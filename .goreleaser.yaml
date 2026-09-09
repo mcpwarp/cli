@@ -1,0 +1,165 @@
+# goreleaser configuration for mcpwarp (github.com/mcpwarp/cli)
+# Docs validated against context7 /goreleaser/goreleaser on 2026-09-05:
+#  - https://github.com/goreleaser/goreleaser/blob/main/www/content/customization/builds/builders/go.md
+#  - https://github.com/goreleaser/goreleaser/blob/main/www/content/blog/reproducible-builds.md
+#  - https://github.com/goreleaser/goreleaser/blob/main/www/content/customization/package/archives.md
+#  - https://github.com/goreleaser/goreleaser/blob/main/www/content/customization/package/checksum.md
+#  - https://github.com/goreleaser/goreleaser/blob/main/www/content/customization/package/nfpm.md
+#  - https://github.com/goreleaser/goreleaser/blob/main/www/content/customization/publish/homebrew_casks.md
+#  - https://github.com/goreleaser/goreleaser/blob/main/www/content/customization/publish/scoop.md
+#  - https://github.com/goreleaser/goreleaser/blob/main/www/content/resources/deprecations.md (brews->homebrew_casks, tap->repository, bucket->repository)
+#  - https://github.com/goreleaser/goreleaser/blob/main/www/content/customization/builds/verifiable_builds.md (gomod.proxy)
+#  - https://github.com/goreleaser/goreleaser/blob/main/www/content/customization/general/git.md
+#  - https://github.com/goreleaser/goreleaser/blob/main/www/content/customization/publish/snapshots.md
+#  - https://github.com/goreleaser/goreleaser/blob/main/www/content/customization/sign/notarize.md
+#  - https://github.com/goreleaser/goreleaser/blob/main/www/content/blog/rust-zig.md (signs: cosign example)
+version: 2
+
+project_name: mcpwarp
+
+builds:
+  - id: mcpwarp
+    main: ./cmd/mcpwarp
+    binary: mcpwarp
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    # Reproducible builds: pin file mtimes in the build metadata to the commit
+    # timestamp rather than wall-clock time.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: mcpwarp
+    name_template: "mcpwarp_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: ["tar.gz"]
+    format_overrides:
+      - goos: windows
+        formats: ["zip"]
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+  groups:
+    - title: "Features"
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: "Bug fixes"
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: "Others"
+      order: 999
+
+nfpms:
+  - id: mcpwarp
+    package_name: mcpwarp
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: mcpwarp
+    homepage: https://github.com/mcpwarp/cli
+    maintainer: "mcpwarp maintainers <maintainers@mcpwarp.dev>" # placeholder, update me
+    description: |-
+      mcpwarp: CLI for tunneling and bridging MCP servers.
+    license: MIT
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+
+# Casks are macOS-only; Linux users get the deb/rpm/apk packages from nfpms
+# above. `brews:` is hard-deprecated since goreleaser v2.16 (fails `check`
+# with exit 2) — migrated to `homebrew_casks:` per deprecations.md.
+homebrew_casks:
+  - name: mcpwarp
+    binaries: [mcpwarp]
+    repository:
+      owner: mcpwarp
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/mcpwarp/cli
+    description: "CLI for tunneling and bridging MCP servers."
+    license: MIT
+    url:
+      verified: github.com/mcpwarp/cli
+    commit_msg_template: "Brew cask update for {{ .ProjectName }} version {{ .Tag }}"
+    # Signing/notarization deferred (see note near `signs:` below) — strip the
+    # quarantine bit on install instead.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/mcpwarp"]
+          end
+    skip_upload: auto
+
+scoops:
+  - name: mcpwarp
+    repository:
+      owner: mcpwarp
+      name: scoop-bucket
+      token: "{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}"
+    homepage: https://github.com/mcpwarp/cli
+    description: "CLI for tunneling and bridging MCP servers."
+    license: MIT
+    commit_msg_template: "Scoop update for {{ .ProjectName }} version {{ .Tag }}"
+    skip_upload: auto
+
+# Mark GitHub releases from prerelease tags (e.g. v1.0.0-rc.1) as not ready
+# for production, so they don't show up as "latest".
+release:
+  prerelease: auto
+
+# Signing/notarization deferred per docs/DESIGN.md §11 (Pro feature or custom
+# post-hook; not needed for v1). Stub left here for when it's picked back up:
+#
+# signs:
+#   - cmd: cosign
+#     certificate: "${artifact}.pem"
+#     artifacts: checksum
+#     args:
+#       - sign-blob
+#       - "--output-certificate=${certificate}"
+#       - "--output-signature=${signature}"
+#       - "${artifact}"
+#       - "--yes"
+#
+# notarize:
+#   macos:
+#     - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+#       sign:
+#         certificate: "{{ .Env.MACOS_SIGN_P12 }}"
+#         password: "{{ .Env.MACOS_SIGN_PASSWORD }}"
+#       notarize:
+#         issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
+#         key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
+#         key: "{{ .Env.MACOS_NOTARY_KEY }}"
+
+snapshot:
+  version_template: "{{ .Version }}-next"
+
+# gomod.proxy (verifiable builds) intentionally skipped: it fetches the
+# tagged module from proxy.golang.org during the build, which requires the
+# module path to already be publicly resolvable at that tag. The docs don't
+# confirm behavior for a module path that hasn't been published yet, and
+# github.com/mcpwarp/cli isn't public/tagged there yet — revisit once it is.

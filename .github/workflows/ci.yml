@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt (ubuntu only, cross-platform formatting is not OS-dependent)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt'd:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: go test -race
+        # race detector requires cgo; windows-latest and macos-latest runners
+        # ship a working cgo toolchain (mingw / clang), so this works on all
+        # three matrix legs.
+        env:
+          CGO_ENABLED: 1
+        run: go test -race -count=1 ./...
+
+  goreleaser-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: check
+
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --snapshot --clean --single-target
+
+      - name: smoke test snapshot binary
+        run: |
+          bin="$(find dist -type f -name mcpwarp -perm -u+x | head -n1)"
+          if [ -z "$bin" ]; then
+            echo "could not find built mcpwarp binary under dist/"
+            exit 1
+          fi
+          out="$("$bin" --version)"
+          echo "version output: $out"
+          if [ "$out" = "dev" ] || echo "$out" | grep -qx "dev"; then
+            echo "version is 'dev' — snapshot ldflags were not applied"
+            exit 1
+          fi

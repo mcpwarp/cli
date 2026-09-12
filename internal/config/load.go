@@ -21,10 +21,23 @@ func (e *ConfigError) Error() string { return e.message }
 // always usage-shaped, exit 2.
 func (e *ConfigError) ExitCode() int { return 2 }
 
-const example = `{
+// ExampleJSON is a minimal valid config, shown in the "file not found"
+// error below and reused by the root command's --help text. One key per
+// line so its widest line still fits under 80 columns once indented under
+// the root help's numbered list.
+const ExampleJSON = `{
   "servers": [
-    { "name": "blender", "kind": "stdio", "command": "uvx", "args": ["blender-mcp"] },
-    { "name": "notes", "kind": "http", "url": "http://127.0.0.1:8765/mcp" }
+    {
+      "name": "blender",
+      "kind": "stdio",
+      "command": "uvx",
+      "args": ["blender-mcp"]
+    },
+    {
+      "name": "notes",
+      "kind": "http",
+      "url": "http://127.0.0.1:8765/mcp"
+    }
   ]
 }`
 
@@ -60,7 +73,7 @@ func LoadConfig(path string) (*Config, error) {
 		if os.IsNotExist(err) {
 			return nil, &ConfigError{message: fmt.Sprintf(
 				"config file not found: %s\n\nCreate one — for example:\n%s\n\nRun `mcpwarp status --config <path>` to check a different location.",
-				path, example,
+				path, ExampleJSON,
 			)}
 		}
 		return nil, &ConfigError{message: fmt.Sprintf("failed to read config file %s: %s", path, err.Error())}

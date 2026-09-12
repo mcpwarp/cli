@@ -24,8 +24,9 @@ Sources: `research-sdk.md`, `research-nodecli.md`, `research-stack.md`, plus dir
 | Global: `--version`, `--verbose`, `--config`, `--issuer`, `--connect-url` | same, same precedence | `--issuer` selects a distinct credentials file via `sha256(issuer)[:16]` |
 | Exit codes 0/1/2, plus 130/143 on SIGINT/SIGTERM | Same 0/1/2; 128+signal on shutdown (`shutdown.ts:6,110-111`) | No change |
 | stdout=product, stderr=logs, ✓/!/✗, NO_COLOR | same; `slog` replaces pino | TUI owns the screen for `up`; logs go to file (§9), visible via `l` or `--no-tui`; non-TTY emits plain lines plus JSON log lines on stderr |
+| (none) | `+ mcpwarp dashboard` | Go-only addition, decided 2026-09-12: prints the dashboard URL from `MCPWARP_WEB_URL` (or its default), then opens the browser; no Node counterpart |
 
-`--json` and `--token` are both dropped from v1 (§5, §13) — no command added or removed.
+`--json` and `--token` are both dropped from v1 (§5, §13) — no command removed; `dashboard` is the one addition.
 
 ## 3. Architecture
 

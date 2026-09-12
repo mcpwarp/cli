@@ -14,10 +14,44 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mcpwarp/cli/internal/auth"
+	"github.com/mcpwarp/cli/internal/config"
 	"github.com/mcpwarp/cli/internal/output"
 	"github.com/mcpwarp/cli/internal/shutdown"
 	"github.com/spf13/cobra"
 )
+
+// rootLong is the root command's --help body: the one-line description,
+// the public-URL-is-tied-to-name caveat, then a getting-started walkthrough
+// and the environment variables `up`/`dashboard` read defaults from.
+var rootLong = fmt.Sprintf(`Expose local MCP servers through the mcpwarp tunnel
+
+A server's public URL is tied to its name; renaming it in config assigns a new URL.
+
+Getting started:
+  1. mcpwarp login                      sign in via the device flow
+  2. create ~/.mcpwarp/config.json      (or pass --config); example:
+%s
+  3. mcpwarp up                         registers each server, prints its URL
+
+Environment:
+  MCPWARP_AUTH_URL     auth server           (default %s)
+  MCPWARP_CONNECT_URL  tunnel WebSocket URL  (default %s)
+  MCPWARP_WEB_URL      dashboard URL         (default %s)
+  %s        personal access token, skips login
+
+Docs: https://mcpwarp.io/docs/get-started`,
+	indentBlock(config.ExampleJSON, "       "), auth.DefaultAuthURL, defaultConnectURL, defaultWebURL, auth.StaticTokenEnvVar)
+
+// indentBlock prefixes every line of s with prefix, for embedding
+// config.ExampleJSON under the getting-started numbered list above.
+func indentBlock(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = prefix + line
+	}
+	return strings.Join(lines, "\n")
+}
 
 // Root builds the mcpwarp root command. version is injected by main via
 // ldflags (default "dev").
@@ -32,7 +66,7 @@ func Root(version string) *cobra.Command {
 	root := &cobra.Command{
 		Use:     "mcpwarp",
 		Short:   "Expose local MCP servers through the mcpwarp tunnel",
-		Long:    "Expose local MCP servers through the mcpwarp tunnel\n\nA server's public URL is tied to its name; renaming it in config assigns a new URL.",
+		Long:    rootLong,
 		Version: version,
 		// We print our own errors (reportConfigError etc.) and want exit-code
 		// control ourselves, so cobra's default error/usage printing is off —
@@ -76,8 +110,8 @@ func Root(version string) *cobra.Command {
 		},
 	}
 	root.SetVersionTemplate("{{.Version}}\n")
-	// Node's command surface has no shell-completion command (§2) — cobra
-	// adds one by default, so turn it off to keep the surfaces 1:1.
+	// Node's command surface has no shell-completion command (§2), and
+	// cobra adds one by default — turned off since Node has none.
 	root.CompletionOptions.DisableDefaultCmd = true
 	// Defined ourselves, no shorthand, before cobra's InitDefaultVersionFlag
 	// runs: its automatic version flag binds -v too, but Node's -v is unknown.
@@ -110,6 +144,7 @@ func Root(version string) *cobra.Command {
 	root.AddCommand(newLogoutCommand(ctxFor))
 	root.AddCommand(newWhoamiCommand(ctxFor))
 	root.AddCommand(newUpCommand(ctxFor))
+	root.AddCommand(newDashboardCommand(ctxFor))
 
 	return root
 }

@@ -42,6 +42,9 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # When two tags point at the same commit (an rc and the final), GoReleaser's default -version:refname sort picks the rc and tries to republish it;
+          # pinning the tag to the ref that triggered the workflow avoids that. https://goreleaser.com/cookbooks/set-a-custom-git-tag/
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
           # The default GITHUB_TOKEN is scoped to this repo only and can't
           # push to the tap/bucket repos, so each of those repos has its own
           # write deploy key; the private half lives in these secrets and

@@ -99,6 +99,10 @@ homebrew_casks:
       git:
         url: "git@github.com:mcpwarp/homebrew-tap.git"
         private_key: "{{ .Env.HOMEBREW_TAP_SSH_KEY }}"
+        # GoReleaser's default minus accept-new: host keys are pinned by the
+        # workflow's "Pin GitHub's SSH host key" step, so require a strict
+        # match instead of trusting an unseen key on first connect.
+        ssh_command: "ssh -i {{ .KeyPath }} -o StrictHostKeyChecking=yes -F /dev/null"
     homepage: https://github.com/mcpwarp/cli
     description: "CLI for tunneling and bridging MCP servers."
     license: MIT
@@ -121,6 +125,7 @@ scoops:
       git:
         url: "git@github.com:mcpwarp/scoop-bucket.git"
         private_key: "{{ .Env.SCOOP_BUCKET_SSH_KEY }}"
+        ssh_command: "ssh -i {{ .KeyPath }} -o StrictHostKeyChecking=yes -F /dev/null"
     homepage: https://github.com/mcpwarp/cli
     description: "CLI for tunneling and bridging MCP servers."
     license: MIT

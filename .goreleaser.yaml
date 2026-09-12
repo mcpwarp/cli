@@ -96,7 +96,9 @@ homebrew_casks:
     repository:
       owner: mcpwarp
       name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+      git:
+        url: "git@github.com:mcpwarp/homebrew-tap.git"
+        private_key: "{{ .Env.HOMEBREW_TAP_SSH_KEY }}"
     homepage: https://github.com/mcpwarp/cli
     description: "CLI for tunneling and bridging MCP servers."
     license: MIT
@@ -116,7 +118,9 @@ scoops:
     repository:
       owner: mcpwarp
       name: scoop-bucket
-      token: "{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}"
+      git:
+        url: "git@github.com:mcpwarp/scoop-bucket.git"
+        private_key: "{{ .Env.SCOOP_BUCKET_SSH_KEY }}"
     homepage: https://github.com/mcpwarp/cli
     description: "CLI for tunneling and bridging MCP servers."
     license: MIT

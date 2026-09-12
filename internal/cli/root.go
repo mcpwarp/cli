@@ -39,6 +39,7 @@ Environment:
   MCPWARP_CONNECT_URL  tunnel WebSocket URL  (default %s)
   MCPWARP_WEB_URL      dashboard URL         (default %s)
   %s        personal access token, skips login
+  MCPWARP_NO_UPDATE_NOTIFIER  disable the update check
 
 Docs: https://mcpwarp.io/docs/get-started`,
 	indentBlock(config.ExampleJSON, "       "), auth.DefaultAuthURL, defaultConnectURL, defaultWebURL, auth.StaticTokenEnvVar)
@@ -126,9 +127,15 @@ func Root(version string) *cobra.Command {
 	root.PersistentFlags().StringVar(&opts.issuer, "issuer", "", "auth server URL, overrides MCPWARP_AUTH_URL (default: https://auth.mcpwarp.io)")
 	root.PersistentFlags().StringVar(&opts.connectURL, "connect-url", "", "tunnel WebSocket URL, overrides MCPWARP_CONNECT_URL (default: wss://connect.mcpwarp.io)")
 
+	// lastCommandContext (package-level, see its own doc comment) starts
+	// every Root() call nil, so a previous invocation's leftover value —
+	// this build's own test suite calls Execute repeatedly in one process
+	// — never leaks into one where ctxFor is never reached (a bad flag,
+	// unknown command).
+	lastCommandContext = nil
 	ctxFor := func(cmd *cobra.Command) *Context {
 		log, logWriter := NewLoggerWithSwap(opts.verbose)
-		return &Context{
+		c := &Context{
 			Verbose:            opts.verbose,
 			ConfigPath:         opts.configPath,
 			IssuerOverride:     opts.issuer,
@@ -136,7 +143,14 @@ func Root(version string) *cobra.Command {
 			Log:                log,
 			LogWriter:          logWriter,
 			Ctx:                cmd.Context(),
+			CommandName:        cmd.Name(),
 		}
+		// Started here — "the beginning of every command" (DESIGN.md §2) —
+		// so the goroutine has the whole command's runtime to finish
+		// before runRoot's bounded wait for it, below.
+		c.UpdateChecker = startUpdateChecker(c.Context(), version, c.HomeDir, log)
+		lastCommandContext = c
+		return c
 	}
 
 	root.AddCommand(newStatusCommand(ctxFor))
@@ -255,6 +269,11 @@ func runRoot(root *cobra.Command) int {
 	}()
 
 	err := root.ExecuteContext(ctx)
+
+	// Printed here, not a PersistentPostRun, so it runs whether or not the
+	// command's RunE returned an error — see lastCommandContext's doc
+	// comment. Never touches err/code below.
+	printUpdateNotice(lastCommandContext)
 
 	sigMu.Lock()
 	sig := gotSig

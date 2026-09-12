@@ -156,7 +156,12 @@ release:
 #         key: "{{ .Env.MACOS_NOTARY_KEY }}"
 
 snapshot:
-  version_template: "{{ .Version }}-next"
+  # "-next-dev", not "-next": internal/update's releaseVersionPattern
+  # rejects a pre-release identifier with an internal hyphen (the same
+  # rule that rejects `make build`'s git-describe dev versions), so a
+  # snapshot build's own version reads as "dev" to the update notice
+  # instead of as a release older than the tag it was built from.
+  version_template: "{{ .Version }}-next-dev"
 
 # gomod.proxy (verifiable builds) intentionally skipped: it fetches the
 # tagged module from proxy.golang.org during the build, which requires the

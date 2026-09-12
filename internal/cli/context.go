@@ -41,6 +41,18 @@ type Context struct {
 	// directly) — callers must check before using it.
 	LogWriter *SwapWriter
 
+	// UpdateChecker is the background update.Check goroutine started when
+	// this Context was built (Root's ctxFor) — nil in a Context a test
+	// constructs directly, the same way LogWriter can be. runRoot prints
+	// its result for every command except `up`, which consumes it itself
+	// (see up.go) since it owns the terminal and never returns normally.
+	UpdateChecker *updateChecker
+
+	// CommandName is cmd.Name() at the time this Context was built — the
+	// `up` exception above needs to tell itself apart from every other
+	// command without importing cobra just for that.
+	CommandName string
+
 	cachedConfig *config.Config
 }
 

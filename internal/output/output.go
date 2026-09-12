@@ -36,6 +36,13 @@ func isTTY(f *os.File) bool {
 	return isTerminal(f)
 }
 
+// IsTerminal reports whether f is a terminal — an exported seam over the
+// isTerminal var above so other packages (internal/update's stderr-is-a-
+// terminal gate) can reuse it instead of duplicating term.IsTerminal.
+func IsTerminal(f *os.File) bool {
+	return isTerminal(f)
+}
+
 // streamColorEnabled reports whether w should get ANSI color: w must be a
 // real *os.File (a TTY check on anything else is meaningless), and NO_COLOR
 // must be unset.
@@ -84,6 +91,12 @@ func Dim(message string) {
 func Error(message string) {
 	c := streamColorEnabled(Stderr)
 	fmt.Fprintf(Stderr, "%s✗%s %s\n", ifColor(c, colorRed), ifColor(c, colorReset), message)
+}
+
+// Stderrln prints message as-is to stderr, no glyph — for a line (the
+// update notice) that belongs on stderr but isn't a ✓/!/✗ status line.
+func Stderrln(message string) {
+	fmt.Fprintln(Stderr, message)
 }
 
 func ifColor(enabled bool, code string) string {

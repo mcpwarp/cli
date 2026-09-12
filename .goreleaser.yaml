@@ -100,8 +100,6 @@ homebrew_casks:
     homepage: https://github.com/mcpwarp/cli
     description: "CLI for tunneling and bridging MCP servers."
     license: MIT
-    url:
-      verified: github.com/mcpwarp/cli
     commit_msg_template: "Brew cask update for {{ .ProjectName }} version {{ .Tag }}"
     # Signing/notarization deferred (see note near `signs:` below) — strip the
     # quarantine bit on install instead.

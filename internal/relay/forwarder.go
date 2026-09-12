@@ -159,14 +159,11 @@ func classifyForwardErr(err error) error {
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return ErrTargetTimeout
 	}
-	msg := err.Error()
+	var dnsErr *net.DNSError
 	switch {
-	case strings.Contains(msg, "connection refused"),
-		strings.Contains(msg, "no such host"),
-		strings.Contains(msg, "no route to host"):
+	case errors.As(err, &dnsErr), isConnRefused(err), isHostUnreachable(err):
 		return ErrTargetUnreachable
-	case strings.Contains(msg, "connection reset"),
-		errors.Is(err, net.ErrClosed):
+	case isConnReset(err), errors.Is(err, net.ErrClosed):
 		return ErrTargetConnectionReset
 	}
 	return err

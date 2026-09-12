@@ -64,6 +64,12 @@ func TestUpgradeHint(t *testing.T) {
 			want:    "download from " + releaseURL,
 		},
 		{
+			name:    "linux /usr/local/bin",
+			goos:    "linux",
+			exePath: "/usr/local/bin/mcpwarp",
+			want:    "download from " + releaseURL,
+		},
+		{
 			name:    "linux path merely prefixed by /usr/bin (not the directory itself)",
 			goos:    "linux",
 			exePath: "/usr/bin-local/mcpwarp",

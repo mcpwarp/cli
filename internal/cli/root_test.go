@@ -102,9 +102,11 @@ func TestExecuteExitCodes(t *testing.T) {
 
 	t.Run("status exits 1 (a runtime failure, not usage/config) when the home directory can't be resolved", func(t *testing.T) {
 		// config.ResolveConfigPath falls back to os.UserHomeDir() when
-		// --config isn't given; with $HOME unset that's a genuine runtime
-		// failure (#12), not a usage/config error, so it's exit 1.
+		// --config isn't given; with $HOME (or, on Windows, %USERPROFILE%)
+		// unset that's a genuine runtime failure (#12), not a usage/config
+		// error, so it's exit 1.
 		t.Setenv("HOME", "")
+		t.Setenv("USERPROFILE", "")
 		if code := Execute("dev", []string{"status"}); code != 1 {
 			t.Errorf("got %d", code)
 		}

@@ -16,7 +16,9 @@ import (
 // isn't logged in (exit 1) — the point is that the notice still appears,
 // after the command's own output, and the exit code is unaffected by it.
 func TestUpdateNoticePrintedAfterCommand(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
 
 	orig := updateCheck
 	updateCheck = func(ctx context.Context, current string, opts update.Options) *update.Notice {

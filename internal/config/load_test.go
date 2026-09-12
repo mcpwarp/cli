@@ -14,12 +14,17 @@ func TestResolveConfigPath(t *testing.T) {
 	}
 
 	t.Run("uses the override path when given", func(t *testing.T) {
-		got, err := ResolveConfigPath("/some/other/config.json")
+		override := "/some/other/config.json"
+		got, err := ResolveConfigPath(override)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got != "/some/other/config.json" {
-			t.Errorf("got %q", got)
+		want, err := filepath.Abs(override)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("got %q want %q", got, want)
 		}
 	})
 
@@ -60,7 +65,7 @@ func TestResolveConfigPath(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(got, "relative/config.json") || !filepath.IsAbs(got) {
+		if !strings.HasSuffix(got, filepath.Join("relative", "config.json")) || !filepath.IsAbs(got) {
 			t.Errorf("got %q", got)
 		}
 	})

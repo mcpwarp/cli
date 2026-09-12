@@ -33,8 +33,16 @@ func releaseServer(t *testing.T, tag string) (*httptest.Server, *int) {
 
 // baseOpts returns Options wired to never skip (terminal, no cache hit)
 // against a fresh temp home, for a test to layer its own Endpoint/Now on.
+// It also clears Check's two opt-out env vars via t.Setenv, so a CI
+// runner exporting CI=true (GitHub Actions does) or a developer with
+// MCPWARP_NO_UPDATE_NOTIFIER set in their shell can't make Check skip out
+// from under a test that isn't exercising that gate itself — Getenv sees
+// t.Setenv's "" the same as unset, and t.Cleanup restores the real value
+// after the test.
 func baseOpts(t *testing.T, endpoint string) Options {
 	t.Helper()
+	t.Setenv("CI", "")
+	t.Setenv("MCPWARP_NO_UPDATE_NOTIFIER", "")
 	return Options{
 		HomeDir:    t.TempDir(),
 		Endpoint:   endpoint,
@@ -156,16 +164,20 @@ func TestCheckOptOutEnvVarsSkip(t *testing.T) {
 	srv, calls := releaseServer(t, "v0.2.0")
 
 	t.Run("MCPWARP_NO_UPDATE_NOTIFIER", func(t *testing.T) {
-		t.Setenv("MCPWARP_NO_UPDATE_NOTIFIER", "1")
+		// baseOpts clears both opt-out vars via t.Setenv; set the one
+		// under test afterward so it's the value Check actually sees
+		// (t.Setenv's last call for a given var wins for the test body,
+		// then both unwind in reverse order on cleanup).
 		opts := baseOpts(t, srv.URL)
+		t.Setenv("MCPWARP_NO_UPDATE_NOTIFIER", "1")
 		if n := Check(context.Background(), "v0.1.0", opts); n != nil {
 			t.Errorf("expected nil, got %+v", n)
 		}
 	})
 
 	t.Run("CI", func(t *testing.T) {
-		t.Setenv("CI", "1")
 		opts := baseOpts(t, srv.URL)
+		t.Setenv("CI", "1")
 		if n := Check(context.Background(), "v0.1.0", opts); n != nil {
 			t.Errorf("expected nil, got %+v", n)
 		}

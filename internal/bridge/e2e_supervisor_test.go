@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,9 @@ func buildFakeMCPBinary(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	out := filepath.Join(dir, "fakemcp-bin")
+	if runtime.GOOS == "windows" {
+		out += ".exe"
+	}
 	cmd := exec.Command("go", "build", "-o", out, "./testdata/fakemcp")
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("build fakemcp fixture: %v", err)

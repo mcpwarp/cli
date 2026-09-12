@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -32,6 +33,9 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "fakemcp fixture: MkdirTemp: %v\n", err)
 	} else {
 		out := filepath.Join(dir, "fakemcp-bin")
+		if runtime.GOOS == "windows" {
+			out += ".exe"
+		}
 		cmd := exec.Command("go", "build", "-o", out, "./testdata/fakemcp")
 		if output, buildErr := cmd.CombinedOutput(); buildErr != nil {
 			fmt.Fprintf(os.Stderr, "fakemcp fixture build failed: %v\n%s\n", buildErr, output)

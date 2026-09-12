@@ -2,6 +2,7 @@ package update
 
 import (
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -19,10 +20,15 @@ const releaseURL = "https://github.com/mcpwarp/cli/releases/latest"
 func UpgradeHint(goos, exePath string) string {
 	switch goos {
 	case "darwin":
-		if strings.Contains(exePath, "/Cellar/") ||
-			strings.Contains(exePath, "/Caskroom/") ||
-			strings.HasPrefix(exePath, "/opt/homebrew") ||
-			strings.HasPrefix(exePath, "/usr/local/Homebrew") {
+		// UpgradeHint is a pure function of (goos, exePath) and the goos
+		// branch taken need not match the host OS running it (tests, or a
+		// cross-built binary's install-time metadata) — normalise to "/"
+		// before matching rather than trusting the host's separator.
+		slashed := filepath.ToSlash(exePath)
+		if strings.Contains(slashed, "/Cellar/") ||
+			strings.Contains(slashed, "/Caskroom/") ||
+			strings.HasPrefix(slashed, "/opt/homebrew") ||
+			strings.HasPrefix(slashed, "/usr/local/Homebrew") {
 			return "brew upgrade --cask mcpwarp"
 		}
 	case "windows":
@@ -34,10 +40,14 @@ func UpgradeHint(goos, exePath string) string {
 			return "scoop update mcpwarp"
 		}
 	case "linux":
-		// filepath.Dir, not HasPrefix: "/usr/bin" must be the whole parent
-		// directory, not just a string prefix — HasPrefix would also (wrongly)
-		// match a path like "/usr/bin-local/mcpwarp".
-		if filepath.Dir(exePath) == "/usr/bin" {
+		// path.Dir, not filepath.Dir: the goos branch is chosen by the
+		// goos argument, not the host running the test, so this must use
+		// "/"-only semantics regardless of what filepath.Dir would do on
+		// the host (backslashes on a Windows test runner). Not HasPrefix
+		// either: "/usr/bin" must be the whole parent directory, not just
+		// a string prefix — HasPrefix would also (wrongly) match a path
+		// like "/usr/bin-local/mcpwarp".
+		if path.Dir(filepath.ToSlash(exePath)) == "/usr/bin" {
 			return "use your package manager (apt/dnf/apk) or download from " + releaseURL
 		}
 	}

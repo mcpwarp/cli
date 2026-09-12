@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -124,6 +125,9 @@ func TestCredentialsLoad(t *testing.T) {
 	})
 
 	t.Run("returns nil with a distinct message on permission denied", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("chmod-based permission denial is not enforceable on Windows")
+		}
 		dir := t.TempDir()
 		c := sample()
 		paths, _ := CredentialsPaths(c.Issuer, dir)

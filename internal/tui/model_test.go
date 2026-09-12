@@ -313,22 +313,41 @@ func TestApplySnapshotMergesKindAndURL(t *testing.T) {
 	}
 }
 
-func TestClosedChannelsStopListening(t *testing.T) {
+func TestClosedTelemetryAndMetricsStopListening(t *testing.T) {
 	bus := eventbus.New(1)
 	m := New(bus, nil, nil)
 	bus.Close()
 
-	_, cmd := m.Update(controlClosedMsg{})
-	if cmd != nil {
-		t.Fatalf("controlClosedMsg must not re-arm a listen Cmd")
-	}
-	_, cmd = m.Update(telemetryClosedMsg{})
+	_, cmd := m.Update(telemetryClosedMsg{})
 	if cmd != nil {
 		t.Fatalf("telemetryClosedMsg must not re-arm a listen Cmd")
 	}
 	_, cmd = m.Update(metricClosedMsg{})
 	if cmd != nil {
 		t.Fatalf("metricClosedMsg must not re-arm a listen Cmd")
+	}
+}
+
+// TestControlClosedQuits asserts controlClosedMsg tells bubbletea to quit
+// (so the Program returns and the terminal gets restored) without treating
+// it as a user-requested quit: quitting must stay false, since runUp uses
+// that flag to decide whether to drive its own FatalExit(0) shutdown, and a
+// closed bus already means a shutdown is under way elsewhere.
+func TestControlClosedQuits(t *testing.T) {
+	bus := eventbus.New(1)
+	m := New(bus, nil, nil)
+
+	next, cmd := m.Update(controlClosedMsg{})
+	m = next.(Model)
+	if m.quitting {
+		t.Fatalf("controlClosedMsg must not set quitting")
+	}
+	if cmd == nil {
+		t.Fatalf("expected a tea.Quit cmd")
+	}
+	msg := cmd()
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Fatalf("expected tea.QuitMsg, got %T", msg)
 	}
 }
 

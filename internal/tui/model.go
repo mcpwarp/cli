@@ -172,7 +172,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyControl(msg.evt)
 		return m, listenControl(m.ctx, m.bus)
 	case controlClosedMsg:
-		return m, nil
+		// Control only closes when up.go's shutdown handlers call Bus.Close (or
+		// ctx is cancelled by a signal): either way a shutdown is under way, so
+		// quit to restore the terminal and unblock that handler's wait on uiDone.
+		// quitting stays false — the shutdown isn't ours to start.
+		return m, tea.Quit
 
 	case telemetryEventMsg:
 		m.appendLog(msg.line)

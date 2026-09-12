@@ -233,6 +233,31 @@ func TestSecondSignalRunsForceExitHooks(t *testing.T) {
 	}
 }
 
+// TestForceExitHooksAreBounded is the ForceExitDeadline regression: a
+// force-exit hook that hangs forever must not stop RunForceExitHooksForTests
+// (and, in production, osExit right after it) from returning.
+func TestForceExitHooksAreBounded(t *testing.T) {
+	ResetForTests()
+	t.Cleanup(ResetForTests)
+	origDeadline := ForceExitDeadline
+	t.Cleanup(func() { ForceExitDeadline = origDeadline })
+	ForceExitDeadline = 50 * time.Millisecond
+
+	OnForceExit(func() { <-make(chan struct{}) }) // blocks forever
+
+	done := make(chan struct{})
+	go func() {
+		RunForceExitHooksForTests()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(ForceExitDeadline + time.Second):
+		t.Fatal("RunForceExitHooksForTests did not return within ForceExitDeadline + margin")
+	}
+}
+
 func TestFatalExitRunsTheSequence(t *testing.T) {
 	ResetForTests()
 	t.Cleanup(ResetForTests)

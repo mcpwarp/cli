@@ -674,7 +674,12 @@ func runUp(ctx *Context, noTUI bool, deps upDeps) error {
 	// paths that skip the handler sequence above entirely: a second
 	// signal/FatalExit racing an in-progress one (shutdown.Run/FatalExit's
 	// own force-exit branch) and a handler sequence that runs past
-	// shutdown.Deadline.
+	// shutdown.Deadline. Deliberately not unregistered: a second signal can
+	// arrive after runUp has returned (ctx cancellation unblocks
+	// BlockForever while the ordered sequence is still in the tunnel
+	// handler) but before osExit, and that is exactly when the children
+	// still need killing. The hook is idempotent and holds no per-run
+	// state; tests clear it with shutdown.ResetForTests.
 	shutdown.OnForceExit(bridge.KillAllLiveChildren)
 
 	rows := make([]output.TableRow, 0, len(cfg.Servers))

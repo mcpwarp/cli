@@ -3,11 +3,17 @@ package tui
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/mcpwarp/cli/internal/eventbus"
+	"github.com/mcpwarp/cli/internal/shutdown"
 )
+
+// programOptions is a test seam: run_test.go appends tea.WithInput/WithOutput
+// so a headless Program can run without a real terminal.
+var programOptions []tea.ProgramOption
 
 // Run starts the dashboard and blocks until the user quits (`q`), a SIGINT/
 // SIGTERM arrives, or ctx is canceled. It never calls os.Exit or drives
@@ -25,7 +31,24 @@ import (
 func Run(ctx context.Context, bus *eventbus.Bus, servers []Server, ctrl Controller, updates <-chan SnapshotMsg) (quit bool, err error) {
 	m := New(bus, servers, ctrl)
 	m.ctx = ctx
-	p := tea.NewProgram(m, tea.WithContext(ctx))
+	p := tea.NewProgram(m, append([]tea.ProgramOption{tea.WithContext(ctx)}, programOptions...)...)
+
+	// Covers the force-exit / past-Deadline paths (shutdown.go's
+	// runForceExitHooks) that skip the "servers" handler's bus.Close and so
+	// never reach the normal quit path below — without this the terminal is
+	// left in raw mode when one of those fires while the TUI is still up.
+	// Unregistered via defer below so the hook only exists for p.Run's
+	// lifetime: p.Run has early error returns (initTerminal, GetSize,
+	// initInputReader) that never touch p's shutdownOnce, and calling
+	// p.Kill on such a program hangs forever on the unbuffered
+	// rendererDone send in stopRenderer, since startRenderer never ran.
+	var forceKilled atomic.Bool
+	unregisterKill := shutdown.OnForceExit(func() {
+		forceKilled.Store(true)
+		p.Kill()
+	})
+	defer unregisterKill()
+
 	if updates != nil {
 		go func() {
 			for {
@@ -49,7 +72,7 @@ func Run(ctx context.Context, bus *eventbus.Bus, servers []Server, ctrl Controll
 		// That's this function's own "shutdown already under way elsewhere"
 		// case, not a real failure — report it as (false, nil) like any
 		// other non-quit return.
-		if errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil {
+		if errors.Is(err, tea.ErrProgramKilled) && (ctx.Err() != nil || forceKilled.Load()) {
 			return false, nil
 		}
 		return false, err

@@ -36,6 +36,14 @@ type Fn func(ctx context.Context) error
 // tests can shrink it.
 var Deadline = 5 * time.Second
 
+// ForceExitDeadline bounds the OnForceExit hook set, run just before
+// osExit on any of the three call sites below — a hung hook can never
+// prevent the process from actually exiting. That budget is shared by all
+// hooks, run in registration order, so a hook that blocks starves every
+// hook registered after it; register the important ones first. A var, not
+// a const, so tests can shrink it.
+var ForceExitDeadline = 2 * time.Second
+
 // osExit is os.Exit behind a var so tests can observe the code instead of
 // actually killing the test binary.
 var osExit = os.Exit
@@ -45,12 +53,18 @@ type entry struct {
 	fn Fn
 }
 
+type forceExitEntry struct {
+	id int
+	fn func()
+}
+
 var (
-	mu           sync.Mutex
-	handlers     []entry
-	nextID       int
-	shuttingDown bool
-	forceExitFns []func()
+	mu              sync.Mutex
+	handlers        []entry
+	nextID          int
+	shuttingDown    bool
+	forceExitFns    []forceExitEntry
+	nextForceExitID int
 )
 
 // Register appends fn to the shutdown sequence, run in registration order
@@ -86,26 +100,55 @@ func Register(name string, fn Fn) func() {
 // already gets a bounded, ordered chance to clean up; this is the
 // last-resort net for state that sequence never reaches on that path (e.g.
 // bridge.KillAllLiveChildren, restoring a TUI's terminal mode) — called
-// just before osExit. Cleared by ResetForTests.
-func OnForceExit(fn func()) {
+// just before osExit, bounded by ForceExitDeadline. The returned func
+// removes fn again, mirroring Register; safe to call more than once.
+// Cleared by ResetForTests.
+func OnForceExit(fn func()) func() {
 	mu.Lock()
-	defer mu.Unlock()
-	forceExitFns = append(forceExitFns, fn)
+	id := nextForceExitID
+	nextForceExitID++
+	forceExitFns = append(forceExitFns, forceExitEntry{id: id, fn: fn})
+	mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			mu.Lock()
+			defer mu.Unlock()
+			for i, e := range forceExitFns {
+				if e.id == id {
+					forceExitFns = append(forceExitFns[:i], forceExitFns[i+1:]...)
+					return
+				}
+			}
+		})
+	}
 }
 
 func runForceExitHooks() {
 	mu.Lock()
-	fns := append([]func(){}, forceExitFns...)
+	fns := append([]forceExitEntry{}, forceExitFns...)
 	mu.Unlock()
-	for _, fn := range fns {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("shutdown force-exit hook panicked", "recovered", r)
-				}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, e := range fns {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("shutdown force-exit hook panicked", "recovered", r)
+					}
+				}()
+				e.fn()
 			}()
-			fn()
-		}()
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(ForceExitDeadline):
+		// A hung hook must never block osExit — it just misses out on
+		// anything registered after it in the same call.
 	}
 }
 
@@ -206,6 +249,7 @@ func ResetForTests() {
 	nextID = 0
 	shuttingDown = false
 	forceExitFns = nil
+	nextForceExitID = 0
 }
 
 // HandlerCount reports how many handlers are currently registered — a test
@@ -224,4 +268,19 @@ func HandlerCount() int {
 // cursor) without racing a real os.Exit.
 func RunHandlersForTests(ctx context.Context) {
 	runHandlers(ctx)
+}
+
+// RunForceExitHooksForTests runs the registered OnForceExit hooks once,
+// without exiting the process — the force-exit counterpart to
+// RunHandlersForTests.
+func RunForceExitHooksForTests() {
+	runForceExitHooks()
+}
+
+// ForceExitHookCountForTests reports how many OnForceExit hooks are
+// currently registered — HandlerCount's counterpart for force-exit hooks.
+func ForceExitHookCountForTests() int {
+	mu.Lock()
+	defer mu.Unlock()
+	return len(forceExitFns)
 }

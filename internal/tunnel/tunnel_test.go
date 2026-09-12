@@ -537,6 +537,9 @@ func TestRegisteredAllServerDisabledIsNotFatal(t *testing.T) {
 		select {
 		case evt := <-bus.Control:
 			if ae, ok := evt.(eventbus.AppError); ok && ae.Code == "SERVER_DISABLED" {
+				if ae.Hint == "" {
+					t.Fatal("expected a non-empty Hint on the SERVER_DISABLED AppError event")
+				}
 				goto processed
 			}
 		case <-deadline:
@@ -569,6 +572,7 @@ func TestRegisteredInvalidNameAndUsernameRequiredHints(t *testing.T) {
 					}, "errors": []map[string]any{
 						{"name": "bad-name", "code": "INVALID_NAME", "message": "server name must match [a-z0-9]([a-z0-9-]*[a-z0-9])? (max 30 chars)"},
 						{"name": "no-username", "code": "USERNAME_REQUIRED", "message": "sign in to the dashboard once to choose a username"},
+						{"name": "oops", "code": "INTERNAL", "message": "unexpected error"},
 					}},
 				})
 			}
@@ -598,19 +602,27 @@ func TestRegisteredInvalidNameAndUsernameRequiredHints(t *testing.T) {
 	defer tun.Close(context.Background())
 
 	seen := map[string]bool{}
+	hints := map[string]string{}
 	deadline := time.After(2 * time.Second)
-	for len(seen) < 2 {
+	for len(seen) < 3 {
 		select {
 		case evt := <-bus.Control:
 			if ae, ok := evt.(eventbus.AppError); ok {
 				seen[ae.Code] = true
+				hints[ae.Code] = ae.Hint
 			}
 		case <-deadline:
-			t.Fatalf("expected AppError events for INVALID_NAME and USERNAME_REQUIRED, got %v", seen)
+			t.Fatalf("expected AppError events for INVALID_NAME, USERNAME_REQUIRED and INTERNAL, got %v", seen)
 		}
 	}
-	if !seen["INVALID_NAME"] || !seen["USERNAME_REQUIRED"] {
-		t.Fatalf("expected both INVALID_NAME and USERNAME_REQUIRED AppError events, got %v", seen)
+	if !seen["INVALID_NAME"] || !seen["USERNAME_REQUIRED"] || !seen["INTERNAL"] {
+		t.Fatalf("expected INVALID_NAME, USERNAME_REQUIRED and INTERNAL AppError events, got %v", seen)
+	}
+	if hints["INVALID_NAME"] == "" || hints["USERNAME_REQUIRED"] == "" {
+		t.Fatalf("expected non-empty hints for INVALID_NAME and USERNAME_REQUIRED, got %v", hints)
+	}
+	if hints["INTERNAL"] != "" {
+		t.Fatalf("expected no hint for INTERNAL, got %q", hints["INTERNAL"])
 	}
 	if got := exitCode.Load(); got != -1 {
 		t.Fatalf("expected no FatalExit alongside a successful registration, got exit code %d", got)

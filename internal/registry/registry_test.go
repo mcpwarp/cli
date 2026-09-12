@@ -195,13 +195,13 @@ func TestRowsSortedByName(t *testing.T) {
 	if len(rows) != 2 || rows[0].Name != "alpha" || rows[1].Name != "zeta" {
 		t.Fatalf("unexpected row order: %+v", rows)
 	}
-	if rows[1].URL != "https://z.example/mcp (disabled)" {
-		t.Fatalf("expected disabled marker on zeta's row, got %q", rows[1].URL)
-	}
-	if rows[0].Disabled {
-		t.Fatalf("expected alpha's row not to be Disabled: %+v", rows[0])
+	if rows[1].URL != "https://z.example/mcp" {
+		t.Fatalf("expected zeta's URL to stay bare, got %q", rows[1].URL)
 	}
 	if !rows[1].Disabled {
 		t.Fatalf("expected zeta's row to be Disabled: %+v", rows[1])
+	}
+	if rows[0].Disabled {
+		t.Fatalf("expected alpha's row not to be Disabled: %+v", rows[0])
 	}
 }

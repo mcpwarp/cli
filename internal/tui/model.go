@@ -46,7 +46,8 @@ type Model struct {
 	streamsOpened int
 	streamsClosed int
 
-	lastErr string
+	lastErr     string
+	lastErrHint string
 
 	logs        []eventbus.LogLine
 	logsVisible bool
@@ -290,6 +291,7 @@ func (m *Model) applyControl(evt any) {
 		} else {
 			m.lastErr = fmt.Sprintf("[%s] %s", e.Code, e.Message)
 		}
+		m.lastErrHint = e.Hint
 	}
 }
 

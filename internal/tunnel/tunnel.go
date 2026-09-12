@@ -282,21 +282,10 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 
 		for _, svcErr := range msg.Errors {
 			t.log.Warn("register error", "name", svcErr.Name, "code", svcErr.Code, "message", svcErr.Message)
-			t.publish(eventbus.AppError{Code: svcErr.Code, Message: svcErr.Message, Service: svcErr.Name})
-			switch svcErr.Code {
-			case "QUOTA_EXCEEDED":
-				t.log.Warn(fmt.Sprintf("upgrade your plan at %s/settings to add more servers", t.cfg.WebURL))
-			case "CONFLICT":
-				t.log.Warn("a server with this name is already registered — rename it, or check its kind")
-			case "SERVER_DISABLED":
-				t.log.Warn("this server was disabled in the dashboard")
-				if !fatal {
-					t.log.Warn("waiting — toggle it on in the dashboard to resume")
-				}
-			case "INVALID_NAME":
-				t.log.Warn("fix the name in your config — it is the public URL slug and must match [a-z0-9]([a-z0-9-]*[a-z0-9])? (max 30 chars)")
-			case "USERNAME_REQUIRED":
-				t.log.Warn(fmt.Sprintf("sign in once at %s to choose a username, then run `mcpwarp up` again", t.cfg.WebURL))
+			hint := registerErrorHint(svcErr.Code, t.cfg.WebURL, fatal)
+			t.publish(eventbus.AppError{Code: svcErr.Code, Message: svcErr.Message, Service: svcErr.Name, Hint: hint})
+			if hint != "" {
+				t.log.Warn(hint)
 			}
 		}
 		if fatal {
@@ -381,6 +370,29 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 		} else {
 			t.log.Warn(msg.ErrorMessage, "code", msg.ErrorCode)
 		}
+	}
+}
+
+// registerErrorHint returns the code-specific next step for a "registered"
+// reply's per-service error, or "" when the code has none — the single
+// source both the log line and the AppError event's Hint are drawn from.
+func registerErrorHint(code, webURL string, fatal bool) string {
+	switch code {
+	case "QUOTA_EXCEEDED":
+		return fmt.Sprintf("upgrade your plan at %s/settings to add more servers", webURL)
+	case "CONFLICT":
+		return "a server with this name is already registered — rename it, or check its kind"
+	case "SERVER_DISABLED":
+		if fatal {
+			return "this server was disabled in the dashboard"
+		}
+		return "this server was disabled in the dashboard — waiting, toggle it on to resume"
+	case "INVALID_NAME":
+		return "fix the name in your config — it is the public URL slug and must match [a-z0-9]([a-z0-9-]*[a-z0-9])? (max 30 chars)"
+	case "USERNAME_REQUIRED":
+		return fmt.Sprintf("sign in once at %s to choose a username, then run `mcpwarp up` again", webURL)
+	default:
+		return ""
 	}
 }
 

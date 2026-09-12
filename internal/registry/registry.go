@@ -322,9 +322,9 @@ type Row struct {
 	Name string
 	Kind string
 	URL  string
-	// Disabled mirrors the " (disabled)" suffix already appended to URL —
-	// plain-mode output keeps relying on that suffix, this field lets a
-	// caller (the TUI) get the same fact without re-parsing URL.
+	// Disabled reports whether this entry is currently disabled — URL is
+	// always bare; callers that want a "(disabled)" annotation add it
+	// themselves from this field.
 	Disabled bool
 }
 
@@ -341,12 +341,8 @@ func (r *Registry) Rows() []Row {
 	rows := make([]Row, 0, len(names))
 	for _, n := range names {
 		e := r.entries[n]
-		u := e.URL
 		disabled := e.Status == StatusDisabled
-		if disabled {
-			u += " (disabled)"
-		}
-		rows = append(rows, Row{Name: n, Kind: e.Kind, URL: u, Disabled: disabled})
+		rows = append(rows, Row{Name: n, Kind: e.Kind, URL: e.URL, Disabled: disabled})
 	}
 	return rows
 }

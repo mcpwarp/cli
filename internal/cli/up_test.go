@@ -808,8 +808,10 @@ func TestPollTunnelForTUISetsHTTPStateOnly(t *testing.T) {
 	cancel()
 
 	byName := make(map[string]string, len(snap.Servers))
+	urlByName := make(map[string]string, len(snap.Servers))
 	for _, s := range snap.Servers {
 		byName[s.Name] = s.State
+		urlByName[s.Name] = s.URL
 	}
 	if got := byName["active-http"]; got != string(registry.StatusActive) {
 		t.Fatalf("active-http State = %q, want %q", got, registry.StatusActive)
@@ -819,6 +821,10 @@ func TestPollTunnelForTUISetsHTTPStateOnly(t *testing.T) {
 	}
 	if got, ok := byName["the-stdio"]; !ok || got != "" {
 		t.Fatalf("the-stdio State = %q, want empty", got)
+	}
+	// Rows() returns a bare URL; the TUI shows disabled via STATE.
+	if got := urlByName["disabled-http"]; got != "https://d.example/mcp" {
+		t.Fatalf("disabled-http URL = %q, want bare URL", got)
 	}
 }
 

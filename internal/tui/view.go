@@ -137,10 +137,15 @@ func (m Model) renderHeader() string {
 
 	line2 := ""
 	if m.lastErr != "" {
-		line2 = styleBad.Render("last error: ") + m.lastErr
+		const label = "last error: "
+		line2 = styleBad.Render(label) + truncateWidth(m.lastErr, m.width-lipgloss.Width(label))
 	}
 	if line2 == "" {
 		return line1
+	}
+	if m.lastErrHint != "" {
+		line3 := styleDim.Render(truncateWidth(m.lastErrHint, m.width))
+		return line1 + "\n" + line2 + "\n" + line3
 	}
 	return line1 + "\n" + line2
 }

@@ -46,6 +46,52 @@ func TestViewSmoke80x24(t *testing.T) {
 	}
 }
 
+// TestLastErrorHintRendered checks that an AppError's Hint reaches the
+// view, not just the log pane (it used to be logged only).
+func TestLastErrorHintRendered(t *testing.T) {
+	m := newTestModel(nil, nil)
+	next, _ := m.Update(controlEventMsg{evt: eventbus.AppError{
+		Code: "SERVER_DISABLED", Message: "disabled", Service: "svc",
+		Hint: "this server was disabled in the dashboard",
+	}})
+	m = next.(Model)
+
+	out := renderAt(t, m, 80, 24)
+	if !strings.Contains(out, "this server was disabled in the dashboard") {
+		t.Fatalf("view missing last-error hint; got:\n%s", out)
+	}
+}
+
+// TestLastErrorLinesTruncatedToWidth checks that the last-error and hint
+// lines are width-truncated like every other line (renderTable) — untrimmed
+// they wrap into extra physical rows a short terminal's height budget can't
+// see, pushing the footer off the bottom.
+func TestLastErrorLinesTruncatedToWidth(t *testing.T) {
+	m := newTestModel([]Server{{Name: "fs", State: "healthy"}}, nil)
+	next, _ := m.Update(namedKey(t, "l")) // show the log pane too
+	m = next.(Model)
+	next, _ = m.Update(controlEventMsg{evt: eventbus.AppError{
+		Code: "INVALID_NAME", Message: "server name must match [a-z0-9]([a-z0-9-]*[a-z0-9])? (max 30 chars) and this message on its own runs well past eighty columns",
+		Service: "a-very-long-service-name-that-also-helps-push-this-line-past-eighty-columns",
+		Hint:    "fix the name in your config — it is the public URL slug and must match [a-z0-9]([a-z0-9-]*[a-z0-9])? (max 30 chars)",
+	}})
+	m = next.(Model)
+
+	out := renderAt(t, m, 80, 7)
+	lines := strings.Split(out, "\n")
+	if len(lines) > 7 {
+		t.Fatalf("rendered %d lines into a 7-line terminal:\n%s", len(lines), out)
+	}
+	for _, line := range lines {
+		if w := lipgloss.Width(line); w > 80 {
+			t.Fatalf("line exceeds terminal width 80 (display width %d): %q", w, line)
+		}
+	}
+	if got := lines[len(lines)-1]; !strings.Contains(got, "q quit") {
+		t.Fatalf("last rendered line = %q, want the footer", got)
+	}
+}
+
 // TestStateHealthyDisplaysAsActive is the STATE-column vocabulary fix:
 // "healthy" (a stdio supervisor's internal state) and "active" (an http
 // row's registry-derived state, see cli.newTUIRenderer/pollTunnelForTUI)

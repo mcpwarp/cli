@@ -79,7 +79,11 @@ func writeControlLine(w io.Writer, color bool, evt any) {
 		if e.Service != "" {
 			service = " service=" + e.Service
 		}
-		fmt.Fprintf(w, "%s %s: %s%s\n", colorize(color, colorRed, "✗"), e.Code, e.Message, service)
+		hint := ""
+		if e.Hint != "" {
+			hint = " · " + e.Hint
+		}
+		fmt.Fprintf(w, "%s %s: %s%s%s\n", colorize(color, colorRed, "✗"), e.Code, e.Message, service, hint)
 
 	default:
 		fmt.Fprintf(w, "%s unknown event %#v\n", colorize(color, colorYellow, "!"), evt)

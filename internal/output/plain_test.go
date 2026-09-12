@@ -44,7 +44,7 @@ func TestRunPlainWritesControlLines(t *testing.T) {
 	bus.Publish(eventbus.ServerStateChanged{Name: "fs", State: "healthy", Restarts: 0})
 	bus.Publish(eventbus.StreamOpened{ID: 1})
 	bus.Publish(eventbus.StreamClosed{ID: 1})
-	bus.Publish(eventbus.AppError{Code: "QUOTA_EXCEEDED", Message: "too many servers", Service: "fs"})
+	bus.Publish(eventbus.AppError{Code: "QUOTA_EXCEEDED", Message: "too many servers", Service: "fs", Hint: "upgrade your plan at https://example.test/settings to add more servers"})
 
 	// Give RunPlain's goroutine a chance to drain what was just published
 	// before asserting on the buffer.
@@ -67,7 +67,7 @@ func TestRunPlainWritesControlLines(t *testing.T) {
 	out := buf.String()
 	// "healthy" prints as "active" (displayState): a healthy supervisor and
 	// an http row's registry-derived "active" are the same fact.
-	for _, want := range []string{"connected", "sess-1", "fs", "active", "stream 1 opened", "stream 1 closed", "QUOTA_EXCEEDED", "too many servers"} {
+	for _, want := range []string{"connected", "sess-1", "fs", "active", "stream 1 opened", "stream 1 closed", "QUOTA_EXCEEDED", "too many servers", "upgrade your plan at https://example.test/settings"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q; got:\n%s", want, out)
 		}

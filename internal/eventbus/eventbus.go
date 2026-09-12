@@ -58,6 +58,10 @@ type AppError struct {
 	Code    string
 	Message string
 	Service string
+	// Hint is an optional code-specific next step (e.g. where to upgrade,
+	// how to fix a name) — empty when the code has none. Computed once by
+	// the producer so log and event share one source of truth.
+	Hint string
 }
 
 // Control events are lossless (backpressure the producer); Telemetry and

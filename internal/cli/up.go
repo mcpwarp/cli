@@ -122,11 +122,17 @@ func (a staticTokenAdapter) Token(context.Context) (string, error) { return a.p.
 type Controller struct {
 	mu          sync.Mutex
 	supervisors map[string]*supervisor.Supervisor
-	t           tunnelHandle
+	// httpNames is the set of configured http server names — they have no
+	// supervisor, so Disable/Enable/Restart need this to tell "http" apart
+	// from "unknown" once the supervisor lookup below comes up empty.
+	// Built once in runUp and never mutated afterward, so reading it needs
+	// no lock (unlike supervisors, looked up per-call through get()).
+	httpNames map[string]struct{}
+	t         tunnelHandle
 }
 
-func newController(supervisors map[string]*supervisor.Supervisor, t tunnelHandle) *Controller {
-	return &Controller{supervisors: supervisors, t: t}
+func newController(supervisors map[string]*supervisor.Supervisor, httpNames map[string]struct{}, t tunnelHandle) *Controller {
+	return &Controller{supervisors: supervisors, httpNames: httpNames, t: t}
 }
 
 func (c *Controller) get(name string) *supervisor.Supervisor {
@@ -135,10 +141,32 @@ func (c *Controller) get(name string) *supervisor.Supervisor {
 	return c.supervisors[name]
 }
 
+func (c *Controller) isHTTP(name string) bool {
+	_, ok := c.httpNames[name]
+	return ok
+}
+
+// State reports name's current supervisor state (e.g. "healthy"), used by
+// newTUIRenderer to seed the TUI's initial STATE column for a stdio server
+// before the first eventbus.ServerStateChanged arrives. ok is false for an
+// http server, which has no supervisor.
+func (c *Controller) State(name string) (state string, ok bool) {
+	s := c.get(name)
+	if s == nil {
+		return "", false
+	}
+	return string(s.GetState()), true
+}
+
 // Restart stops and immediately respawns name's child (supervisor.Restart).
+// An http server has no child to restart — that's a distinct error from
+// "unknown server", not a silent no-op.
 func (c *Controller) Restart(name string) error {
 	s := c.get(name)
 	if s == nil {
+		if c.isHTTP(name) {
+			return fmt.Errorf("http servers have no child to restart")
+		}
 		return fmt.Errorf("unknown server %q", name)
 	}
 	s.Restart()
@@ -147,13 +175,14 @@ func (c *Controller) Restart(name string) error {
 
 // Disable stops name's child (supervisor.Disable) and unregisters it from
 // the tunnel (tunnelHandle.UnregisterService) — the local counterpart of a
-// remote disable.
+// remote disable. An http server has no child to stop, so only the
+// unregister half applies.
 func (c *Controller) Disable(name string) error {
-	s := c.get(name)
-	if s == nil {
+	if s := c.get(name); s != nil {
+		s.Disable()
+	} else if !c.isHTTP(name) {
 		return fmt.Errorf("unknown server %q", name)
 	}
-	s.Disable()
 	if c.t != nil {
 		return c.t.UnregisterService(name)
 	}
@@ -162,13 +191,14 @@ func (c *Controller) Disable(name string) error {
 
 // Enable respawns name's child (supervisor.Enable) and re-registers it with
 // the tunnel (tunnelHandle.RegisterService) — the local counterpart of a
-// remote enable.
+// remote enable. An http server has no child to respawn, so only the
+// re-register half applies.
 func (c *Controller) Enable(name string) error {
-	s := c.get(name)
-	if s == nil {
+	if s := c.get(name); s != nil {
+		s.Enable()
+	} else if !c.isHTTP(name) {
 		return fmt.Errorf("unknown server %q", name)
 	}
-	s.Enable()
 	if c.t != nil {
 		c.t.RegisterService(name)
 	}
@@ -266,27 +296,37 @@ func newTUIRenderer(home string, t tunnelHandle) runUIFunc {
 			}
 		}
 
+		// Seed each row's initial STATE: http starts at the registry's
+		// active status (no supervisor); stdio reads its supervisor's.
 		servers := make([]tui.Server, len(deps.Services))
 		for i, r := range deps.Services {
-			servers[i] = tui.Server{Name: r.Name, Kind: r.Kind}
+			s := tui.Server{Name: r.Name, Kind: r.Kind}
+			if r.Kind == config.KindHTTP {
+				s.State = string(registry.StatusActive)
+			} else if deps.Controller != nil {
+				if st, ok := deps.Controller.State(r.Name); ok {
+					s.State = st
+				}
+			}
+			servers[i] = s
 		}
 
 		pollCtx, stopPoll := context.WithCancel(ctx)
 		defer stopPoll()
 		updates := make(chan tui.SnapshotMsg, 1)
-		go pollTunnelForTUI(pollCtx, t, deps.Bus, updates)
+		go pollTunnelForTUI(pollCtx, t, deps.Bus, updates, time.Second)
 
 		return tuiRunFunc(ctx, deps.Bus, servers, tuiControllerAdapter{c: deps.Controller, log: deps.Log}, updates)
 	}
 }
 
 // pollTunnelForTUI feeds the running dashboard what the bus alone can't:
-// the registry's public URLs (pushed as a tui.SnapshotMsg once a second)
-// and a bytes-transferred metric derived from Stats() (DESIGN.md §9).
-// Stops, closing updates, once ctx is done.
-func pollTunnelForTUI(ctx context.Context, t tunnelHandle, bus *eventbus.Bus, updates chan<- tui.SnapshotMsg) {
+// the registry's public URLs (pushed as a tui.SnapshotMsg once per
+// interval) and a bytes-transferred metric derived from Stats() (DESIGN.md
+// §9). Stops, closing updates, once ctx is done.
+func pollTunnelForTUI(ctx context.Context, t tunnelHandle, bus *eventbus.Bus, updates chan<- tui.SnapshotMsg, interval time.Duration) {
 	defer close(updates)
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -297,7 +337,18 @@ func pollTunnelForTUI(ctx context.Context, t tunnelHandle, bus *eventbus.Bus, up
 				rows := reg.Rows()
 				snap := make([]tui.Server, len(rows))
 				for i, r := range rows {
-					snap[i] = tui.Server{Name: r.Name, Kind: r.Kind, URL: r.URL}
+					s := tui.Server{Name: r.Name, Kind: r.Kind, URL: r.URL}
+					// stdio's state is owned by eventbus.ServerStateChanged
+					// (applySnapshot leaves an empty State untouched); only
+					// http has a registry-derived state to report here.
+					if r.Kind == config.KindHTTP {
+						if r.Disabled {
+							s.State = string(registry.StatusDisabled)
+						} else {
+							s.State = string(registry.StatusActive)
+						}
+					}
+					snap[i] = s
 				}
 				select {
 				case updates <- tui.SnapshotMsg{Servers: snap}:
@@ -491,6 +542,45 @@ func runUp(ctx *Context, noTUI bool, deps upDeps) error {
 	// screen.
 	plainMode := noTUI || !deps.IsTTY()
 
+	// Update notice exception (DESIGN.md §9): `up` never returns normally,
+	// so root.go's printUpdateNotice (after root.ExecuteContext returns)
+	// never runs for it. Once the TUI starts it also owns the whole
+	// terminal, and the swap of ctx.Log's writer to the TUI log file
+	// happens later, inside newTUIRenderer's own goroutine (up.go below) —
+	// not here — so a plain ctx.Log.Warn/stderr write at this point would
+	// race that swap: it either lands on raw stderr an instant before the
+	// alt screen wipes it, or in the log file if the swap wins, depending
+	// on how fast the background check happened to finish. Rather than
+	// special-case "already finished", TUI mode always hands the notice to
+	// the bus instead — the one thing the running TUI reliably renders
+	// regardless of timing — as two LogLine telemetry events, the same
+	// shape the log-tail pane already shows (internal/tui/view.go's
+	// renderLogLines). Plain mode has no such race (no alt screen to wipe
+	// anything), so it keeps printing straight to stderr: immediately if
+	// the check already finished, before the renderer below writes
+	// anything, or from a goroutine once it does.
+	if plainMode {
+		if n, ready := ctx.UpdateChecker.TryWait(); ready {
+			if n != nil {
+				n.Print()
+			}
+		} else {
+			go func() {
+				if n := ctx.UpdateChecker.Wait(updateCheckLogWait); n != nil {
+					n.Print()
+				}
+			}()
+		}
+	} else {
+		go func() {
+			if n := ctx.UpdateChecker.Wait(updateCheckLogWait); n != nil {
+				for _, line := range n.Lines() {
+					bus.PublishTelemetry(eventbus.LogLine{Server: "update", Level: "warn", Text: line})
+				}
+			}
+		}()
+	}
+
 	services := make([]appproto.RegisterService, len(cfg.Servers))
 	for i, s := range cfg.Servers {
 		services[i] = appproto.RegisterService{Name: s.Name, Kind: s.Kind}
@@ -501,12 +591,17 @@ func runUp(ctx *Context, noTUI bool, deps upDeps) error {
 	// ignoring the error, like the bridge URL parse below, rather than
 	// re-deriving an unreachable error path for it.
 	targets := make(map[string]*url.URL, len(cfg.Servers))
+	// httpNames backs Controller's d/e/r keybindings for a server with no
+	// supervisor (below): it's how Disable/Enable/Restart tell "http" apart
+	// from "unknown".
+	httpNames := make(map[string]struct{}, len(cfg.Servers))
 	for _, s := range cfg.Servers {
 		if s.Kind != config.KindHTTP {
 			continue
 		}
 		u, _ := url.Parse(s.URL)
 		targets[s.Name] = u
+		httpNames[s.Name] = struct{}{}
 	}
 
 	// --- startup order (DESIGN.md §3): stdio bridges bind before the
@@ -703,7 +798,7 @@ func runUp(ctx *Context, noTUI bool, deps upDeps) error {
 		}
 	}
 
-	controller := newController(supervisors, t)
+	controller := newController(supervisors, httpNames, t)
 
 	// --- renderer selection (DESIGN.md §9's degrade path): a caller-
 	// supplied deps.RunUI always wins (test seam); otherwise plainMode

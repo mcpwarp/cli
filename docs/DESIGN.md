@@ -28,6 +28,8 @@ Sources: `research-sdk.md`, `research-nodecli.md`, `research-stack.md`, plus dir
 
 `--json` and `--token` are both dropped from v1 (§5, §13) — no command removed; `dashboard` is the one addition.
 
+Also Go-only, like `dashboard`: an update notice (`internal/update`), gh-CLI-style — checks GitHub releases at most once per 24h and prints a two-line notice on stderr when a newer tag exists, never self-replaces.
+
 ## 3. Architecture
 
 Package layout (Go modules, module path `github.com/mcpwarp/cli`, decided — §13):
@@ -127,7 +129,7 @@ Port list (verified against `mcpwarp-cli/src/bridge/{stdio-child,supervisor,http
 | Framing | NDJSON on child stdout, 16 MiB line cap, non-JSON skipped (debug); stdin backpressure-aware | Port as-is |
 | stderr | Piped at debug level, `[name]`-prefixed, shown under `--verbose` | Port as-is |
 | Supervisor backoff | Full-jitter, base 1000ms, cap 30000ms; 10 crashes without 60s healthy uptime → `failed` | Distinct from SDK reconnect cap (60000ms, §2.9) |
-| Supervisor states | `healthy/restarting/failed/disabled/stopped`; `enable` = respawn + re-register | Port as-is |
+| Supervisor states | `healthy/restarting/failed/disabled/stopped`; `enable` = respawn + re-register | Port as-is; http rows have no supervisor and show the registry's status (`active`/`disabled`) in the STATE column instead |
 | `replaceChild` | Swaps child after restart; listener/port/session untouched; in-flight requests get `-32000 "local server restarted"` | Port as-is |
 | HTTP bridge routing | By JSON-RPC shape — serves session-based and stateless transports | Port as-is |
 | id rewriting | Client ids rewritten to bridge-minted monotonic ids | Port as-is |
@@ -170,7 +172,7 @@ Go encode/decode: a flat struct can't express op-specific payloads — two-pass 
 
 **TTY requirement.** The TUI path requires *both* stdin and stdout to be a TTY (`defaultUpIsTTY`), not stdout alone — it reads keypresses too, so either being redirected degrades to the plain renderer. A `kill -INT` while the TUI owns the screen races bubbletea's own signal handling benignly: bubbletea restores the terminal either way.
 
-`d` stops the child (supervisor state `disabled`, same as a remote disable) and sends `unregister` for that one service; `e` respawns it and sends `register` for it. Both reuse the existing ops (§8) — no new protocol. Consequence: while locally disabled, the dashboard shows the service as absent, not paused; an agent-paused dashboard state is a possible later SaaS addition, out of scope here.
+`d` stops the child (supervisor state `disabled`, same as a remote disable) and sends `unregister` for that one service; `e` respawns it and sends `register` for it. Both reuse the existing ops (§8) — no new protocol. For an http server, which has no child, only the unregister/register half applies. Consequence: while locally disabled, the dashboard shows the service as absent, not paused; an agent-paused dashboard state is a possible later SaaS addition, out of scope here.
 
 **Degrade path:** stdout not a TTY, or `--no-tui` — skip bubbletea, use `internal/output`'s plain-line renderer (parity with Node's pino pretty-on-TTY / NDJSON-off-TTY, ✓/!/✗, NO_COLOR). Non-TTY fallback is plain lines on stdout plus JSON log lines on stderr (`slog`, matching Node's pino behaviour) — no `--json` mode (§2, §13).
 
@@ -188,7 +190,7 @@ Go encode/decode: a flat struct can't express op-specific payloads — two-pass 
 
 - **goreleaser** (`.goreleaser.yaml` v2, OSS): `goos: [linux, darwin, windows]` × `goarch: [amd64, arm64]` (`CGO_ENABLED=0`) — six targets, including `windows/arm64`.
 - `nfpms` for `.deb`/`.rpm`/`.apk`; `homebrew_casks` (macOS only — `brews:` is hard-deprecated since goreleaser v2.16; Linux gets the nfpm packages instead) and `scoops` for Homebrew/Scoop; sha256 `checksum`.
-- Version via `-ldflags "-X main.version=..."` from the git tag — no runtime update check (parity with Node). `release.prerelease: auto` keeps a prerelease tag (e.g. `v1.0.0-rc.1`) off the "latest" release.
+- Version via `-ldflags "-X main.version=..."` from the git tag. The runtime update notice lives in `internal/update` (see §2), not here — `release.prerelease: auto` is what keeps a prerelease tag (e.g. `v1.0.0-rc.1`) off `/releases/latest`, and therefore out of the notice too, since `internal/update.Check` only ever compares against that endpoint.
 - **License:** MIT (decided 2026-09-05). `nfpms`/`homebrew_casks`/`scoops` declare `MIT`, matching the repo's `LICENSE` file.
 - **Signing/notarization deferred** — Pro feature or custom post-hook; not needed for v1.
 

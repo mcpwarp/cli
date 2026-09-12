@@ -325,6 +325,12 @@ func (m *Model) applySnapshot(snap []Server) {
 		if i, ok := byName[s.Name]; ok {
 			m.servers[i].Kind = s.Kind
 			m.servers[i].URL = s.URL
+			// Empty State means the snapshot has nothing to say about it
+			// (e.g. a stdio row, whose state is owned by
+			// eventbus.ServerStateChanged) — leave whatever's there.
+			if s.State != "" {
+				m.servers[i].State = s.State
+			}
 		} else {
 			m.servers = append(m.servers, s)
 			byName[s.Name] = len(m.servers) - 1

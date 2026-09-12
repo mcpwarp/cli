@@ -35,10 +35,15 @@ type Controller interface {
 }
 
 // SnapshotMsg lets the caller push an updated server snapshot (e.g. Kind/
-// URL for a server discovered after the dashboard started) into a running
-// Program via (*tea.Program).Send. Servers are merged by Name, keeping each
-// row's live State/Restarts unless the model hasn't seen a
-// ServerStateChanged for that name yet.
+// URL for a server discovered after the dashboard started, or a disabled/
+// active toggle for an http row) into a running Program via
+// (*tea.Program).Send. Servers are merged by Name: Kind/URL are always
+// applied; State is applied only when non-empty, so a caller with nothing
+// to say about a row's state (stdio rows, whose state is owned by
+// eventbus.ServerStateChanged) doesn't stomp the model's live value. A
+// row not yet in the model is added as given, State included — the seed
+// value a caller supplies (e.g. the initial snapshot at startup) stands
+// until the first real update for that name arrives.
 type SnapshotMsg struct {
 	Servers []Server
 }

@@ -14,8 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mcpwarp/cli/internal/appproto"
 	"github.com/mcpwarp/cli/internal/bridge"
 	"github.com/mcpwarp/cli/internal/eventbus"
+	"github.com/mcpwarp/cli/internal/output"
 	"github.com/mcpwarp/cli/internal/registry"
 	"github.com/mcpwarp/cli/internal/shutdown"
 	"github.com/mcpwarp/cli/internal/supervisor"
@@ -269,6 +271,10 @@ type fakeTunnelHandle struct {
 
 	registeredNames   []string
 	unregisteredNames []string
+
+	// reg, if set, is returned by Registry() instead of a fresh empty one —
+	// lets a test seed rows for pollTunnelForTUI to poll.
+	reg *registry.Registry
 }
 
 func (f *fakeTunnelHandle) Unregister(context.Context) error {
@@ -293,8 +299,7 @@ func (f *fakeTunnelHandle) Close(context.Context) error {
 
 // RegisterService/UnregisterService record the name they were called with
 // (for TestControllerDisableEnableReachTunnel) in addition to being no-ops
-// otherwise; Registry/Stats are zero values — no test drives the TUI
-// renderer, the only other caller of those two.
+// otherwise; Registry/Stats are zero values unless reg is set.
 func (f *fakeTunnelHandle) RegisterService(name string) {
 	f.mu.Lock()
 	f.registeredNames = append(f.registeredNames, name)
@@ -307,8 +312,13 @@ func (f *fakeTunnelHandle) UnregisterService(name string) error {
 	f.mu.Unlock()
 	return nil
 }
-func (f *fakeTunnelHandle) Registry() *registry.Registry { return registry.New() }
-func (f *fakeTunnelHandle) Stats() wsmixer.Stats         { return wsmixer.Stats{} }
+func (f *fakeTunnelHandle) Registry() *registry.Registry {
+	if f.reg != nil {
+		return f.reg
+	}
+	return registry.New()
+}
+func (f *fakeTunnelHandle) Stats() wsmixer.Stats { return wsmixer.Stats{} }
 
 // TestControllerDisableEnableReachTunnel is S-6: Controller.Disable/Enable
 // (the `d`/`e` keybindings' backing logic) must reach both the local
@@ -333,7 +343,7 @@ func TestControllerDisableEnableReachTunnel(t *testing.T) {
 	}, supervisor.Deps{})
 
 	fake := &fakeTunnelHandle{}
-	ctrl := newController(map[string]*supervisor.Supervisor{"echo": sv}, fake)
+	ctrl := newController(map[string]*supervisor.Supervisor{"echo": sv}, nil, fake)
 
 	if err := ctrl.Disable("echo"); err != nil {
 		t.Fatalf("Disable: %v", err)
@@ -363,6 +373,66 @@ func TestControllerDisableEnableReachTunnel(t *testing.T) {
 
 	if err := ctrl.Disable("does-not-exist"); err == nil {
 		t.Fatal("expected an error for an unknown server name")
+	}
+}
+
+// TestControllerHTTPDisableEnable covers the `d`/`e` keybindings for an
+// http server, which has no supervisor: Disable/Enable must still reach
+// the tunnel ops rather than erroring "unknown server", and Restart (no
+// child to restart) must error rather than silently succeed.
+func TestControllerHTTPDisableEnable(t *testing.T) {
+	fake := &fakeTunnelHandle{}
+	httpNames := map[string]struct{}{"notes": {}}
+	ctrl := newController(map[string]*supervisor.Supervisor{}, httpNames, fake)
+
+	if err := ctrl.Disable("notes"); err != nil {
+		t.Fatalf("Disable: %v", err)
+	}
+	fake.mu.Lock()
+	unregistered := append([]string{}, fake.unregisteredNames...)
+	fake.mu.Unlock()
+	if !slices.Contains(unregistered, "notes") {
+		t.Fatalf("expected UnregisterService(\"notes\"), got %v", unregistered)
+	}
+
+	if err := ctrl.Enable("notes"); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	fake.mu.Lock()
+	registered := append([]string{}, fake.registeredNames...)
+	fake.mu.Unlock()
+	if !slices.Contains(registered, "notes") {
+		t.Fatalf("expected RegisterService(\"notes\"), got %v", registered)
+	}
+
+	httpErr := ctrl.Restart("notes")
+	if httpErr == nil {
+		t.Fatal("expected Restart on an http server to error, not silently succeed")
+	}
+
+	if err := ctrl.Disable("does-not-exist"); err == nil {
+		t.Fatal("expected an error for an unknown server name")
+	}
+	if err := ctrl.Enable("does-not-exist"); err == nil {
+		t.Fatal("expected an error for an unknown server name")
+	}
+	unknownErr := ctrl.Restart("does-not-exist")
+	if unknownErr == nil {
+		t.Fatal("expected an error for an unknown server name")
+	}
+	if httpErr.Error() == unknownErr.Error() {
+		t.Fatalf("expected Restart's http and unknown-name errors to differ, both were %q", httpErr.Error())
+	}
+
+	fake.mu.Lock()
+	unregistered = append([]string{}, fake.unregisteredNames...)
+	registered = append([]string{}, fake.registeredNames...)
+	fake.mu.Unlock()
+	if slices.Contains(unregistered, "does-not-exist") {
+		t.Fatalf("Disable on an unknown name must not call UnregisterService, got %v", unregistered)
+	}
+	if slices.Contains(registered, "does-not-exist") {
+		t.Fatalf("Enable on an unknown name must not call RegisterService, got %v", registered)
 	}
 }
 
@@ -645,6 +715,110 @@ func TestNewTUIRenderer_SetsAndRestoresLogWriter(t *testing.T) {
 	}
 	if _, err := os.Stat(tui.LogFilePath(dir)); err != nil {
 		t.Fatalf("expected the TUI log file to have been created: %v", err)
+	}
+}
+
+// TestNewTUIRenderer_SeedsInitialState covers the STATE-column bug: before
+// the first eventbus.ServerStateChanged, an http row must show "active"
+// and a stdio row must show its supervisor's current GetState() rather
+// than an empty string.
+func TestNewTUIRenderer_SeedsInitialState(t *testing.T) {
+	t.Cleanup(bridge.KillAllLiveChildren)
+
+	br, err := bridge.StartBridge(bridge.StartBridgeOptions{
+		Name:      "echo",
+		SpawnSpec: bridge.SpawnSpec{Command: "true"},
+		Log:       NewLogger(false),
+	})
+	if err != nil {
+		t.Fatalf("StartBridge: %v", err)
+	}
+	sv := supervisor.New(supervisor.Options{
+		Name:      "echo",
+		SpawnSpec: bridge.SpawnSpec{Command: "true"},
+		Log:       NewLogger(false),
+		Child:     br.GetCurrentChild(),
+		Bridge:    br,
+	}, supervisor.Deps{})
+	sv.Disable()
+	if sv.GetState() != supervisor.Disabled {
+		t.Fatalf("setup: supervisor state = %v, want %v", sv.GetState(), supervisor.Disabled)
+	}
+	ctrl := newController(map[string]*supervisor.Supervisor{"echo": sv}, nil, &fakeTunnelHandle{})
+
+	origTUIRun := tuiRunFunc
+	t.Cleanup(func() { tuiRunFunc = origTUIRun })
+	var gotServers []tui.Server
+	tuiRunFunc = func(ctx context.Context, _ *eventbus.Bus, servers []tui.Server, _ tui.Controller, _ <-chan tui.SnapshotMsg) (bool, error) {
+		gotServers = servers
+		return false, nil
+	}
+
+	renderer := newTUIRenderer(t.TempDir(), &fakeTunnelHandle{})
+	quit, err := renderer(context.Background(), upUIDeps{
+		Bus:        eventbus.New(1),
+		Log:        NewLogger(false),
+		Controller: ctrl,
+		Services: []output.TableRow{
+			{Name: "echo", Kind: "stdio"},
+			{Name: "notes", Kind: "http"},
+		},
+	})
+	if err != nil || quit {
+		t.Fatalf("got quit=%v err=%v, want false/nil", quit, err)
+	}
+
+	byName := make(map[string]string, len(gotServers))
+	for _, s := range gotServers {
+		byName[s.Name] = s.State
+	}
+	if got := byName["echo"]; got != string(supervisor.Disabled) {
+		t.Fatalf("stdio row State = %q, want supervisor state %q", got, supervisor.Disabled)
+	}
+	if got := byName["notes"]; got != "active" {
+		t.Fatalf("http row State = %q, want %q", got, "active")
+	}
+}
+
+// TestPollTunnelForTUISetsHTTPStateOnly is the poll-side half of the
+// STATE-column fix: an active http row reports registry.StatusActive, a
+// disabled one reports registry.StatusDisabled, and a stdio row's State
+// stays empty (its state is owned by eventbus.ServerStateChanged, and
+// applySnapshot leaves an empty State untouched).
+func TestPollTunnelForTUISetsHTTPStateOnly(t *testing.T) {
+	reg := registry.New()
+	reg.ApplyRegistered([]appproto.RegisteredService{
+		{Name: "active-http", ID: "id1", URL: "https://a.example/mcp"},
+		{Name: "disabled-http", ID: "id2", URL: "https://d.example/mcp"},
+		{Name: "the-stdio", ID: "id3", URL: "https://s.example/mcp"},
+	}, map[string]string{"active-http": "http", "disabled-http": "http", "the-stdio": "stdio"})
+	reg.ApplyDisable("id2", "test")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	updates := make(chan tui.SnapshotMsg, 1)
+	go pollTunnelForTUI(ctx, &fakeTunnelHandle{reg: reg}, eventbus.New(1), updates, time.Millisecond)
+
+	var snap tui.SnapshotMsg
+	select {
+	case snap = <-updates:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for a SnapshotMsg")
+	}
+	cancel()
+
+	byName := make(map[string]string, len(snap.Servers))
+	for _, s := range snap.Servers {
+		byName[s.Name] = s.State
+	}
+	if got := byName["active-http"]; got != string(registry.StatusActive) {
+		t.Fatalf("active-http State = %q, want %q", got, registry.StatusActive)
+	}
+	if got := byName["disabled-http"]; got != string(registry.StatusDisabled) {
+		t.Fatalf("disabled-http State = %q, want %q", got, registry.StatusDisabled)
+	}
+	if got, ok := byName["the-stdio"]; !ok || got != "" {
+		t.Fatalf("the-stdio State = %q, want empty", got)
 	}
 }
 

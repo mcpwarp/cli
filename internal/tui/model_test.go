@@ -313,6 +313,18 @@ func TestApplySnapshotMergesKindAndURL(t *testing.T) {
 	}
 }
 
+// TestApplySnapshotUpdatesNonEmptyState covers the http side of types.go's
+// SnapshotMsg rule: a snapshot row with a State (e.g. a registry poll's
+// disabled/active toggle) overwrites the model's current value.
+func TestApplySnapshotUpdatesNonEmptyState(t *testing.T) {
+	m := newTestModel([]Server{{Name: "svc", State: "active"}}, nil)
+	next, _ := m.Update(SnapshotMsg{Servers: []Server{{Name: "svc", State: "disabled"}}})
+	m = next.(Model)
+	if m.servers[0].State != "disabled" {
+		t.Fatalf("expected non-empty snapshot State to update the row, got %+v", m.servers[0])
+	}
+}
+
 func TestClosedTelemetryAndMetricsStopListening(t *testing.T) {
 	bus := eventbus.New(1)
 	m := New(bus, nil, nil)

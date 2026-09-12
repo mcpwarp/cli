@@ -198,4 +198,10 @@ func TestRowsSortedByName(t *testing.T) {
 	if rows[1].URL != "https://z.example/mcp (disabled)" {
 		t.Fatalf("expected disabled marker on zeta's row, got %q", rows[1].URL)
 	}
+	if rows[0].Disabled {
+		t.Fatalf("expected alpha's row not to be Disabled: %+v", rows[0])
+	}
+	if !rows[1].Disabled {
+		t.Fatalf("expected zeta's row to be Disabled: %+v", rows[1])
+	}
 }

@@ -65,10 +65,15 @@ func TestRunPlainWritesControlLines(t *testing.T) {
 	}
 
 	out := buf.String()
-	for _, want := range []string{"connected", "sess-1", "fs", "healthy", "stream 1 opened", "stream 1 closed", "QUOTA_EXCEEDED", "too many servers"} {
+	// "healthy" prints as "active" (displayState): a healthy supervisor and
+	// an http row's registry-derived "active" are the same fact.
+	for _, want := range []string{"connected", "sess-1", "fs", "active", "stream 1 opened", "stream 1 closed", "QUOTA_EXCEEDED", "too many servers"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q; got:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "healthy") {
+		t.Errorf("expected \"healthy\" to print as \"active\", got:\n%s", out)
 	}
 }
 

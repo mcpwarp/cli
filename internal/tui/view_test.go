@@ -34,10 +34,37 @@ func TestViewSmoke80x24(t *testing.T) {
 	m = next.(Model)
 
 	out := renderAt(t, m, 80, 24)
-	for _, want := range []string{"NAME", "KIND", "STATE", "RESTARTS", "URL", "fs", "git", "127.0.0.1:9001", "restarting", "CONNECTED", "q quit"} {
+	for _, want := range []string{"NAME", "KIND", "STATE", "RESTARTS", "URL", "fs", "git", "127.0.0.1:9001", "active", "restarting", "CONNECTED", "q quit"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("view missing %q; got:\n%s", want, out)
 		}
+	}
+	// "healthy" is the supervisor's internal state name (unchanged in the
+	// model); the STATE column must show "active" instead, not both.
+	if strings.Contains(out, "healthy") {
+		t.Fatalf("view must display a healthy row's state as \"active\", not \"healthy\"; got:\n%s", out)
+	}
+}
+
+// TestStateHealthyDisplaysAsActive is the STATE-column vocabulary fix:
+// "healthy" (a stdio supervisor's internal state) and "active" (an http
+// row's registry-derived state, see cli.newTUIRenderer/pollTunnelForTUI)
+// must render identically, while every other state passes through as-is.
+func TestStateHealthyDisplaysAsActive(t *testing.T) {
+	m := newTestModel([]Server{
+		{Name: "fs", Kind: "stdio", State: "healthy"},
+		{Name: "notes", Kind: "http", State: "active"},
+		{Name: "git", Kind: "stdio", State: "restarting"},
+	}, nil)
+	out := renderAt(t, m, 80, 24)
+	if strings.Contains(out, "healthy") {
+		t.Fatalf("expected \"healthy\" not to appear in the rendered view; got:\n%s", out)
+	}
+	if !strings.Contains(out, "restarting") {
+		t.Fatalf("expected \"restarting\" to render as-is; got:\n%s", out)
+	}
+	if m.servers[0].State != "healthy" {
+		t.Fatalf("displayState must not mutate the model's stored State, got %q", m.servers[0].State)
 	}
 }
 

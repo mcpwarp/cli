@@ -147,6 +147,18 @@ func (m Model) renderHeader() string {
 
 var tableCols = []string{"NAME", "KIND", "STATE", "RESTARTS", "URL"}
 
+// displayState maps a stored State value to what the STATE column shows:
+// the supervisor's "healthy" and an http row's registry-derived "active"
+// are the same fact from a user's point of view, so both display as "active" —
+// the model itself keeps whichever value it was given (tests that assert
+// on stored state are unaffected).
+func displayState(s string) string {
+	if s == "healthy" {
+		return "active"
+	}
+	return s
+}
+
 func (m Model) renderTable() string {
 	if len(m.servers) == 0 {
 		return styleDim.Render("(no servers configured)")
@@ -156,7 +168,7 @@ func (m Model) renderTable() string {
 	for _, s := range m.servers {
 		nameW = maxInt(nameW, lipgloss.Width(s.Name))
 		kindW = maxInt(kindW, lipgloss.Width(s.Kind))
-		stateW = maxInt(stateW, lipgloss.Width(s.State))
+		stateW = maxInt(stateW, lipgloss.Width(displayState(s.State)))
 		restartsW = maxInt(restartsW, lipgloss.Width(strconv.Itoa(s.Restarts)))
 	}
 
@@ -170,7 +182,7 @@ func (m Model) renderTable() string {
 	const rowPrefixWidth = 2
 	for i, s := range m.servers {
 		row := formatRow(nameW, kindW, stateW, restartsW,
-			s.Name, s.Kind, s.State, strconv.Itoa(s.Restarts), s.URL)
+			s.Name, s.Kind, displayState(s.State), strconv.Itoa(s.Restarts), s.URL)
 		row = truncateWidth(row, m.width-rowPrefixWidth)
 		b.WriteString("\n")
 		if i == m.cursor {

@@ -62,7 +62,7 @@ func writeControlLine(w io.Writer, color bool, evt any) {
 
 	case eventbus.ServerStateChanged:
 		glyph, style := glyphFor(serverStateSeverity(e.State))
-		fmt.Fprintf(w, "%s %s: %s (restarts=%d)\n", colorize(color, style, glyph), e.Name, e.State, e.Restarts)
+		fmt.Fprintf(w, "%s %s: %s (restarts=%d)\n", colorize(color, style, glyph), e.Name, displayState(e.State), e.Restarts)
 
 	case eventbus.StreamOpened:
 		fmt.Fprintf(w, "%s stream %d opened\n", colorize(color, colorDim, "·"), e.ID)
@@ -117,6 +117,17 @@ func connStateSeverity(state string) severity {
 	default:
 		return sevWarn
 	}
+}
+
+// displayState maps a raw supervisor state to what gets printed: healthy
+// and an http row's "active" are the same fact from a user's point of
+// view, so both print as "active" (mirrors internal/tui/view.go's
+// displayState — kept separate since neither package imports the other).
+func displayState(s string) string {
+	if s == "healthy" {
+		return "active"
+	}
+	return s
 }
 
 func serverStateSeverity(state string) severity {

@@ -3,3 +3,4 @@
 /fakemcp
 *.tmp
 .DS_Store
+/Makefile.local

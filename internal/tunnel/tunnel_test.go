@@ -17,6 +17,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/mcpwarp/cli/internal/appproto"
 	"github.com/mcpwarp/cli/internal/eventbus"
+	"github.com/mcpwarp/cli/internal/registry"
 	"github.com/mcpwarp/ws-mixer-go/wsmixer"
 )
 
@@ -83,6 +84,26 @@ func newFakeTunnelServer(t *testing.T, onConn func(c *wsmixer.Conn)) *fakeTunnel
 	f.url = "ws" + f.srv.URL[len("http"):]
 	t.Cleanup(f.srv.Close)
 	return f
+}
+
+// connCount reports how many connections this fake server has accepted so
+// far (across every reconnect).
+func (f *fakeTunnelServer) connCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.conns)
+}
+
+// latestConn returns the most recently accepted connection, or nil if none
+// yet — unlike a CompareAndSwap-guarded atomic.Pointer, this always reflects
+// the current connection across any number of reconnects.
+func (f *fakeTunnelServer) latestConn() *wsmixer.Conn {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.conns) == 0 {
+		return nil
+	}
+	return f.conns[len(f.conns)-1]
 }
 
 func newTestBus(t *testing.T) *eventbus.Bus {
@@ -1043,5 +1064,430 @@ func TestEnableClearsPendingDisableEvenWhenNameNotConfigured(t *testing.T) {
 			t.Fatalf("expected the deferred disable to have been cleared by the enable, but OnDisable fired for %q", got)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// registeredNames extracts the sorted "register" batch's service names from
+// a raw app message, or nil if raw isn't a "register".
+func registeredNames(raw json.RawMessage) []string {
+	var wrapper struct {
+		Mcpwarp struct {
+			Op       string `json:"op"`
+			Services []struct {
+				Name string `json:"name"`
+			} `json:"services"`
+		} `json:"mcpwarp"`
+	}
+	if json.Unmarshal(raw, &wrapper) != nil || wrapper.Mcpwarp.Op != "register" {
+		return nil
+	}
+	names := make([]string, len(wrapper.Mcpwarp.Services))
+	for i, s := range wrapper.Mcpwarp.Services {
+		names[i] = s.Name
+	}
+	return names
+}
+
+// TestLocalDisablePersistsAcrossReconnect covers the bug fix: a local `d`
+// (UnregisterService) must survive a reconnect instead of the next
+// welcome's register batch silently resurrecting the name, and a following
+// `e` (RegisterService) must bring it back on the reconnect after that.
+func TestLocalDisablePersistsAcrossReconnect(t *testing.T) {
+	var mu sync.Mutex
+	var batches [][]string
+
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		c.OnApp(func(raw json.RawMessage) {
+			if names := registeredNames(raw); names != nil {
+				mu.Lock()
+				batches = append(batches, names)
+				mu.Unlock()
+			}
+		})
+	})
+
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services: []appproto.RegisterService{
+			{Name: "svc-a", Kind: "http"},
+			{Name: "svc-b", Kind: "http"},
+		},
+		Bus:       newTestBus(t),
+		Log:       slog.New(slog.DiscardHandler),
+		FatalExit: func(int) {},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	batchCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(batches)
+	}
+	batchAt := func(i int) []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), batches[i]...)
+	}
+	waitForBatch := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for batchCount() < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for register batch #%d, got %d so far", n, batchCount())
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	// Batch 1: the very first connect, unaffected by localUnregistered
+	// (empty) — both names present.
+	waitForBatch(1)
+	if got := batchAt(0); len(got) != 2 {
+		t.Fatalf("first register batch = %v, want both services", got)
+	}
+
+	waitForConn := func(n int) *wsmixer.Conn {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for srv.connCount() < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for the fake tunnel to accept connection #%d", n)
+			}
+			time.Sleep(time.Millisecond)
+		}
+		return srv.latestConn()
+	}
+
+	// A local `d` on svc-a, then force a reconnect.
+	if err := tun.UnregisterService("svc-a"); err != nil {
+		t.Fatalf("UnregisterService: %v", err)
+	}
+	_ = waitForConn(1).Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
+
+	// Batch 2: the reconnect's register must omit svc-a.
+	waitForBatch(2)
+	got := batchAt(1)
+	for _, name := range got {
+		if name == "svc-a" {
+			t.Fatalf("register batch after local disable = %v, want svc-a omitted", got)
+		}
+	}
+	if len(got) != 1 || got[0] != "svc-b" {
+		t.Fatalf("register batch after local disable = %v, want [svc-b]", got)
+	}
+
+	// A local `e` on svc-a: RegisterService itself immediately re-sends just
+	// svc-a over the still-live connection (sendRegisterFor, batch 3) before
+	// the forced reconnect below produces the batch this test actually
+	// wants to inspect (batch 4, once localUnregistered is empty again).
+	tun.RegisterService("svc-a")
+	waitForBatch(3)
+	_ = waitForConn(2).Close(uint32(wsmixer.InternalErrorCode), "forcing a second reconnect for test")
+
+	waitForBatch(4)
+	got = batchAt(3)
+	if len(got) != 2 {
+		t.Fatalf("register batch after re-enable = %v, want both services back", got)
+	}
+}
+
+// TestLocalDisableOfOnlyServiceSendsNoRegisterOnReconnect covers
+// currentRegisterBody's empty-subset case: with a single configured
+// service, a local `d` followed by a forced reconnect must produce no
+// "register" op at all on the new connection — neither this CLI nor Node's
+// ever sends a register with an empty services list, and the fake tunnel
+// must see nothing to unregister-and-resurrect race against.
+func TestLocalDisableOfOnlyServiceSendsNoRegisterOnReconnect(t *testing.T) {
+	var mu sync.Mutex
+	var batches [][]string
+
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		c.OnApp(func(raw json.RawMessage) {
+			if names := registeredNames(raw); names != nil {
+				mu.Lock()
+				batches = append(batches, names)
+				mu.Unlock()
+			}
+		})
+	})
+
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
+		Bus:         newTestBus(t),
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(int) {},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	batchCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(batches)
+	}
+	waitForBatch := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for batchCount() < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for register batch #%d, got %d so far", n, batchCount())
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	waitForConn := func(n int) *wsmixer.Conn {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for srv.connCount() < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for the fake tunnel to accept connection #%d", n)
+			}
+			time.Sleep(time.Millisecond)
+		}
+		return srv.latestConn()
+	}
+
+	waitForBatch(1)
+
+	if err := tun.UnregisterService("svc"); err != nil {
+		t.Fatalf("UnregisterService: %v", err)
+	}
+	_ = waitForConn(1).Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
+	waitForConn(2)
+
+	// Give the (absent) register a brief window to have arrived if it were
+	// (erroneously) going to.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if batchCount() > 1 {
+			t.Fatalf("got a register op on the reconnect with only one, locally-disabled, service: %v", batches[1])
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestServerDisablePersistsAcrossReconnect covers item 3: a dashboard-driven
+// OpDisable (unlike a local `d`) must NOT be treated as a local
+// unregister — the name must still be sent in the next reconnect's register
+// batch so the server can reply SERVER_DISABLED and the resume-on-enable
+// flow (OpEnable) keeps working.
+func TestServerDisablePersistsAcrossReconnect(t *testing.T) {
+	var mu sync.Mutex
+	var batches [][]string
+	var conn atomic.Pointer[wsmixer.Conn]
+
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		conn.Store(c)
+		c.OnApp(func(raw json.RawMessage) {
+			if names := registeredNames(raw); names != nil {
+				mu.Lock()
+				batches = append(batches, names)
+				mu.Unlock()
+				_ = c.SendApp(context.Background(), map[string]any{
+					"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []map[string]any{
+						{"name": "svc", "id": "id1", "url": "https://svc.example/mcp", "created": true},
+					}, "errors": []any{}},
+				})
+			}
+		})
+	})
+
+	var disabledName atomic.Value
+	disabledName.Store("")
+
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
+		Bus:         newTestBus(t),
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(int) {},
+		OnDisable: func(name, id, reason string) {
+			disabledName.Store(name)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	batchCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(batches)
+	}
+	waitForBatch := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for batchCount() < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for register batch #%d, got %d so far", n, batchCount())
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	waitForBatch(1)
+
+	c := conn.Load()
+	_ = c.SendApp(context.Background(), map[string]any{
+		"mcpwarp": map[string]any{"v": 1, "op": "disable", "id": "id1", "reason": "quota"},
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for disabledName.Load().(string) != "svc" {
+		if time.Now().After(deadline) {
+			t.Fatal("OnDisable never fired for svc")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	_ = c.Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
+
+	waitForBatch(2)
+	mu.Lock()
+	got := append([]string(nil), batches[1]...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != "svc" {
+		t.Fatalf("register batch after server-side disable + reconnect = %v, want [svc] (still re-registered)", got)
+	}
+}
+
+// TestServerEnableClearsLocalDisable covers item 2: a dashboard-driven
+// OpEnable for a name the user had also locally `d`-disabled must clear
+// localUnregistered (handleApp's OpEnable now goes through RegisterService,
+// not sendRegisterFor directly), or the very next reconnect would silently
+// drop the service again despite the dashboard having just re-enabled it.
+func TestServerEnableClearsLocalDisable(t *testing.T) {
+	var mu sync.Mutex
+	var batches [][]string
+	var conn atomic.Pointer[wsmixer.Conn]
+
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		conn.Store(c)
+		c.OnApp(func(raw json.RawMessage) {
+			if names := registeredNames(raw); names != nil {
+				mu.Lock()
+				batches = append(batches, names)
+				mu.Unlock()
+				_ = c.SendApp(context.Background(), map[string]any{
+					"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []map[string]any{
+						{"name": "svc", "id": "id1", "url": "https://svc.example/mcp", "created": true},
+					}, "errors": []any{}},
+				})
+			}
+		})
+	})
+
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
+		Bus:         newTestBus(t),
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(int) {},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	batchCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(batches)
+	}
+	batchAt := func(i int) []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), batches[i]...)
+	}
+	waitForBatch := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for batchCount() < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for register batch #%d, got %d so far", n, batchCount())
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	waitForBatch(1)
+
+	// Wait for the registry to know svc's id before disabling — the fake
+	// server's "registered" reply above races with this.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := tun.Registry().Get("svc"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("registry never populated")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// A local `d` on svc, then a dashboard-driven "enable" for it.
+	if err := tun.UnregisterService("svc"); err != nil {
+		t.Fatalf("UnregisterService: %v", err)
+	}
+	c := conn.Load()
+	_ = c.SendApp(context.Background(), map[string]any{
+		"mcpwarp": map[string]any{"v": 1, "op": "enable", "id": "id1", "name": "svc"},
+	})
+
+	// The enable's own RegisterService call re-sends svc immediately over
+	// the still-live connection (batch 2) before the forced reconnect below
+	// produces the batch this test actually wants to inspect (batch 3).
+	waitForBatch(2)
+	_ = c.Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
+
+	waitForBatch(3)
+	if got := batchAt(2); len(got) != 1 || got[0] != "svc" {
+		t.Fatalf("register batch after server-side enable + reconnect = %v, want [svc] (local disable cleared)", got)
+	}
+}
+
+// TestRegisterServiceWhileDisconnectedClearsLocalFlag covers edge case 4:
+// RegisterService (the `e` keypress) must clear the local-unregistered flag
+// even with no live connection, so the next welcome's register batch
+// includes the name again — exercised directly against a Tunnel built
+// around a wsmixer.Client that has never dialed (Conn() reports nil, same
+// as a genuinely dropped connection).
+func TestRegisterServiceWhileDisconnectedClearsLocalFlag(t *testing.T) {
+	services := []appproto.RegisterService{{Name: "svc", Kind: "http"}}
+	// Only the fields UnregisterService/RegisterService/currentRegisterBody
+	// touch: cfg (Services), log, registry, client (for Conn()), registerBody,
+	// localUnregistered. disp is deliberately left nil — nothing here goes
+	// through the dispatcher.
+	tun := &Tunnel{
+		cfg:               Config{Services: services},
+		log:               slog.New(slog.DiscardHandler),
+		registry:          registry.New(),
+		client:            wsmixer.NewClient("ws://unused.invalid", wsmixer.StaticToken("t"), wsmixer.ClientConfig{}),
+		registerBody:      appproto.EncodeRegister(services),
+		localUnregistered: make(map[string]bool),
+	}
+
+	if err := tun.UnregisterService("svc"); err != nil {
+		t.Fatalf("UnregisterService: %v", err)
+	}
+	if got := tun.currentRegisterBody(); got != nil {
+		t.Fatalf("register body after local disable = %v, want nil (svc was the only configured service)", got)
+	}
+
+	// `e` while still disconnected (tun.client.Conn() is nil — never dialed).
+	tun.RegisterService("svc")
+
+	got := tun.currentRegisterBody()
+	svcs := got["mcpwarp"].(map[string]any)["services"].([]map[string]any)
+	if len(svcs) != 1 || svcs[0]["name"] != "svc" {
+		t.Fatalf("register body after RegisterService while disconnected = %v, want [svc] restored", got)
 	}
 }

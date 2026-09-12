@@ -118,6 +118,23 @@ type Tunnel struct {
 	// caller to supply separately).
 	kindByName map[string]string
 
+	// mu guards localUnregistered, touched from whatever goroutine drives a
+	// local `d`/`e` keypress (Controller.Disable/Enable) concurrently with
+	// onConnect reading it from this package's dispatcher goroutine.
+	mu sync.Mutex
+	// localUnregistered holds names most recently taken down by a local `d`
+	// keypress (UnregisterService) that haven't since been brought back by
+	// `e` (RegisterService) — DESIGN.md §9: a local disable must survive a
+	// reconnect instead of the next welcome's register batch resurrecting
+	// it. Deliberately separate from registry's disabledIds/Status, which
+	// also carries a dashboard-driven OpDisable: those names must still be
+	// re-registered on reconnect so the server can reply SERVER_DISABLED
+	// and the resume-on-enable flow (OpEnable -> RegisterService) keeps
+	// working, so this set can't just be "is the registry entry disabled".
+	// Empty until the first local `d`, so the very first connect's batch is
+	// unaffected.
+	localUnregistered map[string]bool
+
 	// sawFirstRegistered is set once this process has ever applied a
 	// "registered" batch with at least one success — it lives on the
 	// Tunnel, not per-connection, so it stays true across every reconnect
@@ -154,18 +171,19 @@ func Start(ctx context.Context, cfg Config) (*Tunnel, error) {
 	reg := registry.New()
 	reg.SetLogger(cfg.Log)
 	t := &Tunnel{
-		cfg:             cfg,
-		log:             cfg.Log,
-		registry:        reg,
-		forwarder:       relay.NewForwarder(),
-		overload:        appproto.NewOverloadQueue(),
-		disp:            newDispatcher(),
-		unreachableWarn: relay.NewUnreachableWarnLimiter(),
-		relayCtx:        relayCtx,
-		relayCancel:     relayCancel,
-		registerBody:    appproto.EncodeRegister(regServices),
-		unregisterBody:  appproto.EncodeUnregister(unregServices),
-		kindByName:      kindByName,
+		cfg:               cfg,
+		log:               cfg.Log,
+		registry:          reg,
+		forwarder:         relay.NewForwarder(),
+		overload:          appproto.NewOverloadQueue(),
+		disp:              newDispatcher(),
+		unreachableWarn:   relay.NewUnreachableWarnLimiter(),
+		relayCtx:          relayCtx,
+		relayCancel:       relayCancel,
+		registerBody:      appproto.EncodeRegister(regServices),
+		unregisterBody:    appproto.EncodeUnregister(unregServices),
+		kindByName:        kindByName,
+		localUnregistered: make(map[string]bool),
 	}
 
 	tokenProvider := func(ctx context.Context) (string, error) {
@@ -214,9 +232,11 @@ func (t *Tunnel) onConnect(c *wsmixer.Conn, welcome *wsmixer.WelcomeMsg) {
 		}
 		t.log.Info("connected to tunnel", "session", session)
 		t.publish(eventbus.ConnStateChanged{State: "connected", Session: session})
-		t.sendApp(c, t.registerBody, func(err error) {
-			t.log.Warn("failed to send register", "err", err)
-		})
+		if body := t.currentRegisterBody(); body != nil {
+			t.sendApp(c, body, func(err error) {
+				t.log.Warn("failed to send register", "err", err)
+			})
+		}
 	})
 }
 
@@ -338,7 +358,11 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 		if t.cfg.OnEnable != nil {
 			go t.cfg.OnEnable(msg.EnableName)
 		}
-		t.sendRegisterFor(msg.EnableName)
+		// RegisterService, not sendRegisterFor directly: a dashboard enable
+		// for a name the user had also locally `d`-disabled must clear
+		// localUnregistered too, or the child gets respawned/registered now
+		// but dropped again silently on the very next reconnect.
+		t.RegisterService(msg.EnableName)
 
 	case appproto.OpError:
 		if msg.ErrorCode == "UNSUPPORTED_VERSION" {
@@ -358,6 +382,38 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 			t.log.Warn(msg.ErrorMessage, "code", msg.ErrorCode)
 		}
 	}
+}
+
+// currentRegisterBody builds the "register" payload for this connect or
+// reconnect, omitting any name currently in localUnregistered (a local `d`
+// keypress not yet followed by `e`) — see that field's doc. The common case
+// (nothing locally unregistered, including every fresh `up`) returns the
+// same precomputed t.registerBody rather than re-encoding it. Returns nil
+// if every configured service is currently locally unregistered: neither
+// this CLI nor Node's ever sends a register with an empty services list,
+// and the server may bounce an empty batch as BAD_REQUEST, which handleApp
+// would then log as a protocol mismatch.
+func (t *Tunnel) currentRegisterBody() map[string]any {
+	t.mu.Lock()
+	n := len(t.localUnregistered)
+	skip := make(map[string]bool, n)
+	for name := range t.localUnregistered {
+		skip[name] = true
+	}
+	t.mu.Unlock()
+	if n == 0 {
+		return t.registerBody
+	}
+	subset := make([]appproto.RegisterService, 0, len(t.cfg.Services))
+	for _, s := range t.cfg.Services {
+		if !skip[s.Name] {
+			subset = append(subset, s)
+		}
+	}
+	if len(subset) == 0 {
+		return nil
+	}
+	return appproto.EncodeRegister(subset)
 }
 
 // hasConfiguredService reports whether name is one this connection's own
@@ -400,9 +456,14 @@ func (t *Tunnel) sendRegisterFor(name string) {
 // RegisterService re-registers a single configured service — the exported
 // counterpart of sendRegisterFor, for a caller-driven "enable" (a local `e`
 // keypress/Controller.Enable, DESIGN.md §9) rather than one arriving off
-// the wire. A no-op if name isn't one of this connection's configured
-// services or if there's currently no live connection.
+// the wire. Always clears name from localUnregistered first, even with no
+// live connection (edge case: `e` pressed while disconnected must still
+// make the next welcome's register batch include name again) — the actual
+// re-register send below stays a no-op in that case, same as before.
 func (t *Tunnel) RegisterService(name string) {
+	t.mu.Lock()
+	delete(t.localUnregistered, name)
+	t.mu.Unlock()
 	t.sendRegisterFor(name)
 }
 
@@ -411,9 +472,14 @@ func (t *Tunnel) RegisterService(name string) {
 // Controller.Disable (DESIGN.md §9). It also flips that entry's registry
 // status to disabled locally (if known) so relay/registry.IsDisabled 503s
 // the service immediately rather than waiting on a round trip through the
-// tunnel's own "disable" reply. Best-effort like every other app send: a
-// failure to actually reach the tunnel just logs.
+// tunnel's own "disable" reply, and marks name locally unregistered so a
+// later reconnect's register batch excludes it (see localUnregistered's
+// doc) until a matching RegisterService. Best-effort like every other app
+// send: a failure to actually reach the tunnel just logs.
 func (t *Tunnel) UnregisterService(name string) error {
+	t.mu.Lock()
+	t.localUnregistered[name] = true
+	t.mu.Unlock()
 	if entry, ok := t.registry.Get(name); ok {
 		t.registry.ApplyDisable(entry.ID, "unregistered locally")
 	}

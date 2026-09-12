@@ -129,7 +129,7 @@ Port list (verified against `mcpwarp-cli/src/bridge/{stdio-child,supervisor,http
 | Framing | NDJSON on child stdout, 16 MiB line cap, non-JSON skipped (debug); stdin backpressure-aware | Port as-is |
 | stderr | Piped at debug level, `[name]`-prefixed, shown under `--verbose` | Port as-is |
 | Supervisor backoff | Full-jitter, base 1000ms, cap 30000ms; 10 crashes without 60s healthy uptime → `failed` | Distinct from SDK reconnect cap (60000ms, §2.9) |
-| Supervisor states | `healthy/restarting/failed/disabled/stopped`; `enable` = respawn + re-register | Port as-is; http rows have no supervisor and show the registry's status (`active`/`disabled`) in the STATE column instead |
+| Supervisor states | `healthy/restarting/failed/disabled/stopped`; `enable` = respawn + re-register | Port as-is; the supervisor's internal state name stays `healthy`, but the STATE column displays it as `active` (so stdio and http rows — which show the registry's status, `active`/`disabled`, having no supervisor — share one vocabulary) |
 | `replaceChild` | Swaps child after restart; listener/port/session untouched; in-flight requests get `-32000 "local server restarted"` | Port as-is |
 | HTTP bridge routing | By JSON-RPC shape — serves session-based and stateless transports | Port as-is |
 | id rewriting | Client ids rewritten to bridge-minted monotonic ids | Port as-is |
@@ -153,7 +153,7 @@ Envelope: `{"mcpwarp":{"v":1,"op":...}}` wrapping `SendApp`'s body on stream 0 (
 |---|---|---|---|
 | out | `register` | `{services:[{name,kind}]}` | Sent on every `welcome` |
 | out | `unregister` | `{services:[{name}]}` | On shutdown |
-| in | `registered` | `{services:[{name,id,url,created}], errors:[{name,code,message}]}` | Authoritative on reconnect — resurrects locally-disabled servers |
+| in | `registered` | `{services:[{name,id,url,created}], errors:[{name,code,message}]}` | Authoritative on reconnect — resurrects dashboard-disabled servers (a locally-disabled one is excluded from the reconnect batch entirely, §9) |
 | in | `unregistered` | `{services:[{name,id}]}` | |
 | in | `disable` | `{id,reason}` | May arrive before id is known locally → pending-disables map keyed by id |
 | in | `enable` | `{id,name}` | Resolved by name |
@@ -166,13 +166,15 @@ Go encode/decode: a flat struct can't express op-specific payloads — two-pass 
 
 **bubbletea v2, pinned exact version, decided (§13)** (`research-stack.md`) — v1 is frozen; v2 is young but the only forward-looking choice. Isolated in `internal/tui` behind the event bus, with no `--no-tui`-default fallback plan. `tview` was evaluated and rejected by the owner. Companion libs: `bubbles` + `lipgloss` v2, `huh` for prompts.
 
-**`up` screen** (fed by the event bus, §3): connection state; per-server table — NAME, KIND, STATE, RESTARTS, URL (no streams column; stream events carry no server name) — with aggregate streams/bytes/latency in the header; latency from `MetricSample{Kind:"ping_rtt"}` (`busMetrics.PingRTT`, not a `LogLine`); bytes polled from `Stats()` once a second (`BytesTransferred` fires per DATA frame — too hot to publish per call); last error; scrollable log tail.
+**`up` screen** (fed by the event bus, §3): connection state; per-server table — NAME, KIND, STATE, RESTARTS, URL (no streams column; stream events carry no server name) — with aggregate streams/bytes/latency in the header; latency from `MetricSample{Kind:"ping_rtt"}` (`busMetrics.PingRTT`, not a `LogLine`); bytes polled from `Stats()` once a second (`BytesTransferred` fires per DATA frame — too hot to publish per call); last error; scrollable log tail. STATE displays a healthy supervisor as `active`, not `healthy`, so a stdio row reads the same as an http row's registry-derived status.
 
 **Keybindings (decided):** `q` quit, `?` help, arrows or `j`/`k` move selection, `l` toggle log pane, `pgup`/`pgdown`/`ctrl+u`/`ctrl+d` page/half-page the log pane, `r` restart selected server, `d` disable selected server, `e` enable selected server.
 
 **TTY requirement.** The TUI path requires *both* stdin and stdout to be a TTY (`defaultUpIsTTY`), not stdout alone — it reads keypresses too, so either being redirected degrades to the plain renderer. A `kill -INT` while the TUI owns the screen races bubbletea's own signal handling benignly: bubbletea restores the terminal either way.
 
 `d` stops the child (supervisor state `disabled`, same as a remote disable) and sends `unregister` for that one service; `e` respawns it and sends `register` for it. Both reuse the existing ops (§8) — no new protocol. For an http server, which has no child, only the unregister/register half applies. Consequence: while locally disabled, the dashboard shows the service as absent, not paused; an agent-paused dashboard state is a possible later SaaS addition, out of scope here.
+
+A local `d` persists across a tunnel reconnect: the name is excluded from every register batch the tunnel sends until a matching `e`, so a reconnect can't silently resurrect (and, for stdio, respawn) a service the user deliberately stopped. A dashboard-driven disable is unaffected — that name is still re-registered on reconnect so the server can answer `SERVER_DISABLED` and resume-on-enable keeps working.
 
 **Degrade path:** stdout not a TTY, or `--no-tui` — skip bubbletea, use `internal/output`'s plain-line renderer (parity with Node's pino pretty-on-TTY / NDJSON-off-TTY, ✓/!/✗, NO_COLOR). Non-TTY fallback is plain lines on stdout plus JSON log lines on stderr (`slog`, matching Node's pino behaviour) — no `--json` mode (§2, §13).
 

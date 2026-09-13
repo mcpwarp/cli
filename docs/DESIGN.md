@@ -191,7 +191,7 @@ A local `d` persists across a tunnel reconnect: the name is excluded from every 
 ## 11. Distribution
 
 - **goreleaser** (`.goreleaser.yaml` v2, OSS): `goos: [linux, darwin, windows]` × `goarch: [amd64, arm64]` (`CGO_ENABLED=0`) — six targets, including `windows/arm64`.
-- `nfpms` for `.deb`/`.rpm`/`.apk`; `homebrew_casks` (macOS only — `brews:` is hard-deprecated since goreleaser v2.16; Linux gets the nfpm packages instead) and `scoops` for Homebrew/Scoop; sha256 `checksum`.
+- `nfpms` for `.deb`/`.rpm`/`.apk`; `homebrew_casks` (covers macOS and Linux Homebrew — `brews:` is hard-deprecated since goreleaser v2.16; nfpm covers non-Homebrew Linux) and `scoops` for Homebrew/Scoop; sha256 `checksum`. Homebrew 6+ requires `brew trust --tap mcpwarp/tap` once before installing from this tap.
 - Version via `-ldflags "-X main.version=..."` from the git tag. The runtime update notice lives in `internal/update` (see §2), not here — `release.prerelease: auto` is what keeps a prerelease tag (e.g. `v1.0.0-rc.1`) off `/releases/latest`, and therefore out of the notice too, since `internal/update.Check` only ever compares against that endpoint.
 - **License:** MIT (decided 2026-09-05). `nfpms`/`homebrew_casks`/`scoops` declare `MIT`, matching the repo's `LICENSE` file.
 - **Signing/notarization deferred** — Pro feature or custom post-hook; not needed for v1.

@@ -87,9 +87,10 @@ nfpms:
       - apk
     bindir: /usr/bin
 
-# Casks are macOS-only; Linux users get the deb/rpm/apk packages from nfpms
-# above. `brews:` is hard-deprecated since goreleaser v2.16 (fails `check`
-# with exit 2) — migrated to `homebrew_casks:` per deprecations.md.
+# The cask covers macOS and Linux (Homebrew on Linux); the deb/rpm/apk
+# packages from nfpms above are for users without Homebrew. `brews:` is
+# hard-deprecated since goreleaser v2.16 (fails `check` with exit 2) —
+# migrated to `homebrew_casks:` per deprecations.md.
 homebrew_casks:
   - name: mcpwarp
     binaries: [mcpwarp]

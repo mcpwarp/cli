@@ -643,13 +643,21 @@ func (t *Tunnel) onDisconnect(reason wsmixer.DisconnectReason) {
 // (4000 + 0x0b), used the same way Node client.ts's UNAUTHORIZED_WS_CODE is.
 const unauthorizedWSCode = 4011
 
-// connectionLimitWSCode is the wsmixer close code for
-// wsmixer.EnhanceYourCalm (4000 + 0x09). The tunnel server (0.3.1+) also
-// uses this code for its own account connection cap, distinguished only by
-// connectionLimitPrefix on the close reason — a bare 4009 keeps ws-mixer's
-// own meaning (rate limit / oversize payload) and must not be treated as a
-// connection-limit close.
-const connectionLimitWSCode = 4009
+// applicationCloseErrorCode is ws-mixer's reserved application-level error
+// code 0x0e (4000 + 0x0e = 4014). ws-mixer-go v0.4.0 has no exported const
+// for it — DisconnectReason.ErrorName renders "INTERNAL_ERROR" for this
+// code, since 0x0e is unrecognized there — but a later ws-mixer-go release
+// is expected to export a named constant for it.
+const applicationCloseErrorCode = 0x0e
+
+// connectionLimitWSCode is the WS close code the tunnel server uses for its
+// account connection cap: ws-mixer's application-level close (0x0e),
+// distinguished only by connectionLimitPrefix on the close reason — a bare
+// 4014 without that prefix is ws-mixer's own application-level close for
+// something else and must not be treated as a connection-limit close. 4009
+// (wsmixer.EnhanceYourCalm) is ws-mixer's own rate-limit/oversize meaning
+// and the tunnel never sends it for the connection cap.
+const connectionLimitWSCode = 4000 + applicationCloseErrorCode
 
 // connectionLimitPrefix is the fixed lead-in of a CONNECTION_LIMIT close
 // reason or app error message; only the prefix is a stable contract, the
@@ -657,9 +665,13 @@ const connectionLimitWSCode = 4009
 const connectionLimitPrefix = "CONNECTION_LIMIT:"
 
 // connectionLimitHint is the guidance surfaced for a CONNECTION_LIMIT close
-// or app error, both in the log line and as the AppError's Hint: the SDK is
-// already retrying at the backoff cap, so recovery just needs one fewer
-// live mcpwarp agent for this account.
+// or app error, both in the log line and as the AppError's Hint. With
+// ws-mixer-go v0.4.0 the SDK retries a 4014 on its default full-jitter
+// schedule, and because the attempt counter resets on every welcome and the
+// cap close is post-welcome, the delay stays at random(0-2s) per cycle; a
+// fix is requested in ws-mixer-go (grow backoff for post-welcome
+// rejections). Recovery just needs one fewer live mcpwarp agent for this
+// account.
 const connectionLimitHint = "close another `mcpwarp up` and this one will reconnect"
 
 // classifyFatalMessage is this package's half of client.ts's classifyFatal:

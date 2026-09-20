@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -117,6 +118,15 @@ type Tunnel struct {
 	// RegisterService already names its own kind, so there's nothing for a
 	// caller to supply separately).
 	kindByName map[string]string
+
+	// connLimitReported is set once a CONNECTION_LIMIT AppError has been
+	// published for the current connection attempt, so the app-level error
+	// envelope and a matching close reason — both of which can arrive for
+	// the same condition — don't surface it twice. Reset on every onConnect,
+	// so a new connection attempt reports CONNECTION_LIMIT again. Touched
+	// only from the dispatcher goroutine (onConnect, handleApp and
+	// onDisconnect all run inside t.disp.enqueue), so it needs no locking.
+	connLimitReported bool
 
 	// mu guards localUnregistered, touched from whatever goroutine drives a
 	// local `d`/`e` keypress (Controller.Disable/Enable) concurrently with
@@ -222,11 +232,38 @@ func (t *Tunnel) publish(evt any) {
 	}
 }
 
+// publishConnLimitError is publish for a CONNECTION_LIMIT eventbus.AppError
+// specifically, deduped against connLimitReported so the app-level error
+// envelope and a matching close reason don't both surface it for the same
+// connection attempt. Only callable from the dispatcher goroutine.
+func (t *Tunnel) publishConnLimitError(evt eventbus.AppError) {
+	if t.connLimitReported {
+		return
+	}
+	t.connLimitReported = true
+	t.publish(evt)
+}
+
+// connectionLimitMessage strips connectionLimitPrefix and surrounding
+// whitespace from raw (a CONNECTION_LIMIT close reason or app error
+// message), falling back to a generic message when that leaves nothing —
+// the single source both onDisconnect and handleApp build their
+// CONNECTION_LIMIT AppError's Message from, so the two paths produce an
+// identical Message (and therefore Hint) for the dedupe to actually match.
+func connectionLimitMessage(raw string) string {
+	msg := strings.TrimSpace(strings.TrimPrefix(raw, connectionLimitPrefix))
+	if msg == "" {
+		return "too many agent connections for this account"
+	}
+	return msg
+}
+
 // --- wsmixer callbacks (fire on the SDK's shared delivery goroutine) -----
 
 func (t *Tunnel) onConnect(c *wsmixer.Conn, welcome *wsmixer.WelcomeMsg) {
 	session := welcome.Session
 	t.disp.enqueue(func() {
+		t.connLimitReported = false
 		if a, ok := t.cfg.TokenSource.(accepter); ok {
 			a.MarkAccepted()
 		}
@@ -359,6 +396,12 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 			// See the "registered" fatal path above: must not run
 			// synchronously on this dispatcher goroutine.
 			go t.cfg.FatalExit(1)
+			return
+		}
+		if msg.ErrorCode == "CONNECTION_LIMIT" {
+			message := connectionLimitMessage(msg.ErrorMessage)
+			t.log.Warn("too many mcpwarp agents connected for this account; "+connectionLimitHint, "message", message)
+			t.publishConnLimitError(eventbus.AppError{Code: msg.ErrorCode, Message: message, Hint: connectionLimitHint})
 			return
 		}
 		t.publish(eventbus.AppError{Code: msg.ErrorCode, Message: msg.ErrorMessage})
@@ -571,6 +614,12 @@ func (t *Tunnel) onDisconnect(reason wsmixer.DisconnectReason) {
 	t.disp.enqueue(func() {
 		t.publish(eventbus.ConnStateChanged{State: "disconnected"})
 		if !reason.Fatal {
+			if reason.WSCode == connectionLimitWSCode && strings.HasPrefix(reason.Message, connectionLimitPrefix) {
+				message := connectionLimitMessage(reason.Message)
+				t.log.Warn("too many mcpwarp agents connected for this account; "+connectionLimitHint, "message", message)
+				t.publishConnLimitError(eventbus.AppError{Code: "CONNECTION_LIMIT", Message: message, Hint: connectionLimitHint})
+				return
+			}
 			t.log.Info("tunnel disconnected; SDK reconnecting", "phase", reason.Phase, "message", reason.Message)
 			return
 		}
@@ -593,6 +642,25 @@ func (t *Tunnel) onDisconnect(reason wsmixer.DisconnectReason) {
 // unauthorizedWSCode is the wsmixer close code for wsmixer.UnauthorizedCode
 // (4000 + 0x0b), used the same way Node client.ts's UNAUTHORIZED_WS_CODE is.
 const unauthorizedWSCode = 4011
+
+// connectionLimitWSCode is the wsmixer close code for
+// wsmixer.EnhanceYourCalm (4000 + 0x09). The tunnel server (0.3.1+) also
+// uses this code for its own account connection cap, distinguished only by
+// connectionLimitPrefix on the close reason — a bare 4009 keeps ws-mixer's
+// own meaning (rate limit / oversize payload) and must not be treated as a
+// connection-limit close.
+const connectionLimitWSCode = 4009
+
+// connectionLimitPrefix is the fixed lead-in of a CONNECTION_LIMIT close
+// reason or app error message; only the prefix is a stable contract, the
+// account's connection limit number after it is not.
+const connectionLimitPrefix = "CONNECTION_LIMIT:"
+
+// connectionLimitHint is the guidance surfaced for a CONNECTION_LIMIT close
+// or app error, both in the log line and as the AppError's Hint: the SDK is
+// already retrying at the backoff cap, so recovery just needs one fewer
+// live mcpwarp agent for this account.
+const connectionLimitHint = "close another `mcpwarp up` and this one will reconnect"
 
 // classifyFatalMessage is this package's half of client.ts's classifyFatal:
 // the message a fatal disconnect is logged (and exited) with, kept in

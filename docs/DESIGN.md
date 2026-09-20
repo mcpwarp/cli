@@ -157,8 +157,10 @@ Envelope: `{"mcpwarp":{"v":1,"op":...}}` wrapping `SendApp`'s body on stream 0 (
 | in | `unregistered` | `{services:[{name,id}]}` | |
 | in | `disable` | `{id,reason}` | May arrive before id is known locally → pending-disables map keyed by id |
 | in | `enable` | `{id,name}` | Resolved by name |
-| in | `error` | `{code,message}` | `UNSUPPORTED_VERSION` (fatal, exit 1), `OVERLOADED` (pause 1s), `UNKNOWN_OP`/`BAD_REQUEST` (warn), `INTERNAL` |
+| in | `error` | `{code,message}` | `UNSUPPORTED_VERSION` (fatal, exit 1), `OVERLOADED` (pause 1s), `UNKNOWN_OP`/`BAD_REQUEST` (warn), `INTERNAL`, `CONNECTION_LIMIT` (non-fatal, best-effort — see close-code note below) |
 | register errors | — | `QUOTA_EXCEEDED`, `CONFLICT`, `SERVER_DISABLED` (non-fatal, wait) | |
+
+A close with code 4009 and reason prefix `CONNECTION_LIMIT:` is server 0.3.1+'s per-account concurrent-agent-connection cap (non-fatal): the SDK reconnects on its "start at cap" schedule (random 0–30s), unchanged, and the close is surfaced as an `AppError{Code:"CONNECTION_LIMIT"}` with a reconnect-guidance `Hint`, same as the app-level `error` row above — a bare 4009 (no prefix) keeps ws-mixer's own `ENHANCE_YOUR_CALM` meaning and is not this.
 
 Go encode/decode: a flat struct can't express op-specific payloads — two-pass decode or `json.RawMessage` per-op in a switch. **Unknown op/version**: ignored-with-log, not fatal. **OVERLOADED**: pause sends 1s, queue up to 64, drop-oldest beyond — port the Node constants exactly.
 

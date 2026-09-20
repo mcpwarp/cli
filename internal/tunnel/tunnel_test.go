@@ -803,6 +803,170 @@ func TestUnauthorizedCloseIsFatalWithSessionExpiredMessage(t *testing.T) {
 	}
 }
 
+// TestConnectionLimitCloseIsNonFatalWithHintAndReconnects covers onDisconnect's
+// CONNECTION_LIMIT branch: a 4009 (wsmixer.EnhanceYourCalm) close whose reason
+// carries the connectionLimitPrefix must not be fatal, must publish an
+// AppError with Code CONNECTION_LIMIT and a non-empty Hint, and — since this
+// package changes no backoff — the SDK must still be retrying underneath it.
+func TestConnectionLimitCloseIsNonFatalWithHintAndReconnects(t *testing.T) {
+	var conns atomic.Int32
+	var firstConn atomic.Pointer[wsmixer.Conn]
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		conns.Add(1)
+		firstConn.CompareAndSwap(nil, c)
+	})
+
+	bus := eventbus.New(64)
+	go func() {
+		for range bus.Telemetry {
+		}
+	}()
+	t.Cleanup(bus.Close)
+
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
+		Bus:         bus,
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for firstConn.Load() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("fake tunnel never accepted a connection")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	_ = firstConn.Load().Close(uint32(wsmixer.EnhanceYourCalm),
+		"CONNECTION_LIMIT: too many agent connections for this account (limit 10)")
+
+	var appErr eventbus.AppError
+	found := false
+	deadline = time.Now().Add(2 * time.Second)
+	for !found {
+		select {
+		case evt := <-bus.Control:
+			if ae, ok := evt.(eventbus.AppError); ok && ae.Code == "CONNECTION_LIMIT" {
+				appErr = ae
+				found = true
+			}
+		case <-time.After(time.Until(deadline)):
+			t.Fatal("expected a CONNECTION_LIMIT AppError, got none")
+		}
+	}
+	if appErr.Hint == "" {
+		t.Fatal("expected a non-empty Hint on the CONNECTION_LIMIT AppError")
+	}
+	if appErr.Message == "" || strings.Contains(appErr.Message, connectionLimitPrefix) {
+		t.Fatalf("expected the AppError Message to be the server text with the prefix stripped, got %q", appErr.Message)
+	}
+
+	if exitCode.Load() != -1 {
+		t.Fatalf("expected no FatalExit for a CONNECTION_LIMIT close, got exit code %d", exitCode.Load())
+	}
+
+	// The SDK's own reconnect (unchanged backoff, still capped at 30s by
+	// this package) should still be under way. Rather than wait out a
+	// worst-case ~30s full-jitter delay for an actual second connection,
+	// poll the wsmixer Client's own state machine (client_reconnect.go),
+	// which flips to "dialing" immediately and then "backoff" well within a
+	// second — it must never report "closed", and FatalExit must never run.
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		state := tun.client.State()
+		if state == "backoff" || state == "dialing" {
+			break
+		}
+		if state == "closed" {
+			t.Fatalf("expected the SDK to keep reconnecting after a CONNECTION_LIMIT close, got state %q", state)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected the SDK to reach backoff/dialing after a CONNECTION_LIMIT close, got stuck at %q", state)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if exitCode.Load() != -1 {
+		t.Fatalf("expected no FatalExit while the SDK reconnects after a CONNECTION_LIMIT close, got exit code %d", exitCode.Load())
+	}
+}
+
+// TestPlainEnhanceYourCalmCloseIsNotConnectionLimit covers the other half of
+// onDisconnect's CONNECTION_LIMIT branch: a 4009 close without the
+// connectionLimitPrefix keeps ws-mixer's own meaning (rate limit / oversize
+// payload) and must not be reported as a CONNECTION_LIMIT AppError.
+func TestPlainEnhanceYourCalmCloseIsNotConnectionLimit(t *testing.T) {
+	var firstConn atomic.Pointer[wsmixer.Conn]
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		firstConn.CompareAndSwap(nil, c)
+	})
+
+	bus := eventbus.New(64)
+	go func() {
+		for range bus.Telemetry {
+		}
+	}()
+	t.Cleanup(bus.Close)
+
+	// Drain bus.Control for the whole test, on a background goroutine
+	// stopped only via t.Cleanup: Control is lossless, so letting it go
+	// undrained around tun.Close's own ConnStateChanged publish (the defer
+	// below runs before this cleanup does) would risk Close parking on a
+	// full channel. Watch for an unwanted CONNECTION_LIMIT AppError as it
+	// drains.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		for {
+			select {
+			case evt := <-bus.Control:
+				if ae, ok := evt.(eventbus.AppError); ok && ae.Code == "CONNECTION_LIMIT" {
+					t.Errorf("unexpected CONNECTION_LIMIT AppError for a plain 4009 close: %+v", ae)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
+		Bus:         bus,
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(int) {},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for firstConn.Load() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("fake tunnel never accepted a connection")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	_ = firstConn.Load().Close(uint32(wsmixer.EnhanceYourCalm), "stream-0 message rate exceeded")
+
+	// Give the dispatcher a generous window to (not) publish a
+	// CONNECTION_LIMIT AppError; the background drain goroutine above
+	// catches it if it shows up, and keeps draining past this point through
+	// tun.Close's own deferred call below.
+	time.Sleep(500 * time.Millisecond)
+}
+
 // TestOnStreamNeverBlocksOnApp is the never-blocks contract: a stream
 // relayed to a slow target must not delay a subsequent app message from
 // being processed.
@@ -991,6 +1155,140 @@ func TestUnknownOpWarnsWithoutFatal(t *testing.T) {
 	}
 	if got := exitCode.Load(); got != -1 {
 		t.Fatalf("expected no FatalExit for an unrecognized op, got exit code %d", got)
+	}
+}
+
+// TestConnectionLimitAppErrorHasHint covers handleApp's OpError branch: the
+// app-level {"op":"error","code":"CONNECTION_LIMIT",...} envelope (sent
+// best-effort just before the matching close) must publish an AppError with
+// a non-empty Hint and must never be treated as fatal.
+func TestConnectionLimitAppErrorHasHint(t *testing.T) {
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		c.OnApp(func(raw json.RawMessage) {
+			var wrapper struct {
+				Mcpwarp struct{ Op string } `json:"mcpwarp"`
+			}
+			_ = json.Unmarshal(raw, &wrapper)
+			if wrapper.Mcpwarp.Op == "register" {
+				_ = c.SendApp(context.Background(), map[string]any{
+					"mcpwarp": map[string]any{"v": 1, "op": "error", "code": "CONNECTION_LIMIT",
+						"message": "too many agent connections for this account (limit 10)"},
+				})
+			}
+		})
+	})
+
+	bus := eventbus.New(64)
+	go func() {
+		for range bus.Telemetry {
+		}
+	}()
+	t.Cleanup(bus.Close)
+
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
+		Bus:         bus,
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	var appErr eventbus.AppError
+	found := false
+	deadline := time.Now().Add(2 * time.Second)
+	for !found {
+		select {
+		case evt := <-bus.Control:
+			if ae, ok := evt.(eventbus.AppError); ok && ae.Code == "CONNECTION_LIMIT" {
+				appErr = ae
+				found = true
+			}
+		case <-time.After(time.Until(deadline)):
+			t.Fatal("expected a CONNECTION_LIMIT AppError, got none")
+		}
+	}
+	if appErr.Hint == "" {
+		t.Fatal("expected a non-empty Hint on the CONNECTION_LIMIT AppError")
+	}
+	if exitCode.Load() != -1 {
+		t.Fatalf("expected no FatalExit for a CONNECTION_LIMIT app error, got exit code %d", exitCode.Load())
+	}
+}
+
+// TestConnectionLimitAppErrorAndCloseDedupe covers the dedupe itself: the
+// fake server sends the app-level CONNECTION_LIMIT error envelope and then
+// immediately closes with 4009 + the matching prefixed reason, the way the
+// real server does best-effort — only one CONNECTION_LIMIT AppError must
+// reach the bus, not two.
+//
+// A second assertion — that a further 4009+prefix close after the SDK's
+// next successful reconnect produces a second AppError (proving
+// connLimitReported resets per connection, not just deduping forever) —
+// isn't included here: driving an actual reconnect deterministically in
+// well under a couple of seconds needs a seam this package doesn't expose
+// (e.g. forcing the next backoff to ~0), so it's skipped rather than
+// reintroducing a multi-second wait.
+func TestConnectionLimitAppErrorAndCloseDedupe(t *testing.T) {
+	const reason = "CONNECTION_LIMIT: too many agent connections for this account (limit 10)"
+	var served atomic.Int32
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		if served.Add(1) != 1 {
+			return
+		}
+		c.OnApp(func(raw json.RawMessage) {
+			var wrapper struct {
+				Mcpwarp struct{ Op string } `json:"mcpwarp"`
+			}
+			_ = json.Unmarshal(raw, &wrapper)
+			if wrapper.Mcpwarp.Op == "register" {
+				_ = c.SendApp(context.Background(), map[string]any{
+					"mcpwarp": map[string]any{"v": 1, "op": "error", "code": "CONNECTION_LIMIT", "message": reason},
+				})
+				_ = c.Close(uint32(wsmixer.EnhanceYourCalm), reason)
+			}
+		})
+	})
+
+	bus := eventbus.New(64)
+	go func() {
+		for range bus.Telemetry {
+		}
+	}()
+	t.Cleanup(bus.Close)
+
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
+		Bus:         bus,
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(int) {},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	var appErrs []eventbus.AppError
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case evt := <-bus.Control:
+			if ae, ok := evt.(eventbus.AppError); ok && ae.Code == "CONNECTION_LIMIT" {
+				appErrs = append(appErrs, ae)
+			}
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if len(appErrs) != 1 {
+		t.Fatalf("expected exactly one CONNECTION_LIMIT AppError from the envelope+close pair, got %d: %+v", len(appErrs), appErrs)
 	}
 }
 

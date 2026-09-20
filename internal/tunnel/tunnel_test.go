@@ -34,9 +34,10 @@ type fakeTunnelServer struct {
 	srv *httptest.Server
 	url string
 
-	mu     sync.Mutex
-	conns  []*wsmixer.Conn
-	onConn func(c *wsmixer.Conn) // called once per accepted connection, on its own goroutine
+	mu       sync.Mutex
+	conns    []*wsmixer.Conn
+	rawConns []*websocket.Conn     // the underlying coder/websocket conn behind each conns entry, same order
+	onConn   func(c *wsmixer.Conn) // called once per accepted connection, on its own goroutine
 }
 
 func newFakeTunnelServer(t *testing.T, onConn func(c *wsmixer.Conn)) *fakeTunnelServer {
@@ -74,6 +75,7 @@ func newFakeTunnelServer(t *testing.T, onConn func(c *wsmixer.Conn)) *fakeTunnel
 		}
 		f.mu.Lock()
 		f.conns = append(f.conns, c)
+		f.rawConns = append(f.rawConns, ws)
 		f.mu.Unlock()
 		if f.onConn != nil {
 			f.onConn(c)
@@ -104,6 +106,20 @@ func (f *fakeTunnelServer) latestConn() *wsmixer.Conn {
 		return nil
 	}
 	return f.conns[len(f.conns)-1]
+}
+
+// latestRawConn returns the underlying coder/websocket conn behind the most
+// recently accepted connection — for a test that needs to close the wire
+// directly, below wsmixer's own Conn.Close (which always sends a stream-0
+// error{} frame before the WS close), to produce a bare close frame with no
+// preceding error{}.
+func (f *fakeTunnelServer) latestRawConn() *websocket.Conn {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.rawConns) == 0 {
+		return nil
+	}
+	return f.rawConns[len(f.rawConns)-1]
 }
 
 func newTestBus(t *testing.T) *eventbus.Bus {
@@ -847,11 +863,7 @@ func TestConnectionLimitCloseIsNonFatalWithHintAndReconnects(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	if got := wsmixer.ErrorCode(0x0e).CloseCode(); got != connectionLimitWSCode {
-		t.Fatalf("expected ws-mixer's application-level error code 0x0e to map to WS close code %d, got %d", connectionLimitWSCode, got)
-	}
-
-	_ = firstConn.Load().Close(uint32(0x0e),
+	_ = firstConn.Load().Close(uint32(wsmixer.ApplicationCloseCode),
 		"CONNECTION_LIMIT: too many agent connections for this account (limit 10)")
 
 	var appErr eventbus.AppError
@@ -1041,7 +1053,7 @@ func TestApplicationCloseWithOtherPrefixIsNotConnectionLimit(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	_ = firstConn.Load().Close(uint32(0x0e), "SOMETHING_ELSE: draining for maintenance")
+	_ = firstConn.Load().Close(uint32(wsmixer.ApplicationCloseCode), "SOMETHING_ELSE: draining for maintenance")
 
 	// Give the dispatcher a generous window to (not) publish a
 	// CONNECTION_LIMIT AppError; the background drain goroutine above
@@ -1051,6 +1063,96 @@ func TestApplicationCloseWithOtherPrefixIsNotConnectionLimit(t *testing.T) {
 
 	if !sawDisconnected.Load() {
 		t.Fatal("expected a ConnStateChanged{State: \"disconnected\"} on bus.Control after the 4014 close")
+	}
+}
+
+// TestConnectionLimitBareCloseWithoutErrorFrame covers onDisconnect's
+// CloseReason fallback (ws-mixer-go v0.4.1): when the tunnel closes 4014
+// with a CONNECTION_LIMIT reason but never sends a preceding stream-0
+// error{} frame — e.g. the error{} write lost a race with the close, or the
+// server just closes bare — reason.Message stays the generic "peer closed
+// with code 4014" text and only reason.CloseReason carries the server's
+// text, so onDisconnect must fall back to CloseReason. The close is
+// produced by closing the fake server's underlying coder/websocket conn
+// directly, bypassing wsmixer.Conn.Close (which always sends error{}
+// first).
+func TestConnectionLimitBareCloseWithoutErrorFrame(t *testing.T) {
+	var firstConn atomic.Pointer[wsmixer.Conn]
+	var registerSeen atomic.Bool
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		firstConn.CompareAndSwap(nil, c)
+		// Wait for the client's own register write to have landed before this
+		// test's raw close below tears down the socket — otherwise closing
+		// the wire out from under a register send still in flight can fail
+		// that write outright (a plain "closed network connection" write
+		// error), which the client reports as a generic disconnect instead
+		// of ever reading this test's close frame/reason at all.
+		c.OnApp(func(raw json.RawMessage) {
+			if names := registeredNames(raw); names != nil {
+				registerSeen.Store(true)
+			}
+		})
+	})
+
+	bus := eventbus.New(64)
+	go func() {
+		for range bus.Telemetry {
+		}
+	}()
+	t.Cleanup(bus.Close)
+
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
+		Bus:         bus,
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !registerSeen.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("fake tunnel never saw the register")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	raw := srv.latestRawConn()
+	if raw == nil {
+		t.Fatal("fake tunnel never captured the underlying websocket conn")
+	}
+	const reason = "CONNECTION_LIMIT: too many agent connections for this account (limit 10)"
+	go func() { _ = raw.Close(websocket.StatusCode(connectionLimitWSCode), reason) }()
+
+	var appErr eventbus.AppError
+	found := false
+	deadline = time.Now().Add(2 * time.Second)
+	for !found {
+		select {
+		case evt := <-bus.Control:
+			if ae, ok := evt.(eventbus.AppError); ok && ae.Code == "CONNECTION_LIMIT" {
+				appErr = ae
+				found = true
+			}
+		case <-time.After(time.Until(deadline)):
+			t.Fatal("expected a CONNECTION_LIMIT AppError from a bare 4014 close, got none")
+		}
+	}
+	if appErr.Hint == "" {
+		t.Fatal("expected a non-empty Hint on the CONNECTION_LIMIT AppError")
+	}
+	if appErr.Message == "" || strings.Contains(appErr.Message, connectionLimitPrefix) {
+		t.Fatalf("expected the AppError Message to be the server text with the prefix stripped, got %q", appErr.Message)
+	}
+	if exitCode.Load() != -1 {
+		t.Fatalf("expected no FatalExit for a bare CONNECTION_LIMIT close, got exit code %d", exitCode.Load())
 	}
 }
 
@@ -1338,7 +1440,7 @@ func TestConnectionLimitAppErrorAndCloseDedupe(t *testing.T) {
 				_ = c.SendApp(context.Background(), map[string]any{
 					"mcpwarp": map[string]any{"v": 1, "op": "error", "code": "CONNECTION_LIMIT", "message": reason},
 				})
-				_ = c.Close(uint32(0x0e), reason)
+				_ = c.Close(uint32(wsmixer.ApplicationCloseCode), reason)
 			}
 		})
 	})

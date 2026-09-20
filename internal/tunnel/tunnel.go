@@ -614,8 +614,12 @@ func (t *Tunnel) onDisconnect(reason wsmixer.DisconnectReason) {
 	t.disp.enqueue(func() {
 		t.publish(eventbus.ConnStateChanged{State: "disconnected"})
 		if !reason.Fatal {
-			if reason.WSCode == connectionLimitWSCode && strings.HasPrefix(reason.Message, connectionLimitPrefix) {
-				message := connectionLimitMessage(reason.Message)
+			text := reason.CloseReason
+			if text == "" {
+				text = reason.Message
+			}
+			if reason.WSCode == connectionLimitWSCode && strings.HasPrefix(text, connectionLimitPrefix) {
+				message := connectionLimitMessage(text)
 				t.log.Warn("too many mcpwarp agents connected for this account; "+connectionLimitHint, "message", message)
 				t.publishConnLimitError(eventbus.AppError{Code: "CONNECTION_LIMIT", Message: message, Hint: connectionLimitHint})
 				return
@@ -643,21 +647,15 @@ func (t *Tunnel) onDisconnect(reason wsmixer.DisconnectReason) {
 // (4000 + 0x0b), used the same way Node client.ts's UNAUTHORIZED_WS_CODE is.
 const unauthorizedWSCode = 4011
 
-// applicationCloseErrorCode is ws-mixer's reserved application-level error
-// code 0x0e (4000 + 0x0e = 4014). ws-mixer-go v0.4.0 has no exported const
-// for it — DisconnectReason.ErrorName renders "INTERNAL_ERROR" for this
-// code, since 0x0e is unrecognized there — but a later ws-mixer-go release
-// is expected to export a named constant for it.
-const applicationCloseErrorCode = 0x0e
-
 // connectionLimitWSCode is the WS close code the tunnel server uses for its
-// account connection cap: ws-mixer's application-level close (0x0e),
-// distinguished only by connectionLimitPrefix on the close reason — a bare
-// 4014 without that prefix is ws-mixer's own application-level close for
-// something else and must not be treated as a connection-limit close. 4009
+// account connection cap: ws-mixer's application-level close
+// (wsmixer.ApplicationCloseCode, 0x0e), distinguished only by
+// connectionLimitPrefix on the close reason — a bare 4014 without that
+// prefix is ws-mixer's own application-level close for something else and
+// must not be treated as a connection-limit close. 4009
 // (wsmixer.EnhanceYourCalm) is ws-mixer's own rate-limit/oversize meaning
 // and the tunnel never sends it for the connection cap.
-const connectionLimitWSCode = 4000 + applicationCloseErrorCode
+var connectionLimitWSCode = wsmixer.ApplicationCloseCode.CloseCode()
 
 // connectionLimitPrefix is the fixed lead-in of a CONNECTION_LIMIT close
 // reason or app error message; only the prefix is a stable contract, the
@@ -666,12 +664,10 @@ const connectionLimitPrefix = "CONNECTION_LIMIT:"
 
 // connectionLimitHint is the guidance surfaced for a CONNECTION_LIMIT close
 // or app error, both in the log line and as the AppError's Hint. With
-// ws-mixer-go v0.4.0 the SDK retries a 4014 on its default full-jitter
-// schedule, and because the attempt counter resets on every welcome and the
-// cap close is post-welcome, the delay stays at random(0-2s) per cycle; a
-// fix is requested in ws-mixer-go (grow backoff for post-welcome
-// rejections). Recovery just needs one fewer live mcpwarp agent for this
-// account.
+// ws-mixer-go v0.4.1 a connected-phase 4014 reconnects at random(0, cap)
+// (this CLI's Cap is 30s), same as 4009 — see client_reconnect.go's
+// scheduleReconnectAtCap. Recovery just needs one fewer live mcpwarp agent
+// for this account.
 const connectionLimitHint = "close another `mcpwarp up` and this one will reconnect"
 
 // classifyFatalMessage is this package's half of client.ts's classifyFatal:

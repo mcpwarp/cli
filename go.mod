@@ -10,7 +10,7 @@ require (
 	charm.land/lipgloss/v2 v2.0.6
 	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/coder/websocket v1.8.15
-	github.com/mcpwarp/ws-mixer-go v0.4.1
+	github.com/mcpwarp/ws-mixer-go v0.7.0
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/mod v0.40.0
 	golang.org/x/term v0.45.0

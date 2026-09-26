@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -1988,5 +1989,213 @@ func TestRegisterServiceWhileDisconnectedClearsLocalFlag(t *testing.T) {
 	svcs := got["mcpwarp"].(map[string]any)["services"].([]map[string]any)
 	if len(svcs) != 1 || svcs[0]["name"] != "svc" {
 		t.Fatalf("register body after RegisterService while disconnected = %v, want [svc] restored", got)
+	}
+}
+
+// retryableTokenErr mirrors *auth.TokenRefreshError's shape: a Retryable()
+// true error, without importing internal/auth.
+type retryableTokenErr struct{ msg string }
+
+func (e *retryableTokenErr) Error() string   { return e.msg }
+func (e *retryableTokenErr) Retryable() bool { return true }
+
+// scriptedToken is a TokenSource whose Nth call (1-based) returns failures[N]
+// when present, and "t" otherwise.
+type scriptedToken struct {
+	calls    atomic.Int32
+	failures map[int32]error
+}
+
+func (s *scriptedToken) Token(context.Context) (string, error) {
+	n := s.calls.Add(1)
+	if err, ok := s.failures[n]; ok {
+		return "", err
+	}
+	return "t", nil
+}
+
+// recordingHandler is a slog.Handler that keeps every record, so a test can
+// assert on the log line (and its attrs) a code path emitted.
+type recordingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler            { return h }
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+// find returns the first record with message msg, and whether there was one.
+func (h *recordingHandler) find(msg string) (slog.Record, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Message == msg {
+			return r, true
+		}
+	}
+	return slog.Record{}, false
+}
+
+func recordAttr(r slog.Record, key string) (slog.Value, bool) {
+	var v slog.Value
+	found := false
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == key {
+			v, found = a.Value, true
+			return false
+		}
+		return true
+	})
+	return v, found
+}
+
+// TestRetryableTokenFailureReconnects covers the token provider seam: a
+// Retryable() refresh failure on a reconnect's token call must be marked
+// wsmixer.ErrTokenUnavailable so the SDK treats it as a non-fatal dial
+// failure and backs off, rather than closing the client for good (which
+// with nothing retrying it left `mcpwarp up` hung). The retrying log line
+// only fires for a non-fatal PhaseDial disconnect whose Cause wraps
+// ErrTokenUnavailable, so seeing it pins that DisconnectReason shape.
+func TestRetryableTokenFailureReconnects(t *testing.T) {
+	var firstConn atomic.Pointer[wsmixer.Conn]
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		firstConn.CompareAndSwap(nil, c)
+	})
+
+	refreshErr := &retryableTokenErr{msg: "could not reach the auth server to refresh the session"}
+	tokens := &scriptedToken{failures: map[int32]error{2: refreshErr}}
+	logs := &recordingHandler{}
+
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: tokens,
+		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
+		Bus:         newTestBus(t),
+		Log:         slog.New(logs),
+		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for firstConn.Load() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("fake tunnel never accepted a connection")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// 4012 reconnects after jitter(0,2s); that redial's token call (the 2nd)
+	// fails, and the one after the backoff succeeds.
+	_ = firstConn.Load().Close(uint32(wsmixer.GoingAwayCode), "forcing a reconnect for test")
+
+	const retryMsg = "could not refresh the session token; retrying"
+	var rec slog.Record
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		var ok bool
+		if rec, ok = logs.find(retryMsg); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected a %q log after the provider failed, got none (token calls: %d)", retryMsg, tokens.calls.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	v, ok := recordAttr(rec, "err")
+	if !ok {
+		t.Fatal("retry log line has no err attr")
+	}
+	cause, _ := v.Any().(error)
+	if !errors.Is(cause, wsmixer.ErrTokenUnavailable) {
+		t.Fatalf("retry log err = %v, want it to wrap wsmixer.ErrTokenUnavailable", cause)
+	}
+	var got *retryableTokenErr
+	if !errors.As(cause, &got) || got != refreshErr {
+		t.Fatalf("retry log err = %v, want it to unwrap to the provider's own retryable error", cause)
+	}
+
+	// Full-jitter backoff after one failed dial is at most a few seconds with
+	// this package's 1s Base.
+	deadline = time.Now().Add(15 * time.Second)
+	for srv.connCount() < 2 || tun.client.State() != "connected" {
+		if state := tun.client.State(); state == "closed" {
+			t.Fatalf("client closed after a retryable token failure, want it to reconnect")
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected a second connection after the token failure, got %d conns, state %q", srv.connCount(), tun.client.State())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if n := tokens.calls.Load(); n < 3 {
+		t.Fatalf("expected at least 3 token calls (connect, failed redial, successful redial), got %d", n)
+	}
+	if exitCode.Load() != -1 {
+		t.Fatalf("expected no FatalExit for a retryable token failure, got exit code %d", exitCode.Load())
+	}
+}
+
+// TestNonRetryableTokenFailureIsFatal is the other half: a provider error
+// that isn't Retryable() stays unmarked, so the SDK closes the client and
+// onDisconnect must exit instead of waiting on a retry that never comes.
+func TestNonRetryableTokenFailureIsFatal(t *testing.T) {
+	var firstConn atomic.Pointer[wsmixer.Conn]
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		firstConn.CompareAndSwap(nil, c)
+	})
+
+	tokens := &scriptedToken{failures: map[int32]error{2: errors.New("credentials file is corrupt")}}
+
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: tokens,
+		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
+		Bus:         newTestBus(t),
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for firstConn.Load() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("fake tunnel never accepted a connection")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	_ = firstConn.Load().Close(uint32(wsmixer.GoingAwayCode), "forcing a reconnect for test")
+
+	deadline = time.Now().Add(5 * time.Second)
+	for exitCode.Load() == -1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("FatalExit was never called for a non-retryable token failure (token calls: %d, state %q)", tokens.calls.Load(), tun.client.State())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if exitCode.Load() != 1 {
+		t.Fatalf("expected exit code 1, got %d", exitCode.Load())
+	}
+	if state := tun.client.State(); state != "closed" {
+		t.Fatalf("expected the client closed after a fatal token failure, got state %q", state)
+	}
+	if n := srv.connCount(); n != 1 {
+		t.Fatalf("expected no reconnect after a fatal token failure, got %d conns", n)
 	}
 }

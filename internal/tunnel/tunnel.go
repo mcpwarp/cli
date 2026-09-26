@@ -196,8 +196,15 @@ func Start(ctx context.Context, cfg Config) (*Tunnel, error) {
 		localUnregistered: make(map[string]bool),
 	}
 
+	// A retryable refresh failure (isRetryableTokenFailure) is marked with
+	// wsmixer.ErrTokenUnavailable so the SDK backs off and redials instead
+	// of closing the client; any other provider error stays fatal.
 	tokenProvider := func(ctx context.Context) (string, error) {
-		return cfg.TokenSource.Token(ctx)
+		token, err := cfg.TokenSource.Token(ctx)
+		if err != nil && isRetryableTokenFailure(err) {
+			return "", fmt.Errorf("%w: %w", wsmixer.ErrTokenUnavailable, err)
+		}
+		return token, err
 	}
 
 	t.client = wsmixer.NewClient(cfg.URL, tokenProvider, wsmixer.ClientConfig{
@@ -208,7 +215,10 @@ func Start(ctx context.Context, cfg Config) (*Tunnel, error) {
 		},
 		// Node client.ts's BACKOFF_CAP_MS: cap full-jitter backoff at 30s,
 		// not the SDK's own 60s default.
-		Reconnect:    wsmixer.ReconnectOptions{Base: time.Second, Cap: 30 * time.Second},
+		// StableAfter: the backoff attempt counter resets only once a
+		// connection has stayed up this long past welcome, so a server that
+		// accepts then drops right away can't pin us at Base.
+		Reconnect:    wsmixer.ReconnectOptions{Base: time.Second, Cap: 30 * time.Second, StableAfter: 10 * time.Second},
 		OnConnect:    t.onConnect,
 		OnApp:        t.onApp,
 		OnStream:     t.onStream,
@@ -624,17 +634,20 @@ func (t *Tunnel) onDisconnect(reason wsmixer.DisconnectReason) {
 				t.publishConnLimitError(eventbus.AppError{Code: "CONNECTION_LIMIT", Message: message, Hint: connectionLimitHint})
 				return
 			}
+			// A retryable token refresh failure reaches here as a non-fatal
+			// dial failure (the provider wrapped it in
+			// wsmixer.ErrTokenUnavailable); the SDK redials with normal backoff.
+			if reason.Phase == wsmixer.PhaseDial && errors.Is(reason.Cause, wsmixer.ErrTokenUnavailable) {
+				t.log.Warn("could not refresh the session token; retrying", "err", reason.Cause)
+				return
+			}
 			t.log.Info("tunnel disconnected; SDK reconnecting", "phase", reason.Phase, "message", reason.Message)
 			return
 		}
-		// classifyFatal (client.ts:140-160): only a fatal disconnect caused
-		// by the token provider itself failing (a TokenRefreshError from
-		// internal/auth, surfaced verbatim as Cause) gets ws-mixer-go's own
-		// retry loop — everything else here is truly terminal, exit.
-		if isRetryableTokenFailure(reason.Cause) {
-			t.log.Warn("could not refresh the session token; ws-mixer-go will retry", "err", reason.Cause)
-			return
-		}
+		// classifyFatal (client.ts:140-160): everything that reaches here is
+		// terminal, including any token provider error not marked
+		// wsmixer.ErrTokenUnavailable — the SDK has already closed the
+		// client and never retries it, so exit.
 		message := classifyFatalMessage(t.cfg.URL, reason)
 		t.log.Error(message, "wsCode", reason.WSCode, "httpStatus", reason.HTTPStatus)
 		// See handleApp's fatal path: FatalExit -> Tunnel.Close(ctx) waits
@@ -717,11 +730,12 @@ func causeMessage(cause error) (string, bool) {
 	return "", false
 }
 
-// isRetryableTokenFailure is this package's half of client.ts's
-// classifyFatal: internal/auth.TokenRefreshError implements Retryable()
-// bool (its Error() alone isn't enough to know) — checked structurally so
-// this package doesn't need to import internal/auth just for one error
-// type switch.
+// isRetryableTokenFailure reports whether a TokenSource error is a
+// temporary refresh failure, via the error's Retryable() bool (implemented by
+// internal/auth.TokenRefreshError), mirroring Node client.ts's classifyFatal.
+// Start's token provider wraps a match in wsmixer.ErrTokenUnavailable, the
+// only signal the SDK reads; adding that marker here keeps internal/auth
+// SDK-agnostic.
 func isRetryableTokenFailure(cause error) bool {
 	if cause == nil {
 		return false

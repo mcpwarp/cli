@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"sync"
@@ -30,7 +31,8 @@ func (e *SessionExpiredError) Error() string {
 
 // TokenRefreshError is a retryable failure: discovery/token endpoint
 // unreachable, a transient (non-invalid_grant) error, or the cross-process
-// lock timed out. Credentials are left untouched.
+// lock couldn't be acquired (its own timeout, or the caller's deadline).
+// Credentials are left untouched.
 type TokenRefreshError struct {
 	message string
 	cause   error
@@ -95,16 +97,35 @@ func isInvalidGrantOrToken(err error) bool {
 	return dfe.Code == CodeHTTPError && invalidTokenPattern.MatchString(dfe.Message)
 }
 
+// withTokenLock runs fn under the credentials lock (DESIGN.md §5), turning a
+// failure to acquire it into a retryable *TokenRefreshError: the lock's own
+// timeout, or the caller's context deadline passing while another process
+// still holds it. The latter is the one the tunnel actually hits — the SDK's
+// per-dial context (~20s) expires long before the lock's 45s timeout, and a
+// bare context.DeadlineExceeded would be fatal to it. context.Canceled passes
+// through unwrapped: the caller gave up, so there is nothing to retry.
+//
+// Only acquire errors are classified here: fn's are refreshAndPersist's, and
+// one from a Discover/RefreshToken that ran out of ctx also matches
+// errors.Is(err, context.DeadlineExceeded).
 func withTokenLock[T any](ctx context.Context, path string, lock LockOptions, fn func() (T, error)) (T, error) {
 	var zero T
-	result, err := WithLock(ctx, path, lock, fn)
+	release, err := AcquireLock(ctx, path, lock)
 	if err != nil {
 		if lte, ok := err.(*LockTimeoutError); ok {
 			return zero, &TokenRefreshError{message: fmt.Sprintf("could not acquire the refresh lock: %s", lte.Error()), cause: lte}
 		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			lockPath := lockPathFor(path)
+			return zero, &TokenRefreshError{message: fmt.Sprintf(
+				"could not acquire the refresh lock at %s before the deadline (held by %s); if that process is gone, delete %s manually and retry",
+				lockPath, lockHolder(lockPath), lockPath,
+			), cause: err}
+		}
 		return zero, err
 	}
-	return result, nil
+	defer release()
+	return fn()
 }
 
 // refreshAndPersist runs one discover+refresh+persist cycle and returns the

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"sync"
@@ -519,25 +520,133 @@ func TestForceRefreshNotLoggedIn(t *testing.T) {
 	}
 }
 
-func TestForceRefreshWrapsLockTimeoutAsTokenRefreshError(t *testing.T) {
+// holdCredentialsLock plants a live lock file owned by pid 424242, as a
+// concurrent `mcpwarp up` mid-refresh would.
+func holdCredentialsLock(t *testing.T, paths Paths) string {
+	t.Helper()
+	lockPath := paths.File + ".lock"
+	raw, _ := json.Marshal(lockPayload{PID: 424242, CreatedAt: time.Now().UnixMilli(), Token: "someone-else"})
+	if err := os.WriteFile(lockPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return lockPath
+}
+
+// TestForceRefreshWrapsLockDeadlineAsTokenRefreshError: the caller's
+// deadline passing while another process holds the lock — long before the
+// lock's own 45s timeout — must surface as a retryable *TokenRefreshError,
+// not a bare context.DeadlineExceeded the tunnel would treat as fatal.
+func TestForceRefreshWrapsLockDeadlineAsTokenRefreshError(t *testing.T) {
+	dir := t.TempDir()
+	issuer := "http://localhost/realms/mcpwarp"
+	paths, _ := CredentialsPaths(issuer, dir)
+	Save(tpCreds(issuer, 9_999_999), paths)
+	lockPath := holdCredentialsLock(t, paths)
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	_, err := ForceRefresh(ctx, TokenProviderOptions{Issuer: issuer, Paths: paths}, "")
+	var tre *TokenRefreshError
+	if !errors.As(err, &tre) {
+		t.Fatalf("got %#v", err)
+	}
+	if !tre.Retryable() {
+		t.Fatal("expected a retryable error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded in the cause chain, got %v", err)
+	}
+	if !strings.Contains(err.Error(), lockPath) || !strings.Contains(err.Error(), "pid 424242") {
+		t.Fatalf("expected the lock path and holder pid in the message, got %q", err.Error())
+	}
+	if _, statErr := os.Stat(lockPath); statErr != nil {
+		t.Fatal("the other process's lock must be left in place")
+	}
+}
+
+// TestForceRefreshLeavesCancelledLockWaitUnwrapped: a cancelled context means
+// the caller gave up (the SDK closing mid-dial), not a refresh failure worth
+// retrying, so the bare context.Canceled comes back.
+func TestForceRefreshLeavesCancelledLockWaitUnwrapped(t *testing.T) {
+	dir := t.TempDir()
+	issuer := "http://localhost/realms/mcpwarp"
+	paths, _ := CredentialsPaths(issuer, dir)
+	Save(tpCreds(issuer, 9_999_999), paths)
+	holdCredentialsLock(t, paths)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := ForceRefresh(ctx, TokenProviderOptions{Issuer: issuer, Paths: paths}, "")
+	if err != context.Canceled {
+		t.Fatalf("expected the bare context.Canceled, got %#v", err)
+	}
+}
+
+// TestForceRefreshLockTimeoutBeforeDeadlineStaysLockTimeout: the lock's own
+// timeout firing inside a still-live deadline keeps its *LockTimeoutError
+// cause and wording.
+func TestForceRefreshLockTimeoutBeforeDeadlineStaysLockTimeout(t *testing.T) {
+	dir := t.TempDir()
+	issuer := "http://localhost/realms/mcpwarp"
+	paths, _ := CredentialsPaths(issuer, dir)
+	Save(tpCreds(issuer, 9_999_999), paths)
+	holdCredentialsLock(t, paths)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+
+	now, sleep := lockFakeClock(time.Now().UnixMilli())
+	opts := TokenProviderOptions{
+		Issuer: issuer, Paths: paths,
+		Lock: LockOptions{RetryMs: 5, TimeoutMs: 50, StaleMs: 60_000, Now: now, Sleep: sleep},
+	}
+	_, err := ForceRefresh(ctx, opts, "")
+	var tre *TokenRefreshError
+	if !errors.As(err, &tre) {
+		t.Fatalf("got %#v", err)
+	}
+	if _, ok := tre.Unwrap().(*LockTimeoutError); !ok {
+		t.Fatalf("expected a *LockTimeoutError cause, got %#v", tre.Unwrap())
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("a lock timeout must not read as a context deadline")
+	}
+	if !strings.HasPrefix(err.Error(), "could not acquire the refresh lock: timed out waiting for the lock at ") {
+		t.Fatalf("got %q", err.Error())
+	}
+}
+
+// TestForceRefreshDeadlineInsideRefreshIsNotRewrappedAsLockError: with the
+// lock free, a deadline that runs out inside Discover is refreshAndPersist's
+// to classify — its *TokenRefreshError must come back as-is, not rewrapped
+// as a lock-acquire failure.
+func TestForceRefreshDeadlineInsideRefreshIsNotRewrappedAsLockError(t *testing.T) {
 	dir := t.TempDir()
 	issuer := "http://localhost/realms/mcpwarp"
 	paths, _ := CredentialsPaths(issuer, dir)
 	Save(tpCreds(issuer, 9_999_999), paths)
 
-	raw, _ := json.Marshal(lockPayload{PID: 999999, CreatedAt: time.Now().UnixMilli(), Token: "someone-else"})
-	if err := os.WriteFile(paths.File+".lock", raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(paths.File + ".lock")
-
 	opts := TokenProviderOptions{
 		Issuer: issuer, Paths: paths,
-		Lock: LockOptions{RetryMs: 5, TimeoutMs: 20, StaleMs: 60_000},
+		Discover: func(ctx context.Context, issuer string, c HTTPDoer) (OidcConfig, error) {
+			return OidcConfig{}, context.DeadlineExceeded
+		},
 	}
 	_, err := ForceRefresh(context.Background(), opts, "")
-	if _, ok := err.(*TokenRefreshError); !ok {
+	tre, ok := err.(*TokenRefreshError)
+	if !ok {
 		t.Fatalf("got %#v", err)
+	}
+	if tre.Unwrap() != context.DeadlineExceeded {
+		t.Fatalf("expected Discover's error as the direct cause, got %#v", tre.Unwrap())
+	}
+	if !strings.HasPrefix(err.Error(), "could not reach the auth server") {
+		t.Fatalf("got %q", err.Error())
+	}
+	if _, statErr := os.Stat(paths.File + ".lock"); !os.IsNotExist(statErr) {
+		t.Fatal("the lock must be released after fn fails")
 	}
 }
 

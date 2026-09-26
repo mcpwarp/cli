@@ -103,6 +103,15 @@ func readLockPayload(lockPath string) *lockPayload {
 	return &p
 }
 
+// lockHolder names whoever holds lockPath for an error message: "pid N" if
+// its payload is readable, "another process" otherwise.
+func lockHolder(lockPath string) string {
+	if holder := readLockPayload(lockPath); holder != nil {
+		return fmt.Sprintf("pid %d", holder.PID)
+	}
+	return "another process"
+}
+
 // tryCreate attempts one O_EXCL create; returns the new lock's token on
 // success, "" if the lock file already exists.
 func tryCreate(lockPath string, now int64) (string, error) {
@@ -176,14 +185,9 @@ func AcquireLock(ctx context.Context, path string, opts LockOptions) (func(), er
 		reapIfStale(lockPath, opts.StaleMs, opts.Now())
 
 		if opts.Now() >= deadline {
-			holder := readLockPayload(lockPath)
-			who := "another process"
-			if holder != nil {
-				who = fmt.Sprintf("pid %d", holder.PID)
-			}
 			return nil, &LockTimeoutError{message: fmt.Sprintf(
 				"timed out waiting for the lock at %s (held by %s); if that process is gone, delete %s manually and retry",
-				lockPath, who, lockPath,
+				lockPath, lockHolder(lockPath), lockPath,
 			)}
 		}
 
@@ -191,18 +195,4 @@ func AcquireLock(ctx context.Context, path string, opts LockOptions) (func(), er
 			return nil, err
 		}
 	}
-}
-
-// WithLock runs fn under the exclusive lock at <path>.lock. release is
-// deferred right after acquiring, so it always runs before WithLock
-// returns — whether fn returns an error or panics — not just on the
-// success path.
-func WithLock[T any](ctx context.Context, path string, opts LockOptions, fn func() (T, error)) (T, error) {
-	var zero T
-	release, err := AcquireLock(ctx, path, opts)
-	if err != nil {
-		return zero, err
-	}
-	defer release()
-	return fn()
 }

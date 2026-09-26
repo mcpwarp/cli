@@ -48,30 +48,6 @@ func TestReleaseIsIdempotent(t *testing.T) {
 	release() // must not panic
 }
 
-func TestWithLockReleasesOnError(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "credentials.json")
-
-	_, err := WithLock(context.Background(), target, LockOptions{}, func() (int, error) {
-		return 0, os.ErrClosed
-	})
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if _, statErr := os.Stat(target + ".lock"); !os.IsNotExist(statErr) {
-		t.Fatal("lock should be released even on error")
-	}
-}
-
-func TestWithLockReturnsValue(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "credentials.json")
-	v, err := WithLock(context.Background(), target, LockOptions{}, func() (int, error) { return 42, nil })
-	if err != nil || v != 42 {
-		t.Fatalf("got %d, %v", v, err)
-	}
-}
-
 // TestAcquireLockContentionInProcess pins contention against a real lock
 // file with no real clock or wall-clock wait anywhere: the second acquire's
 // Sleep hook (its retry backoff) is the only thing standing between it and

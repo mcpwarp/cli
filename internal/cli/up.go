@@ -296,13 +296,16 @@ func newTUIRenderer(home string, t tunnelHandle) runUIFunc {
 			}
 		}
 
-		// Seed each row's initial STATE: http starts at the registry's
-		// active status (no supervisor); stdio reads its supervisor's.
+		// Seed each row's initial STATE: every row starts pending
+		// registration, since nothing is active until the tunnel's first
+		// "registered" reply says so (pollTunnelForTUI takes over from
+		// there); an http row has no supervisor, so that is its State too,
+		// while stdio reads its supervisor's.
 		servers := make([]tui.Server, len(deps.Services))
 		for i, r := range deps.Services {
-			s := tui.Server{Name: r.Name, Kind: r.Kind}
+			s := tui.Server{Name: r.Name, Kind: r.Kind, Registration: tui.RegistrationPending}
 			if r.Kind == config.KindHTTP {
-				s.State = string(registry.StatusActive)
+				s.State = tui.RegistrationPending
 			} else if deps.Controller != nil {
 				if st, ok := deps.Controller.State(r.Name); ok {
 					s.State = st
@@ -337,16 +340,20 @@ func pollTunnelForTUI(ctx context.Context, t tunnelHandle, bus *eventbus.Bus, up
 				rows := reg.Rows()
 				snap := make([]tui.Server, len(rows))
 				for i, r := range rows {
-					s := tui.Server{Name: r.Name, Kind: r.Kind, URL: r.URL}
+					s := tui.Server{Name: r.Name, Kind: r.Kind, URL: r.URL, Registration: registrationOf(r)}
+					// The tunnel won't route a public request to a rejected
+					// name (our registry may still hold its old entry, but
+					// nothing reaches it), so an old URL from an earlier
+					// success this run is a dead link to show or to `c`.
+					if s.Registration == tui.RegistrationRejected {
+						s.URL = ""
+					}
 					// stdio's state is owned by eventbus.ServerStateChanged
 					// (applySnapshot leaves an empty State untouched); only
-					// http has a registry-derived state to report here.
+					// http, with no supervisor, takes its State from the
+					// registration itself.
 					if r.Kind == config.KindHTTP {
-						if r.Disabled {
-							s.State = string(registry.StatusDisabled)
-						} else {
-							s.State = string(registry.StatusActive)
-						}
+						s.State = s.Registration
 					}
 					snap[i] = s
 				}
@@ -364,6 +371,33 @@ func pollTunnelForTUI(ctx context.Context, t tunnelHandle, bus *eventbus.Bus, up
 				At:    time.Now(),
 			})
 		}
+	}
+}
+
+// registrationOf maps one registry row to the dashboard's registration
+// state (tui.Registration*), newest fact first. A local `d` beats
+// everything, since the user took the name out of play whatever the tunnel
+// said before; an `e` awaiting its reply is pending. A rejection then wins
+// over a plain Disabled: the registry keeps a `d`-disabled entry's status
+// until the next successful "registered", so once `e` re-registers it and
+// the tunnel rejects that, the rejection is the newer fact. SERVER_DISABLED
+// is shown as disabled rather than rejected — it's the dashboard's own
+// toggle and resumes on a later "enable" (DESIGN.md §8), not a problem the
+// user has to fix here.
+func registrationOf(r registry.Row) string {
+	switch {
+	case r.LocallyDisabled:
+		return tui.RegistrationDisabled
+	case r.Reregistering:
+		return tui.RegistrationPending
+	case r.Rejected == "SERVER_DISABLED":
+		return tui.RegistrationDisabled
+	case r.Rejected != "":
+		return tui.RegistrationRejected
+	case r.Disabled:
+		return tui.RegistrationDisabled
+	default:
+		return tui.RegistrationActive
 	}
 }
 

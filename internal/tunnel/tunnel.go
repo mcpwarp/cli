@@ -327,6 +327,11 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 		}
 		fatal := zeroSuccesses && !allServerDisabled && !t.sawFirstRegistered
 
+		// Recorded before any early return below: a rejected name never
+		// reaches ApplyRegistered, so without this the registry has no
+		// record of it at all and the dashboard (cli.pollTunnelForTUI) can't
+		// tell "rejected" apart from "not answered yet".
+		t.registry.ApplyRegisterErrors(msg.Errors, t.kindByName)
 		for _, svcErr := range msg.Errors {
 			t.log.Warn("register error", "name", svcErr.Name, "code", svcErr.Code, "message", svcErr.Message)
 			hint := registerErrorHint(svcErr.Code, t.cfg.WebURL, fatal)
@@ -525,10 +530,17 @@ func (t *Tunnel) sendRegisterFor(name string) {
 // live connection (edge case: `e` pressed while disconnected must still
 // make the next welcome's register batch include name again) — the actual
 // re-register send below stays a no-op in that case, same as before.
+//
+// The registry is told too (MarkReregistering), so the dashboard shows the
+// name pending until the reply rather than still disabled — only for a
+// name this connection actually holds, so a stray enable can't add a row.
 func (t *Tunnel) RegisterService(name string) {
 	t.mu.Lock()
 	delete(t.localUnregistered, name)
 	t.mu.Unlock()
+	if kind, ok := t.kindByName[name]; ok {
+		t.registry.MarkReregistering(name, kind)
+	}
 	t.sendRegisterFor(name)
 }
 
@@ -540,11 +552,17 @@ func (t *Tunnel) RegisterService(name string) {
 // tunnel's own "disable" reply, and marks name locally unregistered so a
 // later reconnect's register batch excludes it (see localUnregistered's
 // doc) until a matching RegisterService. Best-effort like every other app
-// send: a failure to actually reach the tunnel just logs.
+// send: a failure to actually reach the tunnel just logs. The registry's
+// MarkLocallyDisabled covers what ApplyDisable can't: a name with no entry
+// yet (pending, or rejected on its first register) still reads disabled,
+// and a reply already in flight for it doesn't land as active.
 func (t *Tunnel) UnregisterService(name string) error {
 	t.mu.Lock()
 	t.localUnregistered[name] = true
 	t.mu.Unlock()
+	if kind, ok := t.kindByName[name]; ok {
+		t.registry.MarkLocallyDisabled(name, kind)
+	}
 	if entry, ok := t.registry.Get(name); ok {
 		t.registry.ApplyDisable(entry.ID, "unregistered locally")
 	}

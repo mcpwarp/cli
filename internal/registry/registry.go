@@ -98,6 +98,30 @@ type Registry struct {
 	// log receives ApplyRegistered's IDChanged warning; defaults to
 	// slog.Default() until SetLogger is called.
 	log *slog.Logger
+	// rejected holds every name whose most recent "registered" reply
+	// carried a per-service error for it (DESIGN.md §8's register errors:
+	// QUOTA_EXCEEDED, CONFLICT, SERVER_DISABLED, ...), keyed by name. Kept
+	// apart from entries because a name rejected on its very first
+	// register never gets an id or URL at all; cleared per name by the
+	// next ApplyRegistered that reports that name registered. Raising the
+	// quota alone doesn't do that — nothing re-registers until an `e` or a
+	// reconnect sends the name again.
+	rejected map[string]rejection
+	// locallyDisabled holds names (-> kind) taken down by a local `d`
+	// (tunnel.UnregisterService, DESIGN.md §9) and not since brought back
+	// by MarkReregistering. Kept by name rather than id because a name can
+	// be disabled before it ever had an id (still pending, or rejected).
+	locallyDisabled map[string]string
+	// reregistering holds names (-> kind) a local or dashboard enable just
+	// sent a register for (MarkReregistering), until the reply for that
+	// name lands — so the dashboard shows pending there, not the stale
+	// disabled/rejected state from before.
+	reregistering map[string]string
+}
+
+type rejection struct {
+	code string
+	kind string
 }
 
 // New builds an empty Registry.
@@ -106,7 +130,33 @@ func New() *Registry {
 		entries:         make(map[string]*Entry),
 		disabledIds:     make(map[string]bool),
 		pendingDisables: make(map[string]string),
+		rejected:        make(map[string]rejection),
+		locallyDisabled: make(map[string]string),
+		reregistering:   make(map[string]string),
 	}
+}
+
+// MarkLocallyDisabled records a local `d` for name: it reads as disabled
+// whether or not it has an entry, any rejection is dropped (the user has
+// taken the name out of play; a stale QUOTA_EXCEEDED isn't news), and a
+// "registered" reply still in flight for it lands disabled instead of
+// active (see ApplyRegistered). kind is only used when name has no entry.
+func (r *Registry) MarkLocallyDisabled(name, kind string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.locallyDisabled[name] = kind
+	delete(r.rejected, name)
+	delete(r.reregistering, name)
+}
+
+// MarkReregistering undoes MarkLocallyDisabled for a local `e` (or a
+// dashboard enable) that just sent a register for name: it reads as
+// pending until the reply for it lands, whichever way that goes.
+func (r *Registry) MarkReregistering(name, kind string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.locallyDisabled, name)
+	r.reregistering[name] = kind
 }
 
 // SetLogger overrides the logger ApplyRegistered warns an IDChanged through.
@@ -157,7 +207,13 @@ func (r *Registry) ApplyRegistered(services []appproto.RegisteredService, kindBy
 
 		isReconnectOfKnownID := hadExisting && existing.ID == svc.ID
 		var status Status
-		if isReconnectOfKnownID {
+		if _, local := r.locallyDisabled[svc.Name]; local {
+			// A reply to a register sent before the local `d` (the `d`'s
+			// own unregister follows it on the wire): routing must 503 it
+			// like any other disabled id, and it isn't a resurrection.
+			r.disabledIds[svc.ID] = true
+			status = StatusDisabled
+		} else if isReconnectOfKnownID {
 			if r.disabledIds[svc.ID] {
 				delete(r.disabledIds, svc.ID)
 				result.Resurrected = append(result.Resurrected, Resurrection{Name: svc.Name, ID: svc.ID})
@@ -188,6 +244,8 @@ func (r *Registry) ApplyRegistered(services []appproto.RegisteredService, kindBy
 		if !hadExisting {
 			r.order = append(r.order, svc.Name)
 		}
+		delete(r.rejected, svc.Name)
+		delete(r.reregistering, svc.Name)
 
 		if svc.Created {
 			result.Created = append(result.Created, svc.Name)
@@ -195,6 +253,37 @@ func (r *Registry) ApplyRegistered(services []appproto.RegisteredService, kindBy
 	}
 
 	return result
+}
+
+// ApplyRegisterErrors records each per-service error of one "registered"
+// batch as that name's current rejection, superseding any earlier one. The
+// name's entry, if it has one from an earlier success, is left in place for
+// routing bookkeeping; Rows reports the rejection alongside it. kindByName
+// plays the same role as in ApplyRegistered, for a name with no entry yet.
+// An error for a locally disabled name (a reply to a register sent before
+// the `d`) is dropped: the `d` is the newer fact, and keeping the rejection
+// would resurface it as stale after a later `e`.
+func (r *Registry) ApplyRegisterErrors(errs []appproto.ServiceError, kindByName map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range errs {
+		if e.Name == "" {
+			continue
+		}
+		delete(r.reregistering, e.Name)
+		if _, local := r.locallyDisabled[e.Name]; local {
+			continue
+		}
+		kind := kindByName[e.Name]
+		if kind == "" {
+			if existing, ok := r.entries[e.Name]; ok {
+				kind = existing.Kind
+			} else {
+				kind = "unknown"
+			}
+		}
+		r.rejected[e.Name] = rejection{code: e.Code, kind: kind}
+	}
 }
 
 // ResolvedDisable is one deferred "disable" whose id this registry has now
@@ -326,23 +415,54 @@ type Row struct {
 	// always bare; callers that want a "(disabled)" annotation add it
 	// themselves from this field.
 	Disabled bool
+	// Rejected is the error code the most recent "registered" reply carried
+	// for this name (see ApplyRegisterErrors), or "" if it wasn't rejected.
+	// A rejected name with no earlier success has an empty URL; one
+	// rejected on a re-register keeps its old URL here, and it's the
+	// caller's call whether that stale link is worth showing.
+	Rejected string
+	// LocallyDisabled reports a local `d` not yet undone by `e`
+	// (MarkLocallyDisabled); Disabled is always true alongside it.
+	LocallyDisabled bool
+	// Reregistering reports an `e` whose register hasn't been answered yet
+	// (MarkReregistering).
+	Reregistering bool
 }
 
-// Rows returns every entry as display rows, sorted by name.
+// Rows returns every entry, plus every rejected, locally disabled or
+// re-registering name that has no entry, as display rows sorted by name.
 func (r *Registry) Rows() []Row {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	names := make([]string, 0, len(r.entries))
-	for n := range r.entries {
+	kinds := make(map[string]string, len(r.entries)+len(r.rejected)+len(r.locallyDisabled)+len(r.reregistering))
+	for n, rej := range r.rejected {
+		kinds[n] = rej.kind
+	}
+	for n, k := range r.locallyDisabled {
+		kinds[n] = k
+	}
+	for n, k := range r.reregistering {
+		kinds[n] = k
+	}
+	for n, e := range r.entries {
+		kinds[n] = e.Kind
+	}
+	names := make([]string, 0, len(kinds))
+	for n := range kinds {
 		names = append(names, n)
 	}
 	sort.Strings(names)
 
 	rows := make([]Row, 0, len(names))
 	for _, n := range names {
-		e := r.entries[n]
-		disabled := e.Status == StatusDisabled
-		rows = append(rows, Row{Name: n, Kind: e.Kind, URL: e.URL, Disabled: disabled})
+		_, local := r.locallyDisabled[n]
+		_, rereg := r.reregistering[n]
+		row := Row{Name: n, Kind: kinds[n], Rejected: r.rejected[n].code, LocallyDisabled: local, Reregistering: rereg, Disabled: local}
+		if e, ok := r.entries[n]; ok {
+			row.URL = e.URL
+			row.Disabled = local || e.Status == StatusDisabled
+		}
+		rows = append(rows, row)
 	}
 	return rows
 }

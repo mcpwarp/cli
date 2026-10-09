@@ -2,11 +2,13 @@ package tui
 
 import (
 	"context"
+	"image/color"
 	"sync"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/mcpwarp/cli/internal/eventbus"
 )
@@ -325,6 +327,57 @@ func TestApplySnapshotUpdatesNonEmptyState(t *testing.T) {
 	}
 }
 
+// TestSnapshotPendingRejectedThenActive is the QUOTA_EXCEEDED-shown-as-
+// active fix, model side: an http row seeded pending isn't shown as active,
+// a snapshot marking it rejected shows rejected, and a later snapshot with
+// a successful registration (after `e` or a reconnect re-sends it, e.g.
+// once the quota was raised) flips it back to active with its URL.
+func TestSnapshotPendingRejectedThenActive(t *testing.T) {
+	m := newTestModel([]Server{{Name: "deepwiki", Kind: "http", State: RegistrationPending, Registration: RegistrationPending}}, nil)
+	if got := displayState(m.servers[0]); got != RegistrationPending {
+		t.Fatalf("seeded row displays %q, want %q", got, RegistrationPending)
+	}
+
+	next, _ := m.Update(SnapshotMsg{Servers: []Server{{Name: "deepwiki", Kind: "http", State: RegistrationRejected, Registration: RegistrationRejected}}})
+	m = next.(Model)
+	if got := displayState(m.servers[0]); got != RegistrationRejected || m.servers[0].URL != "" {
+		t.Fatalf("after a rejected snapshot: display %q, URL %q; want rejected, no URL", got, m.servers[0].URL)
+	}
+
+	next, _ = m.Update(SnapshotMsg{Servers: []Server{{Name: "deepwiki", Kind: "http", URL: "https://dw.example/mcp", State: RegistrationActive, Registration: RegistrationActive}}})
+	m = next.(Model)
+	if got := displayState(m.servers[0]); got != RegistrationActive || m.servers[0].URL != "https://dw.example/mcp" {
+		t.Fatalf("after a successful snapshot: display %q, URL %q; want active with URL", got, m.servers[0].URL)
+	}
+}
+
+// TestBackgroundColorPicksSecondaryGray: the terminal's background reply
+// swaps the secondary-text gray, and neither variant is the theme-defined
+// ANSI 8 that vanished on a mid-gray background.
+func TestBackgroundColorPicksSecondaryGray(t *testing.T) {
+	m := newTestModel(nil, nil)
+	sameColor := func(a, b color.Color) bool {
+		ar, ag, ab, aa := a.RGBA()
+		br, bg, bb, ba := b.RGBA()
+		return ar == br && ag == bg && ab == bb && aa == ba
+	}
+	if got := m.styles.dim.GetForeground(); !sameColor(got, lipgloss.Color("#a8a8a8")) {
+		t.Fatalf("default (dark) gray = %v, want #a8a8a8", got)
+	}
+
+	next, _ := m.Update(tea.BackgroundColorMsg{Color: color.White})
+	m = next.(Model)
+	if got := m.styles.dim.GetForeground(); !sameColor(got, lipgloss.Color("#626262")) {
+		t.Fatalf("light-background gray = %v, want #626262", got)
+	}
+
+	next, _ = m.Update(tea.BackgroundColorMsg{Color: color.RGBA{R: 0x3c, G: 0x3d, B: 0x42, A: 0xff}})
+	m = next.(Model)
+	if got := m.styles.dim.GetForeground(); !sameColor(got, lipgloss.Color("#a8a8a8")) {
+		t.Fatalf("mid-gray (#3c3d42) background gray = %v, want #a8a8a8", got)
+	}
+}
+
 func TestClosedTelemetryAndMetricsStopListening(t *testing.T) {
 	bus := eventbus.New(1)
 	m := New(bus, nil, nil)
@@ -461,7 +514,7 @@ func TestLogPaneScrollKeysMoveViewport(t *testing.T) {
 	}
 }
 
-func TestInitSubscribesAllThreeChannels(t *testing.T) {
+func TestInitSubscribesChannelsAndRequestsBackground(t *testing.T) {
 	bus := eventbus.New(1)
 	m := New(bus, nil, nil)
 	cmd := m.Init()
@@ -474,7 +527,8 @@ func TestInitSubscribesAllThreeChannels(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected tea.BatchMsg, got %T", msg)
 	}
-	if len(batch) != 3 {
-		t.Fatalf("expected 3 batched listen commands, got %d", len(batch))
+	// Three listen Cmds plus tea.RequestBackgroundColor (view.go's styles).
+	if len(batch) != 4 {
+		t.Fatalf("expected 3 batched listen commands plus the background-color request, got %d", len(batch))
 	}
 }

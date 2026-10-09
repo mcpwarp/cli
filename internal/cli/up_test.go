@@ -719,9 +719,11 @@ func TestNewTUIRenderer_SetsAndRestoresLogWriter(t *testing.T) {
 }
 
 // TestNewTUIRenderer_SeedsInitialState covers the STATE-column bug: before
-// the first eventbus.ServerStateChanged, an http row must show "active"
-// and a stdio row must show its supervisor's current GetState() rather
-// than an empty string.
+// the first eventbus.ServerStateChanged, a stdio row must show its
+// supervisor's current GetState() rather than an empty string, and before
+// the tunnel's first "registered" reply an http row must be pending, never
+// "active" (the QUOTA_EXCEEDED-shown-as-active bug) — with both rows'
+// Registration pending too.
 func TestNewTUIRenderer_SeedsInitialState(t *testing.T) {
 	t.Cleanup(bridge.KillAllLiveChildren)
 
@@ -771,12 +773,15 @@ func TestNewTUIRenderer_SeedsInitialState(t *testing.T) {
 	byName := make(map[string]string, len(gotServers))
 	for _, s := range gotServers {
 		byName[s.Name] = s.State
+		if s.Registration != tui.RegistrationPending {
+			t.Fatalf("%s Registration = %q, want %q", s.Name, s.Registration, tui.RegistrationPending)
+		}
 	}
 	if got := byName["echo"]; got != string(supervisor.Disabled) {
 		t.Fatalf("stdio row State = %q, want supervisor state %q", got, supervisor.Disabled)
 	}
-	if got := byName["notes"]; got != "active" {
-		t.Fatalf("http row State = %q, want %q", got, "active")
+	if got := byName["notes"]; got != tui.RegistrationPending {
+		t.Fatalf("http row State = %q, want %q", got, tui.RegistrationPending)
 	}
 }
 
@@ -825,6 +830,100 @@ func TestPollTunnelForTUISetsHTTPStateOnly(t *testing.T) {
 	// Rows() returns a bare URL; the TUI shows disabled via STATE.
 	if got := urlByName["disabled-http"]; got != "https://d.example/mcp" {
 		t.Fatalf("disabled-http URL = %q, want bare URL", got)
+	}
+}
+
+// TestPollTunnelForTUIRejectedThenActive is the QUOTA_EXCEEDED-shown-as-
+// active fix, poll side: an http service the "registered" reply rejected
+// must reach the TUI as rejected with no URL (not left at a seeded
+// "active"); a stdio service's rejection rides on Registration only, its
+// State still owned by the supervisor; SERVER_DISABLED reads as disabled; a
+// name rejected on re-register loses its stale URL; and a later successful
+// registration flips the http row to active with its URL.
+func TestPollTunnelForTUIRejectedThenActive(t *testing.T) {
+	kinds := map[string]string{"deepwiki": "http", "conflicted": "http", "paused": "http", "fs": "stdio"}
+	reg := registry.New()
+	reg.ApplyRegistered([]appproto.RegisteredService{
+		{Name: "conflicted", ID: "id-c", URL: "https://c.example/mcp"},
+	}, kinds)
+	reg.ApplyRegisterErrors([]appproto.ServiceError{
+		{Name: "deepwiki", Code: "QUOTA_EXCEEDED"},
+		{Name: "conflicted", Code: "CONFLICT"},
+		{Name: "paused", Code: "SERVER_DISABLED"},
+		{Name: "fs", Code: "QUOTA_EXCEEDED"},
+	}, kinds)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	updates := make(chan tui.SnapshotMsg, 1)
+	go pollTunnelForTUI(ctx, &fakeTunnelHandle{reg: reg}, eventbus.New(1), updates, time.Millisecond)
+
+	next := func(until func(map[string]tui.Server) bool) map[string]tui.Server {
+		t.Helper()
+		deadline := time.After(2 * time.Second)
+		for {
+			select {
+			case snap := <-updates:
+				byName := make(map[string]tui.Server, len(snap.Servers))
+				for _, s := range snap.Servers {
+					byName[s.Name] = s
+				}
+				if until(byName) {
+					return byName
+				}
+			case <-deadline:
+				t.Fatal("timed out waiting for the expected SnapshotMsg")
+			}
+		}
+	}
+
+	byName := next(func(map[string]tui.Server) bool { return true })
+	if got := byName["deepwiki"]; got.State != tui.RegistrationRejected || got.Registration != tui.RegistrationRejected || got.URL != "" || got.Kind != "http" {
+		t.Fatalf("deepwiki = %+v, want an http row rejected with no URL", got)
+	}
+	if got := byName["conflicted"]; got.State != tui.RegistrationRejected || got.URL != "" {
+		t.Fatalf("conflicted = %+v, want rejected with its stale URL dropped", got)
+	}
+	if got := byName["paused"]; got.State != tui.RegistrationDisabled {
+		t.Fatalf("paused = %+v, want SERVER_DISABLED shown as disabled", got)
+	}
+	if got := byName["fs"]; got.State != "" || got.Registration != tui.RegistrationRejected {
+		t.Fatalf("fs = %+v, want empty State (supervisor-owned) and Registration rejected", got)
+	}
+
+	reg.ApplyRegistered([]appproto.RegisteredService{
+		{Name: "deepwiki", ID: "id-dw", URL: "https://dw.example/mcp"},
+	}, kinds)
+	byName = next(func(m map[string]tui.Server) bool { return m["deepwiki"].State == tui.RegistrationActive })
+	if got := byName["deepwiki"]; got.Registration != tui.RegistrationActive || got.URL != "https://dw.example/mcp" {
+		t.Fatalf("deepwiki after a successful register = %+v, want active with its URL", got)
+	}
+}
+
+// TestRegistrationOfPrecedence pins registrationOf's newest-fact-first
+// order, covering the three `d`-on-a-not-active-row cases (rejected and
+// never registered, rejected after an earlier success, pending with a late
+// reply) and the `e` that follows.
+func TestRegistrationOfPrecedence(t *testing.T) {
+	cases := []struct {
+		name string
+		row  registry.Row
+		want string
+	}{
+		{"active", registry.Row{}, tui.RegistrationActive},
+		{"dashboard disable", registry.Row{Disabled: true}, tui.RegistrationDisabled},
+		{"rejected", registry.Row{Rejected: "QUOTA_EXCEEDED"}, tui.RegistrationRejected},
+		{"SERVER_DISABLED", registry.Row{Rejected: "SERVER_DISABLED"}, tui.RegistrationDisabled},
+		{"rejected after d then e", registry.Row{Disabled: true, Rejected: "CONFLICT"}, tui.RegistrationRejected},
+		{"d on a never-registered name", registry.Row{LocallyDisabled: true, Disabled: true}, tui.RegistrationDisabled},
+		{"d, late reply landed", registry.Row{LocallyDisabled: true, Disabled: true, URL: "https://n.example/mcp"}, tui.RegistrationDisabled},
+		{"d over a leftover rejection", registry.Row{LocallyDisabled: true, Disabled: true, Rejected: "CONFLICT"}, tui.RegistrationDisabled},
+		{"e awaiting its reply", registry.Row{Reregistering: true, Disabled: true}, tui.RegistrationPending},
+	}
+	for _, tc := range cases {
+		if got := registrationOf(tc.row); got != tc.want {
+			t.Errorf("%s: registrationOf(%+v) = %q, want %q", tc.name, tc.row, got, tc.want)
+		}
 	}
 }
 

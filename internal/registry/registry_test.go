@@ -205,3 +205,146 @@ func TestRowsSortedByName(t *testing.T) {
 		t.Fatalf("expected alpha's row not to be Disabled: %+v", rows[0])
 	}
 }
+
+// TestApplyRegisterErrorsUntilNextSuccess: a name rejected on its first
+// register has no entry, yet must still appear in Rows (with its kind and
+// the error code) so the dashboard can show it as rejected; a later
+// successful "registered" for that name clears the rejection. A name that
+// had succeeded earlier and is then rejected keeps its entry, flagged.
+func TestApplyRegisterErrorsUntilNextSuccess(t *testing.T) {
+	r := New()
+	kinds := map[string]string{"deepwiki": "http", "fs": "stdio"}
+	r.ApplyRegistered([]appproto.RegisteredService{
+		{Name: "fs", ID: "id-fs", URL: "https://fs.example/mcp"},
+	}, kinds)
+	r.ApplyRegisterErrors([]appproto.ServiceError{
+		{Name: "deepwiki", Code: "QUOTA_EXCEEDED", Message: "quota"},
+		{Name: "fs", Code: "CONFLICT", Message: "conflict"},
+	}, kinds)
+
+	rows := r.Rows()
+	if len(rows) != 2 {
+		t.Fatalf("expected the rejected-only name alongside the entry, got %+v", rows)
+	}
+	if got := rows[0]; got.Name != "deepwiki" || got.Kind != "http" || got.URL != "" || got.Rejected != "QUOTA_EXCEEDED" {
+		t.Fatalf("deepwiki row = %+v, want http, no URL, Rejected QUOTA_EXCEEDED", got)
+	}
+	if got := rows[1]; got.Name != "fs" || got.URL != "https://fs.example/mcp" || got.Rejected != "CONFLICT" {
+		t.Fatalf("fs row = %+v, want its old URL kept and Rejected CONFLICT", got)
+	}
+	if _, ok := r.Get("deepwiki"); ok {
+		t.Fatalf("a rejected-only name must not become a routable entry")
+	}
+
+	r.ApplyRegistered([]appproto.RegisteredService{
+		{Name: "deepwiki", ID: "id-dw", URL: "https://dw.example/mcp"},
+	}, kinds)
+	rows = r.Rows()
+	if got := rows[0]; got.Name != "deepwiki" || got.Rejected != "" || got.URL != "https://dw.example/mcp" {
+		t.Fatalf("deepwiki row after a successful register = %+v, want registered, not rejected", got)
+	}
+	if got := rows[1]; got.Rejected != "CONFLICT" {
+		t.Fatalf("fs's rejection must stand until fs itself registers, got %+v", got)
+	}
+}
+
+func rowNamed(t *testing.T, r *Registry, name string) Row {
+	t.Helper()
+	for _, row := range r.Rows() {
+		if row.Name == name {
+			return row
+		}
+	}
+	t.Fatalf("no row for %q in %+v", name, r.Rows())
+	return Row{}
+}
+
+// TestLocalDisableOfRejectedNeverRegistered: `d` on a name rejected on its
+// first register (no entry) must read disabled and drop the rejection —
+// otherwise it stays "rejected" forever, since the `d` also keeps it out of
+// every later register batch.
+func TestLocalDisableOfRejectedNeverRegistered(t *testing.T) {
+	r := New()
+	r.ApplyRegisterErrors([]appproto.ServiceError{{Name: "deepwiki", Code: "QUOTA_EXCEEDED"}}, map[string]string{"deepwiki": "http"})
+	r.MarkLocallyDisabled("deepwiki", "http")
+
+	got := rowNamed(t, r, "deepwiki")
+	if !got.LocallyDisabled || !got.Disabled || got.Rejected != "" || got.Kind != "http" {
+		t.Fatalf("deepwiki after d = %+v, want locally disabled, no rejection", got)
+	}
+}
+
+// TestLocalDisableOfRejectedAfterEarlierSuccess: a name that registered,
+// was later rejected on a re-register, then `d`: disabled, not rejected.
+func TestLocalDisableOfRejectedAfterEarlierSuccess(t *testing.T) {
+	r := New()
+	kinds := map[string]string{"deepwiki": "http"}
+	r.ApplyRegistered([]appproto.RegisteredService{{Name: "deepwiki", ID: "id-dw", URL: "https://dw.example/mcp"}}, kinds)
+	r.ApplyRegisterErrors([]appproto.ServiceError{{Name: "deepwiki", Code: "CONFLICT"}}, kinds)
+	// UnregisterService's order: MarkLocallyDisabled, then ApplyDisable.
+	r.MarkLocallyDisabled("deepwiki", "http")
+	r.ApplyDisable("id-dw", "unregistered locally")
+
+	got := rowNamed(t, r, "deepwiki")
+	if !got.LocallyDisabled || !got.Disabled || got.Rejected != "" {
+		t.Fatalf("deepwiki after d = %+v, want locally disabled, no rejection", got)
+	}
+}
+
+// TestLocalDisableBeatsInFlightRegistered: `d` while the first register is
+// still unanswered; the reply then lands. The name must stay disabled for
+// routing (IsDisabled) and display, not flip to active, and it isn't a
+// resurrection. A rejection in such a reply is dropped the same way.
+func TestLocalDisableBeatsInFlightRegistered(t *testing.T) {
+	r := New()
+	kinds := map[string]string{"notes": "http", "deepwiki": "http"}
+	r.MarkLocallyDisabled("notes", "http")
+	r.MarkLocallyDisabled("deepwiki", "http")
+	if got := rowNamed(t, r, "notes"); !got.Disabled || got.URL != "" {
+		t.Fatalf("pending notes after d = %+v, want disabled with no URL", got)
+	}
+
+	res := r.ApplyRegistered([]appproto.RegisteredService{{Name: "notes", ID: "id-n", URL: "https://n.example/mcp"}}, kinds)
+	r.ApplyRegisterErrors([]appproto.ServiceError{{Name: "deepwiki", Code: "QUOTA_EXCEEDED"}}, kinds)
+	if len(res.Resurrected) != 0 {
+		t.Fatalf("a reply for a locally disabled name must not resurrect it: %+v", res.Resurrected)
+	}
+	if e, _ := r.Get("notes"); e.Status != StatusDisabled || !r.IsDisabled("id-n") {
+		t.Fatalf("notes entry = %+v (IsDisabled=%v), want disabled for routing", e, r.IsDisabled("id-n"))
+	}
+	if got := rowNamed(t, r, "notes"); !got.LocallyDisabled || !got.Disabled {
+		t.Fatalf("notes row = %+v, want disabled", got)
+	}
+	if got := rowNamed(t, r, "deepwiki"); got.Rejected != "" || !got.Disabled {
+		t.Fatalf("deepwiki row = %+v, want disabled with the late rejection dropped", got)
+	}
+}
+
+// TestLocalDisableEnableRoundTrip: d → e on a registered name reads
+// disabled, then re-registering (pending) until the reply, then active —
+// and that reply is the usual resurrection of a known id.
+func TestLocalDisableEnableRoundTrip(t *testing.T) {
+	r := New()
+	kinds := map[string]string{"notes": "http"}
+	svc := []appproto.RegisteredService{{Name: "notes", ID: "id-n", URL: "https://n.example/mcp"}}
+	r.ApplyRegistered(svc, kinds)
+
+	r.MarkLocallyDisabled("notes", "http")
+	r.ApplyDisable("id-n", "unregistered locally")
+	if got := rowNamed(t, r, "notes"); !got.LocallyDisabled || !got.Disabled {
+		t.Fatalf("after d: %+v, want disabled", got)
+	}
+
+	r.MarkReregistering("notes", "http")
+	if got := rowNamed(t, r, "notes"); got.LocallyDisabled || !got.Reregistering {
+		t.Fatalf("after e: %+v, want re-registering and no longer locally disabled", got)
+	}
+
+	res := r.ApplyRegistered(svc, kinds)
+	if len(res.Resurrected) != 1 || r.IsDisabled("id-n") {
+		t.Fatalf("reply after e: resurrected=%+v IsDisabled=%v, want one resurrection and routable", res.Resurrected, r.IsDisabled("id-n"))
+	}
+	if got := rowNamed(t, r, "notes"); got.Disabled || got.Reregistering || got.LocallyDisabled {
+		t.Fatalf("after the reply: %+v, want plain active", got)
+	}
+}

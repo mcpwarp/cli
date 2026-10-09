@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -246,6 +247,269 @@ func TestFooterNeverClippedByLogPane(t *testing.T) {
 	}
 	if len(lines) > 12 {
 		t.Fatalf("rendered %d lines into a 12-line terminal", len(lines))
+	}
+}
+
+var errQuota = eventbus.AppError{
+	Code: "QUOTA_EXCEEDED", Message: "server limit reached", Service: "deepwiki",
+	Hint: "upgrade your plan at https://mcpwarp.io/settings to add more servers",
+}
+
+// TestRegistrationStatesRendered: an http row the tunnel rejected shows
+// "rejected" (in the error style), a pending one "pending" — neither
+// "active" — while the `last error` line still carries the detail. A stdio
+// row shows the registration only over a healthy supervisor state; a
+// restarting child stays "restarting" whatever the tunnel said.
+func TestRegistrationStatesRendered(t *testing.T) {
+	m := newTestModel([]Server{
+		{Name: "deepwiki", Kind: "http", State: RegistrationRejected, Registration: RegistrationRejected},
+		{Name: "notes", Kind: "http", State: RegistrationPending, Registration: RegistrationPending},
+		{Name: "fs", Kind: "stdio", State: "healthy", Registration: RegistrationRejected},
+		{Name: "git", Kind: "stdio", State: "healthy", Registration: RegistrationPending},
+		{Name: "db", Kind: "stdio", State: "restarting", Registration: RegistrationRejected},
+	}, nil)
+	next, _ := m.Update(controlEventMsg{evt: errQuota})
+	m = next.(Model)
+
+	out := renderAt(t, m, 100, 24)
+	want := map[string]string{"deepwiki": "rejected", "notes": "pending", "fs": "rejected", "git": "pending", "db": "restarting"}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(strings.TrimPrefix(line, ">"))
+		if len(fields) < 3 {
+			continue
+		}
+		if state, ok := want[fields[0]]; ok {
+			if fields[2] != state {
+				t.Fatalf("%s STATE = %q, want %q; got:\n%s", fields[0], fields[2], state, out)
+			}
+			delete(want, fields[0])
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("rows not found: %v; got:\n%s", want, out)
+	}
+	if strings.Contains(out, "active") {
+		t.Fatalf("no row here is confirmed, so none may read \"active\"; got:\n%s", out)
+	}
+	if !strings.Contains(out, "last error: [QUOTA_EXCEEDED] server limit reached (service=deepwiki)") {
+		t.Fatalf("expected the last-error line to stay; got:\n%s", out)
+	}
+	if raw := m.renderTable(); !strings.Contains(raw, styleBad.Render(padRight(RegistrationRejected, len("restarting")))) {
+		t.Fatalf("expected the rejected STATE cell in the error style; got %q", raw)
+	}
+}
+
+// TestFooterAndHelpListCopyKey: `c` is advertised in both the footer hint
+// and the `?` overlay, and the footer still fits an 80-column terminal.
+func TestFooterAndHelpListCopyKey(t *testing.T) {
+	m := newTestModel([]Server{{Name: "fs", State: "healthy"}}, nil)
+	out := renderAt(t, m, 80, 24)
+	lines := strings.Split(out, "\n")
+	footer := lines[len(lines)-1]
+	if !strings.Contains(footer, "c copy URL") || !strings.Contains(footer, "e enable") {
+		t.Fatalf("footer = %q, want it to list `c copy URL` and still end with `e enable`", footer)
+	}
+	if w := lipgloss.Width(footer); w > 80 {
+		t.Fatalf("footer is %d columns, wider than 80", w)
+	}
+
+	next, _ := m.Update(namedKey(t, "?"))
+	m = next.(Model)
+	if out := renderAt(t, m, 80, 24); !strings.Contains(out, "c          copy selected server's public URL") {
+		t.Fatalf("help overlay missing the c binding; got:\n%s", out)
+	}
+}
+
+const (
+	shortURL = "https://fs.example/mcp"
+	// wrapURL is 59 columns: it fits beside the other columns at 120 wide
+	// but not at 60.
+	wrapURL = "https://anki-anatoly.tunnel.dev.mcpwarp.io/mcp/some-path-xy"
+)
+
+// tableLines renders just the table at w columns, ANSI stripped.
+func tableLines(t *testing.T, m Model, w int) []string {
+	t.Helper()
+	next, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: 24})
+	m = next.(Model)
+	return strings.Split(ansi.Strip(m.renderTable()), "\n")
+}
+
+// TestTableURLFitsStaysOnOneLine: on a wide terminal every row is one line
+// with its full URL inline — the table looks as it always did.
+func TestTableURLFitsStaysOnOneLine(t *testing.T) {
+	m := newTestModel([]Server{
+		{Name: "fs", Kind: "stdio", State: "healthy", URL: shortURL},
+		{Name: "anki", Kind: "http", State: "active", URL: wrapURL},
+	}, nil)
+	lines := tableLines(t, m, 120)
+	if len(lines) != 3 {
+		t.Fatalf("expected header + 2 single-line rows, got %d lines:\n%s", len(lines), strings.Join(lines, "\n"))
+	}
+	if !strings.Contains(lines[1], "fs") || !strings.HasSuffix(lines[1], shortURL) {
+		t.Fatalf("fs row = %q, want its URL inline", lines[1])
+	}
+	if !strings.Contains(lines[2], "anki") || !strings.HasSuffix(lines[2], wrapURL) {
+		t.Fatalf("anki row = %q, want its URL inline", lines[2])
+	}
+}
+
+// TestTableURLWrapsWhenNarrow: when a URL doesn't fit its column it moves,
+// whole and un-ellipsized, to its own line under the row; no line exceeds
+// the terminal width.
+func TestTableURLWrapsWhenNarrow(t *testing.T) {
+	m := newTestModel([]Server{{Name: "anki", Kind: "http", State: "active", URL: wrapURL}}, nil)
+	lines := tableLines(t, m, 66)
+	if len(lines) != 3 {
+		t.Fatalf("expected header + row + URL line, got %d lines:\n%s", len(lines), strings.Join(lines, "\n"))
+	}
+	if !strings.Contains(lines[1], "anki") || strings.Contains(lines[1], "https://") {
+		t.Fatalf("row line = %q, want the row without its URL", lines[1])
+	}
+	if got := strings.TrimSpace(lines[2]); got != wrapURL {
+		t.Fatalf("URL line = %q, want the full URL %q", lines[2], wrapURL)
+	}
+	if strings.Contains(strings.Join(lines, "\n"), "…") {
+		t.Fatalf("nothing should be truncated at this width:\n%s", strings.Join(lines, "\n"))
+	}
+	for _, l := range lines {
+		if w := lipgloss.Width(l); w > 66 {
+			t.Fatalf("line exceeds width 66 (%d): %q", w, l)
+		}
+	}
+}
+
+// TestTableURLWrapMixedRows: only the row whose URL doesn't fit gets the
+// extra line; and the selected row's highlight covers its URL line too.
+func TestTableURLWrapMixedRows(t *testing.T) {
+	m := newTestModel([]Server{
+		{Name: "fs", Kind: "stdio", State: "healthy", URL: shortURL},
+		{Name: "anki", Kind: "http", State: "active", URL: wrapURL},
+		{Name: "deepwiki", Kind: "http", State: RegistrationRejected},
+	}, nil)
+	next, _ := m.Update(namedKey(t, "j")) // select anki
+	m = next.(Model)
+	lines := tableLines(t, m, 66)
+	if len(lines) != 5 {
+		t.Fatalf("expected header + fs + anki + anki URL + deepwiki, got %d lines:\n%s", len(lines), strings.Join(lines, "\n"))
+	}
+	if !strings.HasSuffix(lines[1], shortURL) {
+		t.Fatalf("fs row = %q, want its short URL inline", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], "> anki") || strings.TrimSpace(lines[3]) != wrapURL {
+		t.Fatalf("anki rows = %q / %q, want the selected row then its full URL", lines[2], lines[3])
+	}
+	if !strings.Contains(lines[4], "deepwiki") {
+		t.Fatalf("deepwiki row = %q", lines[4])
+	}
+
+	next, _ = m.Update(tea.WindowSizeMsg{Width: 66, Height: 24})
+	m = next.(Model)
+	raw := strings.Split(m.renderTable(), "\n")
+	if want := styleSelected.Render("  " + "  " + wrapURL); raw[3] != want {
+		t.Fatalf("selected row's URL line = %q, want it highlighted like the row (%q)", raw[3], want)
+	}
+}
+
+// TestTableURLTruncatedOnlyAsLastResort: narrower than even the URL's own
+// line, the URL is cut with "…" rather than overflowing the terminal.
+func TestTableURLTruncatedOnlyAsLastResort(t *testing.T) {
+	m := newTestModel([]Server{{Name: "anki", Kind: "http", State: "active", URL: wrapURL}}, nil)
+	lines := tableLines(t, m, 30)
+	if len(lines) != 3 || !strings.HasSuffix(lines[2], "…") {
+		t.Fatalf("expected a truncated URL line, got:\n%s", strings.Join(lines, "\n"))
+	}
+	for _, l := range lines {
+		if w := lipgloss.Width(l); w > 30 {
+			t.Fatalf("line exceeds width 30 (%d): %q", w, l)
+		}
+	}
+}
+
+// TestWrappedURLsKeepFooterOnScreen: the extra URL lines (and a notice)
+// count against the log pane's budget, so the footer stays the last line
+// and the frame never exceeds the terminal height.
+func TestWrappedURLsKeepFooterOnScreen(t *testing.T) {
+	m := newTestModel([]Server{
+		{Name: "a", Kind: "http", State: "active", URL: wrapURL},
+		{Name: "b", Kind: "http", State: "active", URL: wrapURL},
+		{Name: "c", Kind: "http", State: "active", URL: wrapURL},
+	}, nil)
+	next, _ := m.Update(namedKey(t, "l"))
+	m = next.(Model)
+	for i := 0; i < 50; i++ {
+		next, _ = m.Update(telemetryEventMsg{line: eventbus.LogLine{Server: "a", Text: "line"}})
+		m = next.(Model)
+	}
+	next, _ = m.Update(copyResultMsg{url: wrapURL})
+	m = next.(Model)
+
+	out := renderAt(t, m, 66, 16)
+	lines := strings.Split(out, "\n")
+	if len(lines) > 16 {
+		t.Fatalf("rendered %d lines into a 16-line terminal:\n%s", len(lines), out)
+	}
+	if got := lines[len(lines)-1]; !strings.Contains(got, "q quit") {
+		t.Fatalf("last rendered line = %q, want the footer", got)
+	}
+	if n := strings.Count(out, wrapURL); n < 3 {
+		t.Fatalf("expected all three full URLs on screen, found %d:\n%s", n, out)
+	}
+}
+
+// TestLogTailVisibleAfterTableGrows: on a 66x20 terminal the table grows
+// after the last resize (URLs arrive by snapshot and wrap onto their own
+// lines, a notice line appears) while log lines keep coming — the newest
+// must stay visible, and the frame must fill the terminal exactly, not 3
+// lines short.
+func TestLogTailVisibleAfterTableGrows(t *testing.T) {
+	m := newTestModel([]Server{
+		{Name: "anki", Kind: "http", State: RegistrationPending},
+		{Name: "notes", Kind: "http", State: RegistrationPending},
+	}, nil)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 66, Height: 20})
+	m = next.(Model)
+	next, _ = m.Update(namedKey(t, "l"))
+	m = next.(Model)
+	for i := 0; i < 20; i++ {
+		next, _ = m.Update(telemetryEventMsg{line: eventbus.LogLine{Server: "fs", Text: fmt.Sprintf("line-%d", i)}})
+		m = next.(Model)
+	}
+	next, _ = m.Update(SnapshotMsg{Servers: []Server{
+		{Name: "anki", Kind: "http", URL: wrapURL, State: RegistrationActive},
+		{Name: "notes", Kind: "http", URL: wrapURL, State: RegistrationActive},
+	}})
+	m = next.(Model)
+	for i := 20; i < 40; i++ {
+		next, _ = m.Update(telemetryEventMsg{line: eventbus.LogLine{Server: "fs", Text: fmt.Sprintf("line-%d", i)}})
+		m = next.(Model)
+	}
+	next, _ = m.Update(copyResultMsg{url: wrapURL})
+	m = next.(Model)
+
+	out := ansi.Strip(m.View().Content)
+	lines := strings.Split(out, "\n")
+	if len(lines) != 20 {
+		t.Fatalf("rendered %d lines into a 20-line terminal, want exactly 20:\n%s", len(lines), out)
+	}
+	for _, want := range []string{"line-38", "line-39"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("newest log line %q not visible:\n%s", want, out)
+		}
+	}
+	if got := lines[len(lines)-1]; !strings.Contains(got, "q quit") {
+		t.Fatalf("last rendered line = %q, want the footer", got)
+	}
+
+	// A user scrolled back through the log keeps their place when the
+	// notice later clears and the pane grows again.
+	next, _ = m.Update(namedKey(t, "pgup"))
+	m = next.(Model)
+	offset := m.logsVP.YOffset()
+	next, _ = m.Update(clearNoticeMsg{seq: m.noticeSeq})
+	m = next.(Model)
+	if m.logsVP.AtBottom() || m.logsVP.YOffset() != offset {
+		t.Fatalf("scrolled-back pane moved: offset %d -> %d (atBottom=%v)", offset, m.logsVP.YOffset(), m.logsVP.AtBottom())
 	}
 }
 

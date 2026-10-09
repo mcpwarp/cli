@@ -659,6 +659,200 @@ func TestRegisteredInvalidNameAndUsernameRequiredHints(t *testing.T) {
 	}
 }
 
+// TestRegisteredQuotaExceededRecordedThenClearedByReRegister: a per-service
+// QUOTA_EXCEEDED in a "registered" reply (alongside a success, so not
+// fatal) must land in the registry as that name's rejection — the dashboard
+// reads it from there — and a later successful re-register of that name
+// (here RegisterService, the `e` path; a reconnect takes the same
+// handleApp branch) must clear it.
+func TestRegisteredQuotaExceededRecordedThenClearedByReRegister(t *testing.T) {
+	var registers atomic.Int32
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		c.OnApp(func(raw json.RawMessage) {
+			var wrapper struct {
+				Mcpwarp struct{ Op string } `json:"mcpwarp"`
+			}
+			_ = json.Unmarshal(raw, &wrapper)
+			if wrapper.Mcpwarp.Op != "register" {
+				return
+			}
+			if registers.Add(1) == 1 {
+				_ = c.SendApp(context.Background(), map[string]any{
+					"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []any{
+						map[string]any{"name": "good", "id": "svc-good", "url": "https://good.example/mcp", "created": true},
+					}, "errors": []map[string]any{
+						{"name": "deepwiki", "code": "QUOTA_EXCEEDED", "message": "server limit reached"},
+					}},
+				})
+				return
+			}
+			_ = c.SendApp(context.Background(), map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []any{
+					map[string]any{"name": "deepwiki", "id": "svc-dw", "url": "https://dw.example/mcp", "created": true},
+				}, "errors": []any{}},
+			})
+		})
+	})
+
+	bus := newTestBus(t)
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "good", Kind: "http"}, {Name: "deepwiki", Kind: "http"}},
+		Bus:         bus,
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	rowFor := func(name string) (registry.Row, bool) {
+		for _, r := range tun.Registry().Rows() {
+			if r.Name == name {
+				return r, true
+			}
+		}
+		return registry.Row{}, false
+	}
+	waitFor := func(what string, ok func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for !ok() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s; rows: %+v", what, tun.Registry().Rows())
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	waitFor("deepwiki's rejection", func() bool {
+		r, ok := rowFor("deepwiki")
+		return ok && r.Rejected == "QUOTA_EXCEEDED"
+	})
+	if r, _ := rowFor("deepwiki"); r.URL != "" || r.Kind != "http" {
+		t.Fatalf("rejected deepwiki row = %+v, want kind http and no URL", r)
+	}
+	if r, ok := rowFor("good"); !ok || r.Rejected != "" {
+		t.Fatalf("good row = %+v (found=%v), want registered and not rejected", r, ok)
+	}
+
+	// d on the rejected, never-registered name: disabled, rejection gone.
+	if err := tun.UnregisterService("deepwiki"); err != nil {
+		t.Fatalf("UnregisterService: %v", err)
+	}
+	if r, _ := rowFor("deepwiki"); !r.LocallyDisabled || !r.Disabled || r.Rejected != "" {
+		t.Fatalf("deepwiki after d = %+v, want locally disabled with no rejection", r)
+	}
+
+	// e: re-registered, and this time the tunnel accepts it.
+	tun.RegisterService("deepwiki")
+	waitFor("deepwiki's successful re-register", func() bool {
+		r, ok := rowFor("deepwiki")
+		return ok && r.Rejected == "" && !r.Disabled && !r.Reregistering && r.URL == "https://dw.example/mcp"
+	})
+	if got := exitCode.Load(); got != -1 {
+		t.Fatalf("expected no FatalExit, got exit code %d", got)
+	}
+}
+
+// TestReconnectAllServicesRejectedIsNotFatal: after a first successful
+// registration, a reconnect whose "registered" reply rejects every service
+// (handleApp's zeroSuccesses-after-sawFirstRegistered early return) must
+// still record each rejection — that return comes after
+// ApplyRegisterErrors — and must not exit. The old entries keep their URL
+// in the registry; cli.pollTunnelForTUI drops it for a rejected row.
+func TestReconnectAllServicesRejectedIsNotFatal(t *testing.T) {
+	var conns atomic.Int32
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		n := conns.Add(1)
+		c.OnApp(func(raw json.RawMessage) {
+			var wrapper struct {
+				Mcpwarp struct{ Op string } `json:"mcpwarp"`
+			}
+			_ = json.Unmarshal(raw, &wrapper)
+			if wrapper.Mcpwarp.Op != "register" {
+				return
+			}
+			if n == 1 {
+				_ = c.SendApp(context.Background(), map[string]any{
+					"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []any{
+						map[string]any{"name": "good", "id": "svc-good", "url": "https://good.example/mcp", "created": true},
+						map[string]any{"name": "deepwiki", "id": "svc-dw", "url": "https://dw.example/mcp", "created": true},
+					}, "errors": []any{}},
+				})
+				return
+			}
+			_ = c.SendApp(context.Background(), map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []any{}, "errors": []map[string]any{
+					{"name": "good", "code": "QUOTA_EXCEEDED", "message": "server limit reached"},
+					{"name": "deepwiki", "code": "QUOTA_EXCEEDED", "message": "server limit reached"},
+				}},
+			})
+		})
+	})
+
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "good", Kind: "http"}, {Name: "deepwiki", Kind: "http"}},
+		Bus:         newTestBus(t),
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	allRows := func(ok func(registry.Row) bool) bool {
+		rows := tun.Registry().Rows()
+		if len(rows) != 2 {
+			return false
+		}
+		for _, r := range rows {
+			if !ok(r) {
+				return false
+			}
+		}
+		return true
+	}
+	waitFor := func(what string, cond func() bool, d time.Duration) {
+		t.Helper()
+		deadline := time.Now().Add(d)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s; rows: %+v", what, tun.Registry().Rows())
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	waitFor("the first registration", func() bool {
+		return allRows(func(r registry.Row) bool { return r.URL != "" && r.Rejected == "" })
+	}, 2*time.Second)
+
+	_ = srv.latestConn().Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
+
+	waitFor("the reconnect's rejections", func() bool {
+		return allRows(func(r registry.Row) bool { return r.Rejected == "QUOTA_EXCEEDED" })
+	}, 5*time.Second)
+	// FatalExit, if handleApp wrongly chose it, runs on its own goroutine
+	// right after the rejections are recorded; give it a moment to land.
+	time.Sleep(50 * time.Millisecond)
+	if got := exitCode.Load(); got != -1 {
+		t.Fatalf("expected no FatalExit for an all-rejected reconnect after a first success, got exit code %d", got)
+	}
+	if conns.Load() < 2 {
+		t.Fatalf("expected a reconnect, saw %d connections", conns.Load())
+	}
+}
+
 func TestReconnectsAndReregisters(t *testing.T) {
 	var registerCount atomic.Int32
 	var firstConn atomic.Pointer[wsmixer.Conn]

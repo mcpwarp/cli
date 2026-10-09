@@ -2,7 +2,9 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
@@ -55,11 +57,38 @@ type Model struct {
 
 	showHelp bool
 
+	// notice is the transient `c` feedback line (renderNotice); noticeSeq
+	// tags each one so a clear tick armed for an older notice doesn't wipe
+	// a newer one that replaced it before the tick fired.
+	notice    notice
+	noticeSeq int
+
+	styles styles
+
 	width  int
 	height int
 
 	quitting bool
 }
+
+type noticeTone int
+
+const (
+	noticeOK noticeTone = iota
+	noticeWarn
+)
+
+type notice struct {
+	tone  noticeTone
+	label string
+	text  string
+}
+
+// noticeDuration is how long a `c` notice stays up before clearNoticeMsg
+// removes it. A var only so tests can run the real tick without waiting.
+var noticeDuration = 4 * time.Second
+
+type clearNoticeMsg struct{ seq int }
 
 // New constructs a Model seeded with an initial server snapshot. bus must
 // be non-nil for Run/Init to subscribe to; ctrl may be nil (r/d/e become
@@ -74,6 +103,7 @@ func New(bus *eventbus.Bus, servers []Server, ctrl Controller) Model {
 		ctx:     context.Background(),
 		servers: rows,
 		logsVP:  vp,
+		styles:  newStyles(true),
 		width:   80,
 		height:  24,
 	}
@@ -84,7 +114,9 @@ func New(bus *eventbus.Bus, servers []Server, ctrl Controller) Model {
 // Metrics are drop-oldest — Init treats them identically here: one
 // standing listen Cmd per channel, each re-armed after every message it
 // delivers, so no producer ever waits on the TUI for longer than its own
-// channel's send semantics already allow.
+// channel's send semantics already allow. It also asks the terminal for its
+// background color (bubbletea doesn't on its own), which picks the
+// secondary-text gray — see view.go's styles.
 func (m Model) Init() tea.Cmd {
 	if m.bus == nil {
 		return nil
@@ -93,6 +125,7 @@ func (m Model) Init() tea.Cmd {
 		listenControl(m.ctx, m.bus),
 		listenTelemetry(m.ctx, m.bus),
 		listenMetrics(m.ctx, m.bus),
+		tea.RequestBackgroundColor,
 	)
 }
 
@@ -155,7 +188,34 @@ func listenMetrics(ctx context.Context, bus *eventbus.Bus) tea.Cmd {
 }
 
 // Update implements tea.Model.
+//
+// After every message the log pane's stored height is re-fit to what
+// renderDashboard will actually draw: the header and table change height
+// on their own (a notice or last-error line appearing, a URL wrapping onto
+// its own line), not only on a resize, and a viewport that kept the old,
+// taller height would GotoBottom against it and leave the newest log lines
+// below the visible pane.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	nm := next.(Model)
+	fitLogPane(&nm.logsVP, nm.logPaneHeightBudget())
+	return nm, cmd
+}
+
+// fitLogPane sets vp's height to h, keeping a pane that was following the
+// tail at the bottom; one the user has scrolled back keeps its offset.
+func fitLogPane(vp *viewport.Model, h int) {
+	if vp.Height() == h {
+		return
+	}
+	wasBottom := vp.AtBottom()
+	vp.SetHeight(h)
+	if wasBottom {
+		vp.GotoBottom()
+	}
+}
+
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
@@ -194,9 +254,67 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case SnapshotMsg:
 		m.applySnapshot(msg.Servers)
 		return m, nil
+
+	case tea.BackgroundColorMsg:
+		m.styles = newStyles(msg.IsDark())
+		// Log-line prefixes are baked into the viewport's content when it's
+		// set, so re-render it in the new gray — without GotoBottom, so a
+		// user scrolled back through the log stays where they are.
+		m.logsVP.SetContent(renderLogLines(m.logs, m.styles.dim))
+		return m, nil
+
+	case copyResultMsg:
+		// OSC 52 went out regardless (copyURLCmd). No native tool at all is
+		// the normal SSH case, where OSC 52 is the path that matters, so it
+		// reads as a plain success naming that path; there's no way to know
+		// whether the terminal honored it, hence "terminal clipboard". A
+		// tool that exists but failed is worth a warning with its name.
+		switch {
+		case msg.err == nil:
+			return m, m.setNotice(noticeOK, "copied", msg.url+" to clipboard")
+		case errors.Is(msg.err, errNoNativeClipboard):
+			return m, m.setNotice(noticeOK, "copied", msg.url+" via OSC 52 (terminal clipboard)")
+		default:
+			return m, m.setNotice(noticeWarn, "sent", fmt.Sprintf("%s via OSC 52 only (%v)", msg.url, msg.err))
+		}
+
+	case clearNoticeMsg:
+		if msg.seq == m.noticeSeq {
+			m.notice = notice{}
+		}
+		return m, nil
 	}
 
 	return m, nil
+}
+
+// setNotice shows a transient notice line and returns the tick that clears
+// it after noticeDuration.
+func (m *Model) setNotice(tone noticeTone, label, text string) tea.Cmd {
+	m.noticeSeq++
+	m.notice = notice{tone: tone, label: label, text: text}
+	seq := m.noticeSeq
+	return tea.Tick(noticeDuration, func(time.Time) tea.Msg { return clearNoticeMsg{seq: seq} })
+}
+
+// copySelectedURL is `c`: copy the selected row's full public URL (a very
+// narrow terminal still cuts it short in the table), or say why there's
+// nothing to copy. A row has a URL only once the tunnel has registered it;
+// a disabled row keeps the URL it was given, since that link is stable and
+// works again on `e`.
+func (m *Model) copySelectedURL() tea.Cmd {
+	if m.cursor < 0 || m.cursor >= len(m.servers) {
+		return nil
+	}
+	s := m.servers[m.cursor]
+	if s.URL == "" {
+		why := "has no public URL yet"
+		if displayState(s) == RegistrationRejected {
+			why = "has no public URL: the tunnel rejected it"
+		}
+		return m.setNotice(noticeWarn, "nothing to copy:", s.Name+" "+why)
+	}
+	return copyURLCmd(s.URL)
 }
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -231,6 +349,8 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "l":
 		m.logsVisible = !m.logsVisible
 		m.refreshLogViewport()
+	case "c":
+		return *m, m.copySelectedURL()
 	case "pgup":
 		if m.logsVisible {
 			m.logsVP.PageUp()
@@ -333,6 +453,9 @@ func (m *Model) applySnapshot(snap []Server) {
 			if s.State != "" {
 				m.servers[i].State = s.State
 			}
+			if s.Registration != "" {
+				m.servers[i].Registration = s.Registration
+			}
 		} else {
 			m.servers = append(m.servers, s)
 			byName[s.Name] = len(m.servers) - 1
@@ -361,6 +484,6 @@ func (m *Model) appendLog(line eventbus.LogLine) {
 }
 
 func (m *Model) refreshLogViewport() {
-	m.logsVP.SetContent(renderLogLines(m.logs))
+	m.logsVP.SetContent(renderLogLines(m.logs, m.styles.dim))
 	m.logsVP.GotoBottom()
 }

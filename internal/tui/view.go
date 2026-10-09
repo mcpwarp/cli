@@ -18,19 +18,43 @@ var (
 	colorGood = lipgloss.Color("2") // ANSI green
 	colorWarn = lipgloss.Color("3") // ANSI yellow
 	colorBad  = lipgloss.Color("1") // ANSI red
-	colorDim  = lipgloss.Color("8") // ANSI bright black
 	colorAcc  = lipgloss.Color("6") // ANSI cyan, selection highlight
 
 	styleBold     = lipgloss.NewStyle().Bold(true)
-	styleDim      = lipgloss.NewStyle().Foreground(colorDim)
 	styleGood     = lipgloss.NewStyle().Foreground(colorGood)
 	styleWarn     = lipgloss.NewStyle().Foreground(colorWarn)
 	styleBad      = lipgloss.NewStyle().Foreground(colorBad).Bold(true)
 	styleHeader   = lipgloss.NewStyle().Bold(true).Underline(true)
 	styleSelected = lipgloss.NewStyle().Foreground(colorAcc).Bold(true)
 	stylePane     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	styleFooter   = lipgloss.NewStyle().Foreground(colorDim)
 )
+
+// styles holds the background-dependent styles. Secondary text (the footer,
+// the last-error hint, log-line prefixes) is deliberately not ANSI 8
+// "bright black": the terminal theme defines that color, and it is
+// near-invisible on a mid-gray background like #3c3d42 (~1.9:1) though fine
+// on near-black. Instead the secondary gray is an explicit color picked per
+// background from the terminal's answer to tea.RequestBackgroundColor
+// (Init): #a8a8a8 on dark
+// (about 4.5:1 on #3c3d42, 7:1 on #1a1c20), #626262 on light (about 6:1 on
+// white). Both are exact xterm-256 grays (248/241), so a 256-color terminal
+// gets them unchanged; a 16-color one is downsampled by lipgloss to ANSI 7/8.
+// Footer keys don't use the gray at all: they're bold in the terminal's own
+// default foreground, the one color guaranteed to read on its background.
+// Until the reply arrives (or if the terminal never answers) the dark
+// variant is used, matching what most terminals run.
+type styles struct {
+	dim     lipgloss.Style
+	footKey lipgloss.Style
+}
+
+func newStyles(darkBG bool) styles {
+	gray := lipgloss.LightDark(darkBG)(lipgloss.Color("#626262"), lipgloss.Color("#a8a8a8"))
+	return styles{
+		dim:     lipgloss.NewStyle().Foreground(gray),
+		footKey: lipgloss.NewStyle().Bold(true),
+	}
+}
 
 // View implements tea.Model. It degrades gracefully at small sizes: below
 // minWidth/minHeight it renders only the header and a size warning rather
@@ -65,13 +89,15 @@ func (m Model) View() tea.View {
 func (m Model) renderDashboard() string {
 	header := m.renderHeader()
 	table := m.renderTable()
-	footer := renderFooter()
+	footer := m.renderFooter()
 
 	sections := []string{header, table}
 	if m.logsVisible {
 		if avail := m.logPaneHeightBudget(); avail > 0 {
+			// Update already fits the stored viewport to this height; this
+			// only matters for a View before any Update (New's 80x24 seed).
 			logs := m.logsVP
-			logs.SetHeight(avail)
+			fitLogPane(&logs, avail)
 			sections = append(sections, logs.View())
 		}
 	}
@@ -83,15 +109,19 @@ func countLines(s string) int {
 	return strings.Count(s, "\n") + 1
 }
 
-// logPaneHeightBudget is the log pane's height once header/table/footer and
-// their joining newlines are accounted for, so the footer is never clipped.
+// logPaneHeightBudget is the log pane's height once header/table/footer are
+// accounted for, so the footer is never clipped. The "\n" renderDashboard
+// joins sections with ends one section's last line rather than adding a
+// line of its own, so the budget is the terminal height minus exactly those
+// sections' line counts. It counts the rendered lines rather than rows, so
+// a transient notice line or a row whose URL wrapped onto its own line
+// (renderTable) shrinks the pane instead of pushing the footer off-screen.
 // It returns 0 (not shown) rather than clamping up to a minimum once the
 // terminal is too small to fit a useful pane — logPaneHeightBudget's own
 // caller only shows the pane once this is >= 3.
 func (m Model) logPaneHeightBudget() int {
-	fixedLines := countLines(m.renderHeader()) + countLines(m.renderTable()) + countLines(renderFooter())
-	const joins = 3 // header/table/logs/footer joined by "\n" between each
-	avail := m.height - fixedLines - joins
+	fixedLines := countLines(m.renderHeader()) + countLines(m.renderTable()) + countLines(m.renderFooter())
+	avail := m.height - fixedLines
 	if avail < 3 {
 		return 0
 	}
@@ -99,7 +129,7 @@ func (m Model) logPaneHeightBudget() int {
 }
 
 func (m Model) renderHeader() string {
-	stateStyle := styleDim
+	stateStyle := m.styles.dim
 	switch m.connState {
 	case "connected", "healthy":
 		stateStyle = styleGood
@@ -133,47 +163,79 @@ func (m Model) renderHeader() string {
 		parts = append(parts, fmt.Sprintf("bytes=%.0f", m.bytesTotal))
 	}
 
-	line1 := styleBold.Render("mcpwarp up") + "  " + strings.Join(parts, "  ")
+	// Truncated like every other line: logPaneHeightBudget's exact line
+	// count assumes no line wraps.
+	lines := []string{truncateWidth(styleBold.Render("mcpwarp up")+"  "+strings.Join(parts, "  "), m.width)}
 
-	line2 := ""
 	if m.lastErr != "" {
 		const label = "last error: "
-		line2 = styleBad.Render(label) + truncateWidth(m.lastErr, m.width-lipgloss.Width(label))
+		lines = append(lines, styleBad.Render(label)+truncateWidth(m.lastErr, m.width-lipgloss.Width(label)))
+		if m.lastErrHint != "" {
+			lines = append(lines, m.styles.dim.Render(truncateWidth(m.lastErrHint, m.width)))
+		}
 	}
-	if line2 == "" {
-		return line1
+	// The notice gets its own line rather than replacing the last-error
+	// pair, so a `c` press never hides an error, even for a few seconds.
+	if line := m.renderNotice(); line != "" {
+		lines = append(lines, line)
 	}
-	if m.lastErrHint != "" {
-		line3 := styleDim.Render(truncateWidth(m.lastErrHint, m.width))
-		return line1 + "\n" + line2 + "\n" + line3
+	return strings.Join(lines, "\n")
+}
+
+// renderNotice is the transient `c` feedback line: a colored label (green
+// "copied", yellow otherwise) and the rest in bold default foreground, so it
+// stands out on any background instead of reading as secondary gray text.
+func (m Model) renderNotice() string {
+	if m.notice.text == "" {
+		return ""
 	}
-	return line1 + "\n" + line2
+	labelStyle := styleGood.Bold(true)
+	if m.notice.tone == noticeWarn {
+		labelStyle = styleWarn.Bold(true)
+	}
+	label := m.notice.label + " "
+	return labelStyle.Render(label) + styleBold.Render(truncateWidth(m.notice.text, m.width-lipgloss.Width(label)))
 }
 
 var tableCols = []string{"NAME", "KIND", "STATE", "RESTARTS", "URL"}
 
-// displayState maps a stored State value to what the STATE column shows:
-// the supervisor's "healthy" and an http row's registry-derived "active"
-// are the same fact from a user's point of view, so both display as "active" —
-// the model itself keeps whichever value it was given (tests that assert
-// on stored state are unaffected).
-func displayState(s string) string {
-	if s == "healthy" {
-		return "active"
+// displayState maps a row to what the STATE column shows. The supervisor's
+// "healthy" and an http row's registry-derived "active" are the same fact
+// from a user's point of view, so both display as "active" — but only once
+// the tunnel agrees: a healthy stdio row whose registration is still
+// pending, was rejected, or is disabled shows that instead, since a healthy
+// local process with no public URL isn't "active" to anyone. Any other
+// supervisor state (restarting, failed, ...) wins over the registration,
+// keeping a local problem visible. The model itself keeps whichever values
+// it was given (tests that assert on stored state are unaffected).
+func displayState(s Server) string {
+	if s.State != "healthy" {
+		return s.State
 	}
-	return s
+	switch s.Registration {
+	case "", RegistrationActive:
+		return RegistrationActive
+	default:
+		return s.Registration
+	}
 }
 
+// renderTable draws one line per server, plus a second line for any row
+// whose URL doesn't fit in the URL column at the current width: that URL
+// moves under the row, indented past the selection marker, so the whole
+// link stays visible and mouse-selectable instead of ending in "…". Only
+// such rows grow; at a width where every URL fits the table is one line per
+// row. A URL wider than even its own line is truncated as a last resort.
 func (m Model) renderTable() string {
 	if len(m.servers) == 0 {
-		return styleDim.Render("(no servers configured)")
+		return m.styles.dim.Render("(no servers configured)")
 	}
 
 	nameW, kindW, stateW, restartsW := lipgloss.Width(tableCols[0]), lipgloss.Width(tableCols[1]), lipgloss.Width(tableCols[2]), lipgloss.Width(tableCols[3])
 	for _, s := range m.servers {
 		nameW = maxInt(nameW, lipgloss.Width(s.Name))
 		kindW = maxInt(kindW, lipgloss.Width(s.Kind))
-		stateW = maxInt(stateW, lipgloss.Width(displayState(s.State)))
+		stateW = maxInt(stateW, lipgloss.Width(displayState(s)))
 		restartsW = maxInt(restartsW, lipgloss.Width(strconv.Itoa(s.Restarts)))
 	}
 
@@ -181,19 +243,42 @@ func (m Model) renderTable() string {
 	header := formatRow(nameW, kindW, stateW, restartsW,
 		tableCols[0], tableCols[1], tableCols[2], tableCols[3], tableCols[4])
 	b.WriteString(styleHeader.Render(truncateWidth(header, m.width)))
-	// Each row gets a 2-column "> "/"  " prefix, so truncate to m.width-2 —
-	// truncating to the full width first would let the prefix push the row
-	// past m.width.
+	// Each row gets a 2-column "> "/"  " prefix, so the row itself has
+	// m.width-2 columns to fit in.
 	const rowPrefixWidth = 2
+	// urlIndent sets a wrapped URL line off from the NAME column it sits
+	// under, so it reads as belonging to the row above.
+	const urlIndent = 2
+	rowWidth := m.width - rowPrefixWidth
 	for i, s := range m.servers {
-		row := formatRow(nameW, kindW, stateW, restartsW,
-			s.Name, s.Kind, displayState(s.State), strconv.Itoa(s.Restarts), s.URL)
-		row = truncateWidth(row, m.width-rowPrefixWidth)
-		b.WriteString("\n")
+		state := displayState(s)
+		restarts := strconv.Itoa(s.Restarts)
+		url := s.URL
+		urlLine := ""
+		if url != "" && lipgloss.Width(formatRow(nameW, kindW, stateW, restartsW, s.Name, s.Kind, state, restarts, url)) > rowWidth {
+			urlLine = truncateWidth(strings.Repeat(" ", urlIndent)+url, rowWidth)
+			url = ""
+		}
+
+		rowStyle, prefix := lipgloss.NewStyle(), "  "
 		if i == m.cursor {
-			b.WriteString(styleSelected.Render("> " + row))
-		} else {
-			b.WriteString("  " + row)
+			rowStyle, prefix = styleSelected, "> "
+		}
+		// The STATE cell is rendered on its own so "rejected" can carry the
+		// error style without its reset cutting a selected row's highlight
+		// short for the cells after it.
+		stateStyle := rowStyle
+		if state == RegistrationRejected {
+			stateStyle = styleBad
+		}
+		row := rowStyle.Render(prefix+padRight(s.Name, nameW)+"  "+padRight(s.Kind, kindW)+"  ") +
+			stateStyle.Render(padRight(state, stateW)) +
+			rowStyle.Render(strings.TrimRight("  "+padRight(restarts, restartsW)+"  "+url, " "))
+		b.WriteString("\n")
+		b.WriteString(truncateWidth(row, m.width))
+		if urlLine != "" {
+			b.WriteString("\n")
+			b.WriteString(rowStyle.Render(strings.Repeat(" ", rowPrefixWidth) + urlLine))
 		}
 	}
 	return b.String()
@@ -232,9 +317,25 @@ func maxInt(a, b int) int {
 	return b
 }
 
-func renderFooter() string {
-	hint := "q quit  ? help  ↑/↓ or j/k select  l logs  r restart  d disable  e enable"
-	return styleFooter.Render(hint)
+// footerKeys is the footer hint, key then description; at 80 columns it
+// fits exactly, and narrower terminals truncate it rather than wrap.
+var footerKeys = [][2]string{
+	{"q", "quit"},
+	{"?", "help"},
+	{"↑↓/jk", "select"},
+	{"l", "logs"},
+	{"c", "copy URL"},
+	{"r", "restart"},
+	{"d", "disable"},
+	{"e", "enable"},
+}
+
+func (m Model) renderFooter() string {
+	items := make([]string, len(footerKeys))
+	for i, kv := range footerKeys {
+		items[i] = m.styles.footKey.Render(kv[0]) + " " + m.styles.dim.Render(kv[1])
+	}
+	return truncateWidth(strings.Join(items, "  "), m.width)
 }
 
 func (m Model) renderHelp() string {
@@ -245,16 +346,17 @@ func (m Model) renderHelp() string {
 		"  ?          toggle this help",
 		"  ↑/k, ↓/j   move selection",
 		"  l          toggle log pane",
+		"  c          copy selected server's public URL",
 		"  r          restart selected server",
 		"  d          disable selected server",
 		"  e          enable selected server",
 		"",
-		styleDim.Render("press any key to return"),
+		m.styles.dim.Render("press any key to return"),
 	}
 	return stylePane.Render(strings.Join(lines, "\n"))
 }
 
-func renderLogLines(lines []eventbus.LogLine) string {
+func renderLogLines(lines []eventbus.LogLine, dim lipgloss.Style) string {
 	var b strings.Builder
 	for i, l := range lines {
 		if i > 0 {
@@ -264,7 +366,7 @@ func renderLogLines(lines []eventbus.LogLine) string {
 		if l.Level != "" {
 			prefix += "/" + l.Level
 		}
-		b.WriteString(styleDim.Render("["+prefix+"] ") + l.Text)
+		b.WriteString(dim.Render("["+prefix+"] ") + l.Text)
 	}
 	return b.String()
 }

@@ -14,13 +14,39 @@ package tui
 // URL come from the caller's initial snapshot (and any later SnapshotMsg);
 // State/Restarts are normally kept current by eventbus.ServerStateChanged,
 // falling back to the snapshot's own values until the first one arrives.
+//
+// Registration is the tunnel's side of the row (one of the Registration*
+// values below), kept apart from State because a stdio row has two
+// independent facts to show: its local process (supervisor State) and
+// whether the tunnel accepted it. An http row has no local process, so its
+// caller sets State to the same registration value and Registration adds
+// nothing there; for stdio, displayState overlays a non-active Registration
+// only on a healthy State, so a restarting/failed child still reads as such.
 type Server struct {
-	Name     string
-	Kind     string
-	URL      string
-	State    string
-	Restarts int
+	Name         string
+	Kind         string
+	URL          string
+	State        string
+	Restarts     int
+	Registration string
 }
+
+// Registration values (DESIGN.md §9's STATE column). "active" and
+// "disabled" deliberately match internal/registry's Status strings.
+const (
+	// RegistrationPending: sent in a register batch, no "registered" reply
+	// for this name yet — never shown as active before the tunnel says so.
+	RegistrationPending = "pending"
+	// RegistrationActive: the tunnel confirmed it and assigned a public URL.
+	RegistrationActive = "active"
+	// RegistrationRejected: the latest "registered" reply carried a
+	// per-service error for it (QUOTA_EXCEEDED, CONFLICT, INVALID_NAME,
+	// USERNAME_REQUIRED, ...); the `last error` line carries the detail.
+	RegistrationRejected = "rejected"
+	// RegistrationDisabled: disabled locally (`d`) or in the dashboard,
+	// including a SERVER_DISABLED register error, which is resumable.
+	RegistrationDisabled = "disabled"
+)
 
 // Controller is the set of actions the dashboard can invoke on a selected
 // server, implemented by the caller (M3B, on top of internal/supervisor) so
@@ -38,12 +64,12 @@ type Controller interface {
 // URL for a server discovered after the dashboard started, or a disabled/
 // active toggle for an http row) into a running Program via
 // (*tea.Program).Send. Servers are merged by Name: Kind/URL are always
-// applied; State is applied only when non-empty, so a caller with nothing
-// to say about a row's state (stdio rows, whose state is owned by
-// eventbus.ServerStateChanged) doesn't stomp the model's live value. A
-// row not yet in the model is added as given, State included — the seed
-// value a caller supplies (e.g. the initial snapshot at startup) stands
-// until the first real update for that name arrives.
+// applied; State and Registration are applied only when non-empty, so a
+// caller with nothing to say about a row's state (stdio rows, whose state
+// is owned by eventbus.ServerStateChanged) doesn't stomp the model's live
+// value. A row not yet in the model is added as given, State included —
+// the seed value a caller supplies (e.g. the initial snapshot at startup)
+// stands until the first real update for that name arrives.
 type SnapshotMsg struct {
 	Servers []Server
 }

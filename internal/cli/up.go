@@ -42,7 +42,7 @@ import (
 
 const (
 	defaultConnectURL = "wss://connect.mcpwarp.io"
-	defaultWebURL     = "https://mcpwarp.io"
+	defaultWebURL     = "https://web.mcpwarp.io"
 )
 
 // connectSettingsError is a malformed --connect-url/MCPWARP_CONNECT_URL or

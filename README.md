@@ -102,7 +102,7 @@ mcpwarp status      # config path, server table, login status
 |---|---|---|
 | `MCPWARP_AUTH_URL` | auth server | `https://auth.mcpwarp.io` |
 | `MCPWARP_CONNECT_URL` | tunnel WebSocket URL | `wss://connect.mcpwarp.io` |
-| `MCPWARP_WEB_URL` | dashboard URL | `https://mcpwarp.io` |
+| `MCPWARP_WEB_URL` | dashboard URL | `https://web.mcpwarp.io` |
 | `MCPWARP_TOKEN` | personal access token, skips login | — |
 | `MCPWARP_NO_UPDATE_NOTIFIER` | disable the update check | — |
 

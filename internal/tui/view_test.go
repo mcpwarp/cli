@@ -252,7 +252,7 @@ func TestFooterNeverClippedByLogPane(t *testing.T) {
 
 var errQuota = eventbus.AppError{
 	Code: "QUOTA_EXCEEDED", Message: "server limit reached", Service: "deepwiki",
-	Hint: "upgrade your plan at https://mcpwarp.io/settings to add more servers",
+	Hint: "upgrade your plan at https://web.mcpwarp.io/settings to add more servers",
 }
 
 // TestRegistrationStatesRendered: an http row the tunnel rejected shows

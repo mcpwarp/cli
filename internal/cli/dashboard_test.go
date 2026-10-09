@@ -27,6 +27,17 @@ func TestRunDashboardPrintsURL(t *testing.T) {
 	}
 }
 
+func TestResolveWebURLDefaultsToDashboardHost(t *testing.T) {
+	t.Setenv("MCPWARP_WEB_URL", "")
+	got, err := resolveWebURL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://web.mcpwarp.io" {
+		t.Fatalf("got %q, want https://web.mcpwarp.io", got)
+	}
+}
+
 func TestRunDashboardInvalidWebURLExits2(t *testing.T) {
 	t.Setenv("MCPWARP_WEB_URL", "ftp://x")
 	stderr := withCapturedStderr(t)

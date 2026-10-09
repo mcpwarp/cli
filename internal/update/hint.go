@@ -29,7 +29,10 @@ func UpgradeHint(goos, exePath string) string {
 			strings.Contains(slashed, "/Caskroom/") ||
 			strings.HasPrefix(slashed, "/opt/homebrew") ||
 			strings.HasPrefix(slashed, "/usr/local/Homebrew") {
-			return "brew upgrade --cask mcpwarp"
+			// brew only auto-refreshes taps every HOMEBREW_AUTO_UPDATE_SECS
+			// (24h by default), so a bare upgrade right after a release
+			// reports the stale tap version as already installed.
+			return "brew update && brew upgrade --cask mcpwarp"
 		}
 	case "windows":
 		// os.Executable/EvalSymlinks always return "\"-separated paths on
@@ -37,7 +40,10 @@ func UpgradeHint(goos, exePath string) string {
 		// can also hand a "/"-separated path — normalise before matching.
 		normalized := strings.ReplaceAll(strings.ToLower(exePath), "/", `\`)
 		if strings.Contains(normalized, `\scoop\`) {
-			return "scoop update mcpwarp"
+			// `scoop update <app>` only syncs buckets when the last sync is
+			// 3h+ old; bare `scoop update` always syncs. ";" rather than
+			// "&&", which Windows PowerShell 5.1 doesn't support.
+			return "scoop update; scoop update mcpwarp"
 		}
 	case "linux":
 		// path.Dir, not filepath.Dir: the goos branch is chosen by the

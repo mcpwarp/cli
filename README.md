@@ -16,7 +16,7 @@ brew trust --tap mcpwarp/tap
 brew install --cask mcpwarp
 ```
 
-Upgrade with `brew upgrade --cask mcpwarp`.
+Upgrade with `brew update && brew upgrade --cask mcpwarp`.
 
 ### Windows (Scoop)
 
@@ -27,7 +27,7 @@ scoop bucket add mcpwarp https://github.com/mcpwarp/scoop-bucket
 scoop install mcpwarp
 ```
 
-Upgrade with `scoop update mcpwarp`.
+Upgrade with `scoop update; scoop update mcpwarp`.
 
 ### Debian/Ubuntu, Fedora/RHEL, Alpine
 

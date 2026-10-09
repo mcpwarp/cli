@@ -109,13 +109,20 @@ homebrew_casks:
     license: MIT
     commit_msg_template: "Brew cask update for {{ .ProjectName }} version {{ .Tag }}"
     # Signing/notarization deferred (see note near `signs:` below) — strip the
-    # quarantine bit on install instead.
-    hooks:
-      post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/mcpwarp"]
-          end
+    # quarantine bit on install instead. Not `hooks.post.install`: that emits
+    # a `postflight` block, deprecated since Homebrew 7.0.0 and warned on by
+    # every brew command touching the cask. GoReleaser v2.18 has no option
+    # for `postflight_steps`, so it goes in custom_block; switch to
+    # `hooks.post.install_steps` with `{{ .StagedPath }}` once
+    # goreleaser/goreleaser#6873 ships (v2.19). The `run` step needs
+    # Homebrew >= 6.0.13. The whole cask passes through GoReleaser's
+    # template engine, so Homebrew's own {{staged_path}} token is escaped.
+    custom_block: |
+      on_macos do
+        postflight_steps do
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/mcpwarp"]
+        end
+      end
     skip_upload: auto
 
 scoops:

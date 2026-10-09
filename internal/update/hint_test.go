@@ -13,13 +13,13 @@ func TestUpgradeHint(t *testing.T) {
 			name:    "darwin Cellar",
 			goos:    "darwin",
 			exePath: "/usr/local/Cellar/mcpwarp/0.1.0/bin/mcpwarp",
-			want:    "brew upgrade --cask mcpwarp",
+			want:    "brew update && brew upgrade --cask mcpwarp",
 		},
 		{
 			name:    "darwin Caskroom",
 			goos:    "darwin",
 			exePath: "/opt/homebrew/Caskroom/mcpwarp/0.1.0/mcpwarp",
-			want:    "brew upgrade --cask mcpwarp",
+			want:    "brew update && brew upgrade --cask mcpwarp",
 		},
 		{
 			name:    "darwin /usr/local/bin (not brew)",
@@ -31,7 +31,7 @@ func TestUpgradeHint(t *testing.T) {
 			name:    "windows scoop",
 			goos:    "windows",
 			exePath: `C:\Users\ana\scoop\apps\mcpwarp\current\mcpwarp.exe`,
-			want:    "scoop update mcpwarp",
+			want:    "scoop update; scoop update mcpwarp",
 		},
 		{
 			name:    "windows plain path",
@@ -43,13 +43,13 @@ func TestUpgradeHint(t *testing.T) {
 			name:    "windows scoop, forward slashes",
 			goos:    "windows",
 			exePath: "C:/Users/ana/scoop/apps/mcpwarp/current/mcpwarp.exe",
-			want:    "scoop update mcpwarp",
+			want:    "scoop update; scoop update mcpwarp",
 		},
 		{
 			name:    "windows scoop, mixed case",
 			goos:    "windows",
 			exePath: `C:\Users\ana\Scoop\apps\mcpwarp\current\mcpwarp.exe`,
-			want:    "scoop update mcpwarp",
+			want:    "scoop update; scoop update mcpwarp",
 		},
 		{
 			name:    "linux /usr/bin",

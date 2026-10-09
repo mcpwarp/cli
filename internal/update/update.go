@@ -93,6 +93,18 @@ type Options struct {
 	// entirely when it isn't (a notice nobody can see). Defaults to
 	// checking the real os.Stderr via output.IsTerminal.
 	IsTerminal func() bool
+
+	// OnFetch, if set, is called with the resolved Timeout right before
+	// Check goes to the network — only once it has decided the cache is
+	// missing or stale, never for a fresh-cache answer or any of Check's
+	// early returns. A caller that normally gives Check only a short
+	// grace before the process exits (internal/cli's printUpdateNotice)
+	// uses it to extend that wait for this one case, long enough for the
+	// fetch to succeed or time out and saveCache to record either outcome:
+	// a process that exits mid-fetch never writes the cache, so every
+	// later run would start the same cold request and lose the same race.
+	// Called synchronously on Check's own goroutine, so it must not block.
+	OnFetch func(timeout time.Duration)
 }
 
 func (o Options) withDefaults() Options {
@@ -166,6 +178,9 @@ func Check(ctx context.Context, current string, opts Options) *Notice {
 	if cache != nil && now.Sub(cache.LastCheck) < cacheWindow && !cache.LastCheck.After(now) {
 		latestTag = cache.LastTag
 	} else {
+		if opts.OnFetch != nil {
+			opts.OnFetch(opts.Timeout)
+		}
 		tag, err := fetchLatestTag(ctx, current, opts)
 		if err != nil {
 			opts.Log.Debug("update check: fetching latest release", "err", err)

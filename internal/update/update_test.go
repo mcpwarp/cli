@@ -266,6 +266,67 @@ func TestCheckCacheStaleCallsHTTP(t *testing.T) {
 	}
 }
 
+// TestCheckOnFetchOnlyBeforeNetwork pins OnFetch's contract, which
+// internal/cli's exit wait relies on: called exactly once, with the
+// resolved Timeout, when Check is about to go to the network — and never
+// when it answers from a fresh cache or returns early.
+func TestCheckOnFetchOnlyBeforeNetwork(t *testing.T) {
+	srv, calls := releaseServer(t, "v0.2.0")
+	now := time.Now()
+
+	var got []time.Duration
+	withHook := func(opts Options) Options {
+		opts.Now = func() time.Time { return now }
+		opts.OnFetch = func(timeout time.Duration) {
+			if *calls != 0 {
+				t.Errorf("OnFetch called after the HTTP request, want before")
+			}
+			got = append(got, timeout)
+		}
+		return opts
+	}
+
+	t.Run("fresh cache", func(t *testing.T) {
+		opts := withHook(baseOpts(t, srv.URL))
+		path, err := cachePath(opts.HomeDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := saveCache(path, cacheData{LastCheck: now.Add(-time.Hour), LastTag: "v0.2.0"}); err != nil {
+			t.Fatal(err)
+		}
+		if n := Check(context.Background(), "v0.1.0", opts); n == nil {
+			t.Fatal("expected a notice from the cached tag")
+		}
+	})
+
+	t.Run("early returns", func(t *testing.T) {
+		opts := withHook(baseOpts(t, srv.URL))
+		Check(context.Background(), "dev", opts)
+		opts.IsTerminal = func() bool { return false }
+		Check(context.Background(), "v0.1.0", opts)
+	})
+
+	if len(got) != 0 {
+		t.Fatalf("OnFetch called %d times without a fetch", len(got))
+	}
+
+	t.Run("stale cache", func(t *testing.T) {
+		opts := withHook(baseOpts(t, srv.URL))
+		opts.Timeout = 1234 * time.Millisecond
+		if n := Check(context.Background(), "v0.1.0", opts); n == nil {
+			t.Fatal("expected a notice from the fetched tag")
+		}
+	})
+
+	if len(got) != 1 || got[0] != 1234*time.Millisecond {
+		t.Errorf("OnFetch calls = %v, want exactly one with the 1.234s timeout", got)
+	}
+	if *calls != 1 {
+		t.Errorf("expected 1 HTTP call, got %d", *calls)
+	}
+}
+
 func TestNormalizeVersion(t *testing.T) {
 	tests := []struct {
 		in      string

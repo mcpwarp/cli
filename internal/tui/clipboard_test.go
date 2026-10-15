@@ -144,7 +144,7 @@ func TestCopyKeyWithoutURLCopiesNothing(t *testing.T) {
 		name, state, want string
 	}{
 		{"pending", RegistrationPending, "nothing to copy: deepwiki has no public URL yet"},
-		{"rejected", RegistrationRejected, "nothing to copy: deepwiki has no public URL: the tunnel rejected it"},
+		{"rejected", RegistrationRejected, "nothing to copy: deepwiki has no public URL right now"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clip := useFakeClipboard(t, nil)

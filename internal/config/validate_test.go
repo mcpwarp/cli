@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -277,6 +278,41 @@ func TestValidateConfigMessages(t *testing.T) {
 		}
 		if count != 1 {
 			t.Errorf("expected exactly 1 issue at servers[0].name, got %d: %v", count, issues)
+		}
+	})
+}
+
+// serversJSON builds a config with n distinct, valid http servers.
+func serversJSON(n int) string {
+	entries := make([]string, n)
+	for i := range entries {
+		entries[i] = fmt.Sprintf(`{"name":"s%d","kind":"http","url":"http://127.0.0.1:8765/mcp"}`, i)
+	}
+	return `{"servers":[` + strings.Join(entries, ",") + `]}`
+}
+
+// TestValidateConfigServerCap: the tunnel refuses a register of more than
+// MaxServers services as a whole (TOO_MANY_SERVICES), so the config is
+// capped at exactly that.
+func TestValidateConfigServerCap(t *testing.T) {
+	t.Run("MaxServers servers pass", func(t *testing.T) {
+		if cfg := mustValidate(t, serversJSON(MaxServers)); len(cfg.Servers) != MaxServers {
+			t.Fatalf("got %d servers, want %d", len(cfg.Servers), MaxServers)
+		}
+	})
+
+	t.Run("one more fails with the cap message", func(t *testing.T) {
+		issues := mustFail(t, serversJSON(MaxServers+1))
+		got, ok := findIssue(issues, "servers")
+		if !ok {
+			t.Fatalf("expected an issue at servers, got %v", issues)
+		}
+		want := "too many servers (101): the tunnel accepts at most 100 in one register message, which carries them all"
+		if got.message != want {
+			t.Errorf("got message %q, want %q", got.message, want)
+		}
+		if len(issues) != 1 {
+			t.Errorf("expected only the cap issue for otherwise-valid servers, got %v", issues)
 		}
 	})
 }

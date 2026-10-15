@@ -100,12 +100,14 @@ type Registry struct {
 	log *slog.Logger
 	// rejected holds every name whose most recent "registered" reply
 	// carried a per-service error for it (DESIGN.md §8's register errors:
-	// QUOTA_EXCEEDED, CONFLICT, SERVER_DISABLED, ...), keyed by name. Kept
-	// apart from entries because a name rejected on its very first
-	// register never gets an id or URL at all; cleared per name by the
-	// next ApplyRegistered that reports that name registered. Raising the
-	// quota alone doesn't do that — nothing re-registers until an `e` or a
-	// reconnect sends the name again.
+	// QUOTA_EXCEEDED, CONFLICT, SERVER_DISABLED, ...), keyed by name — or
+	// that the tunnel since took away (a "conflict" op, recorded as
+	// CONFLICT; a whole-batch TOO_MANY_SERVICES error). Kept apart from
+	// entries because a name rejected on its very first register never gets
+	// an id or URL at all; cleared per name by the next ApplyRegistered that
+	// reports that name registered. Raising the quota alone doesn't do that
+	// — nothing re-registers until an `e` or a reconnect sends the name
+	// again.
 	rejected map[string]rejection
 	// locallyDisabled holds names (-> kind) taken down by a local `d`
 	// (tunnel.UnregisterService, DESIGN.md §9) and not since brought back

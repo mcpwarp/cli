@@ -128,9 +128,10 @@ type Tunnel struct {
 	// onDisconnect all run inside t.disp.enqueue), so it needs no locking.
 	connLimitReported bool
 
-	// mu guards localUnregistered, touched from whatever goroutine drives a
-	// local `d`/`e` keypress (Controller.Disable/Enable) concurrently with
-	// onConnect reading it from this package's dispatcher goroutine.
+	// mu guards localUnregistered and takenOver, touched from whatever
+	// goroutine drives a local `d`/`e` keypress (Controller.Disable/Enable)
+	// concurrently with onConnect reading them from this package's
+	// dispatcher goroutine.
 	mu sync.Mutex
 	// localUnregistered holds names most recently taken down by a local `d`
 	// keypress (UnregisterService) that haven't since been brought back by
@@ -144,6 +145,13 @@ type Tunnel struct {
 	// Empty until the first local `d`, so the very first connect's batch is
 	// unaffected.
 	localUnregistered map[string]bool
+	// takenOver holds names a "conflict" op took away (another session of
+	// the account registered them, DESIGN.md §8) and not since reclaimed by
+	// `e` (RegisterService). Sticky like ws-mixer-go's own mcpwarp layer
+	// (its DECISIONS.md D-2026-10-14-03): every register batch leaves them
+	// out, so a reconnect can't take the name back and bounce the other
+	// session, and a dashboard enable for one is ignored.
+	takenOver map[string]bool
 
 	// sawFirstRegistered is set once this process has ever applied a
 	// "registered" batch with at least one success — it lives on the
@@ -194,6 +202,7 @@ func Start(ctx context.Context, cfg Config) (*Tunnel, error) {
 		unregisterBody:    appproto.EncodeUnregister(unregServices),
 		kindByName:        kindByName,
 		localUnregistered: make(map[string]bool),
+		takenOver:         make(map[string]bool),
 	}
 
 	// A retryable refresh failure (isRetryableTokenFailure) is marked with
@@ -327,11 +336,25 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 		}
 		fatal := zeroSuccesses && !allServerDisabled && !t.sawFirstRegistered
 
+		// A "conflict" can land before the reply naming that same name: the
+		// tunnel records this session's hold before replying, so a
+		// concurrent take-over's frame can overtake the reply (an `e` reply
+		// in flight can lose the same race, and during a drain hand-over a
+		// stale reply can arrive from the retiring connection). The
+		// take-over is the newer fact, so neither a success nor an error for
+		// a taken-over name may replace its CONFLICT: a success would flip
+		// the row back to active with a dead URL, a SERVER_DISABLED would
+		// read as resumable by a dashboard enable that OpEnable ignores.
+		// The fatal check above and the per-error log below still read the
+		// raw reply, so a first batch whose only success was taken over
+		// isn't mistaken for a fatal zero-success one.
+		taken := t.takenOverSnapshot()
+
 		// Recorded before any early return below: a rejected name never
 		// reaches ApplyRegistered, so without this the registry has no
 		// record of it at all and the dashboard (cli.pollTunnelForTUI) can't
 		// tell "rejected" apart from "not answered yet".
-		t.registry.ApplyRegisterErrors(msg.Errors, t.kindByName)
+		t.registry.ApplyRegisterErrors(withoutTaken(msg.Errors, taken, func(e appproto.ServiceError) string { return e.Name }), t.kindByName)
 		for _, svcErr := range msg.Errors {
 			t.log.Warn("register error", "name", svcErr.Name, "code", svcErr.Code, "message", svcErr.Message)
 			hint := registerErrorHint(svcErr.Code, t.cfg.WebURL, fatal)
@@ -351,8 +374,12 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 		if zeroSuccesses || len(msg.Services) == 0 {
 			return
 		}
-		result := t.registry.ApplyRegistered(msg.Services, t.kindByName)
 		t.sawFirstRegistered = true
+		services := withoutTaken(msg.Services, taken, func(s appproto.RegisteredService) string { return s.Name })
+		if len(services) == 0 {
+			return
+		}
+		result := t.registry.ApplyRegistered(services, t.kindByName)
 		for _, name := range result.Created {
 			t.log.Info("new public URL assigned", "name", name)
 		}
@@ -394,6 +421,12 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 			t.log.Debug("enable for a name this connection doesn't hold; ignoring", "name", msg.EnableName)
 			return
 		}
+		if t.isTakenOver(msg.EnableName) {
+			// Another session serves this name now (see takenOver); only a
+			// local `e` takes it back.
+			t.log.Debug("enable for a name another session took over; ignoring", "name", msg.EnableName)
+			return
+		}
 		t.registry.ApplyEnable(msg.EnableName, msg.EnableID)
 		t.log.Info("server re-enabled by the tunnel", "name", msg.EnableName)
 		if t.cfg.OnEnable != nil {
@@ -404,6 +437,34 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 		// localUnregistered too, or the child gets respawned/registered now
 		// but dropped again silently on the very next reconnect.
 		t.RegisterService(msg.EnableName)
+
+	case appproto.OpConflict:
+		// DESIGN.md §8: a newer session of the same account registered this
+		// name, so the tunnel moved it there and reset its streams here;
+		// every other name on this connection stays live. Keyed on name,
+		// like enable (the frame carries it): the id is only cross-checked,
+		// since ignoring a mismatch would leave the stale `active` row this
+		// op exists to correct. The name reads rejected (CONFLICT), which
+		// drops its URL from the dashboard, and stays out of every register
+		// batch (takenOver) until a local `e` reclaims it. A stdio child is
+		// left running, unlike a dashboard disable: `e` brings the name
+		// back without a respawn.
+		name := msg.ConflictName
+		if !t.hasConfiguredService(name) {
+			t.log.Debug("conflict for a name this connection doesn't hold; ignoring", "name", name, "id", msg.ConflictID)
+			return
+		}
+		if entry, ok := t.registry.Get(name); ok && entry.ID != msg.ConflictID {
+			t.log.Warn("conflict id differs from this name's registered id; applying it by name", "name", name, "id", msg.ConflictID, "registeredId", entry.ID)
+		}
+		t.mu.Lock()
+		t.takenOver[name] = true
+		t.mu.Unlock()
+		message := fmt.Sprintf("another mcpwarp session of this account registered this name (%s)", msg.ConflictReason)
+		t.registry.ApplyRegisterErrors([]appproto.ServiceError{{Name: name, Code: "CONFLICT", Message: message}}, t.kindByName)
+		t.log.Warn("server taken over by another mcpwarp session", "name", name, "id", msg.ConflictID, "reason", msg.ConflictReason)
+		t.log.Warn(takenOverHint)
+		t.publish(eventbus.AppError{Code: "CONFLICT", Message: message, Service: name, Hint: takenOverHint})
 
 	case appproto.OpError:
 		if msg.ErrorCode == "UNSUPPORTED_VERSION" {
@@ -417,6 +478,27 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 			message := connectionLimitMessage(msg.ErrorMessage)
 			t.log.Warn("too many mcpwarp agents connected for this account; "+connectionLimitHint, "message", message)
 			t.publishConnLimitError(eventbus.AppError{Code: msg.ErrorCode, Message: message, Hint: connectionLimitHint})
+			return
+		}
+		if msg.ErrorCode == "TOO_MANY_SERVICES" {
+			// The tunnel refuses a register naming more services than its
+			// cap as a whole, with no "registered" reply (agentconn.go's
+			// maxServicesPerRegister). Only a welcome batch can be that big
+			// (`e` re-registers one name), so none of its names is
+			// registered on this connection: record each as rejected rather
+			// than leave its row pending on a reply that never comes. A
+			// taken-over name wasn't in the batch and keeps its CONFLICT;
+			// ApplyRegisterErrors skips a locally disabled one likewise.
+			t.log.Warn(msg.ErrorMessage, "code", msg.ErrorCode)
+			t.log.Warn(tooManyServicesHint)
+			errs := make([]appproto.ServiceError, 0, len(t.cfg.Services))
+			for _, s := range t.cfg.Services {
+				if !t.isTakenOver(s.Name) {
+					errs = append(errs, appproto.ServiceError{Name: s.Name, Code: msg.ErrorCode, Message: msg.ErrorMessage})
+				}
+			}
+			t.registry.ApplyRegisterErrors(errs, t.kindByName)
+			t.publish(eventbus.AppError{Code: msg.ErrorCode, Message: msg.ErrorMessage, Hint: tooManyServicesHint})
 			return
 		}
 		t.publish(eventbus.AppError{Code: msg.ErrorCode, Message: msg.ErrorMessage})
@@ -456,20 +538,23 @@ func registerErrorHint(code, webURL string, fatal bool) string {
 
 // currentRegisterBody builds the "register" payload for this connect or
 // reconnect, omitting any name currently in localUnregistered (a local `d`
-// keypress not yet followed by `e`) — see that field's doc. The common case
-// (nothing locally unregistered, including every fresh `up`) returns the
-// same precomputed t.registerBody rather than re-encoding it. Returns nil
-// if every configured service is currently locally unregistered: neither
-// this CLI nor Node's ever sends a register with an empty services list,
-// and the server may bounce an empty batch as BAD_REQUEST, which handleApp
-// would then log as a protocol mismatch.
+// keypress not yet followed by `e`) or takenOver (a "conflict" not yet
+// followed by `e`) — see those fields' docs. The common case (neither,
+// including every fresh `up`) returns the same precomputed t.registerBody
+// rather than re-encoding it. Returns nil if every configured service is
+// left out: neither this CLI nor Node's ever sends a register with an
+// empty services list, and the server may bounce an empty batch as
+// BAD_REQUEST, which handleApp would then log as a protocol mismatch.
 func (t *Tunnel) currentRegisterBody() map[string]any {
 	t.mu.Lock()
-	n := len(t.localUnregistered)
-	skip := make(map[string]bool, n)
+	skip := make(map[string]bool, len(t.localUnregistered)+len(t.takenOver))
 	for name := range t.localUnregistered {
 		skip[name] = true
 	}
+	for name := range t.takenOver {
+		skip[name] = true
+	}
+	n := len(skip)
 	t.mu.Unlock()
 	if n == 0 {
 		return t.registerBody
@@ -484,6 +569,40 @@ func (t *Tunnel) currentRegisterBody() map[string]any {
 		return nil
 	}
 	return appproto.EncodeRegister(subset)
+}
+
+// isTakenOver reports whether name is in takenOver.
+func (t *Tunnel) isTakenOver(name string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.takenOver[name]
+}
+
+// takenOverSnapshot copies takenOver under t.mu, so one "registered" reply
+// is filtered against a single view of it.
+func (t *Tunnel) takenOverSnapshot() map[string]bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	snap := make(map[string]bool, len(t.takenOver))
+	for name := range t.takenOver {
+		snap[name] = true
+	}
+	return snap
+}
+
+// withoutTaken returns items minus every one whose name (per nameOf) is in
+// taken; items itself when taken is empty.
+func withoutTaken[T any](items []T, taken map[string]bool, nameOf func(T) string) []T {
+	if len(taken) == 0 {
+		return items
+	}
+	kept := make([]T, 0, len(items))
+	for _, it := range items {
+		if !taken[nameOf(it)] {
+			kept = append(kept, it)
+		}
+	}
+	return kept
 }
 
 // hasConfiguredService reports whether name is one this connection's own
@@ -526,10 +645,13 @@ func (t *Tunnel) sendRegisterFor(name string) {
 // RegisterService re-registers a single configured service — the exported
 // counterpart of sendRegisterFor, for a caller-driven "enable" (a local `e`
 // keypress/Controller.Enable, DESIGN.md §9) rather than one arriving off
-// the wire. Always clears name from localUnregistered first, even with no
-// live connection (edge case: `e` pressed while disconnected must still
-// make the next welcome's register batch include name again) — the actual
-// re-register send below stays a no-op in that case, same as before.
+// the wire. Always clears name from localUnregistered and takenOver first,
+// even with no live connection (edge case: `e` pressed while disconnected
+// must still make the next welcome's register batch include name again) —
+// the actual re-register send below stays a no-op in that case, same as
+// before. Clearing takenOver is the one way back from a "conflict": OpEnable
+// skips a taken-over name before reaching here, so only a local `e`
+// reclaims it (and takes it from the other session).
 //
 // The registry is told too (MarkReregistering), so the dashboard shows the
 // name pending until the reply rather than still disabled — only for a
@@ -537,6 +659,7 @@ func (t *Tunnel) sendRegisterFor(name string) {
 func (t *Tunnel) RegisterService(name string) {
 	t.mu.Lock()
 	delete(t.localUnregistered, name)
+	delete(t.takenOver, name)
 	t.mu.Unlock()
 	if kind, ok := t.kindByName[name]; ok {
 		t.registry.MarkReregistering(name, kind)
@@ -640,6 +763,17 @@ func (t *Tunnel) onDrain(d *wsmixer.DrainMsg) {
 
 func (t *Tunnel) onDisconnect(reason wsmixer.DisconnectReason) {
 	t.disp.enqueue(func() {
+		// ws-mixer-go v0.9.0's drain hand-over (its DECISIONS.md
+		// D-2026-10-14-03): a drained connection keeps serving its in-flight
+		// streams past its replacement's welcome and its end is reported as
+		// Superseded, possibly after the replacement's onConnect has
+		// published "connected" and re-registered. The replacement is live
+		// either way, so this end is no loss and must not publish
+		// "disconnected" over it.
+		if reason.Superseded {
+			t.log.Debug("drained tunnel connection retired; its replacement is live", "message", reason.Message)
+			return
+		}
 		t.publish(eventbus.ConnStateChanged{State: "disconnected"})
 		if !reason.Fatal {
 			text := reason.CloseReason
@@ -700,6 +834,17 @@ const connectionLimitPrefix = "CONNECTION_LIMIT:"
 // scheduleReconnectAtCap. Recovery just needs one fewer live mcpwarp agent
 // for this account.
 const connectionLimitHint = "close another `mcpwarp up` and this one will reconnect"
+
+// tooManyServicesHint is the guidance for a TOO_MANY_SERVICES app error.
+// config.Validate already caps a config at config.MaxServers, so this only
+// fires against a tunnel whose cap is lower than the CLI's — hence no
+// number here; the tunnel's own message carries its real cap.
+const tooManyServicesHint = "the tunnel refused this many servers in one register; remove some from the config"
+
+// takenOverHint is the guidance for a "conflict" op: unlike a register
+// reply's CONFLICT (registerErrorHint), the name is fine and its kind is
+// irrelevant — another session simply holds it now.
+const takenOverHint = "another `mcpwarp up` on this account now serves it; stop that one or rename this server, then press e (or restart this `mcpwarp up`)"
 
 // classifyFatalMessage is this package's half of client.ts's classifyFatal:
 // the message a fatal disconnect is logged (and exited) with, kept in

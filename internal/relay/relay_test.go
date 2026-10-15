@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,6 +142,45 @@ func TestRelayStreamDisabledService(t *testing.T) {
 	}
 	if resp.StatusCode != 503 {
 		t.Fatalf("expected 503, got %d", resp.StatusCode)
+	}
+}
+
+// TestRelayStreamRelaysRejectedWhileReregistering: the tunnel decides
+// routing, not the registry's rejection. It routes a name to this session as
+// soon as a re-register (`e`, or a reconnect's batch) records it, before the
+// "registered" reply clears a CONFLICT from an earlier take-over, so such a
+// request must reach the local target.
+func TestRelayStreamRelaysRejectedWhileReregistering(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+	}))
+	defer srv.Close()
+	target, _ := url.Parse(srv.URL + "/mcp")
+
+	reg := registryWithService("svc", "id1", "https://svc.tunnel.example/mcp")
+	reg.ApplyRegisterErrors([]appproto.ServiceError{{Name: "svc", Code: "CONFLICT", Message: "taken over"}}, nil)
+	reg.MarkReregistering("svc", "http")
+	fwd := NewForwarder()
+	defer fwd.Close()
+	opts := testOpts(t, reg, map[string]*url.URL{"svc": target}, fwd)
+
+	stream, reqW, respR := newFakeStream()
+	done := make(chan struct{})
+	go func() { RelayStream(stream, opts); close(done) }()
+	fmt.Fprintf(reqW, "GET /mcp HTTP/1.1\r\nHost: svc.tunnel.example\r\n\r\n")
+
+	resp, err := http.ReadResponse(bufio.NewReader(respR), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	<-done
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("the local target was hit %d times, want 1", n)
 	}
 }
 

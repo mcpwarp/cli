@@ -308,9 +308,11 @@ func (m *Model) copySelectedURL() tea.Cmd {
 	}
 	s := m.servers[m.cursor]
 	if s.URL == "" {
+		// Neutral for a rejected row: it may have been refused on register
+		// or taken over by another session; `last error` says which.
 		why := "has no public URL yet"
 		if displayState(s) == RegistrationRejected {
-			why = "has no public URL: the tunnel rejected it"
+			why = "has no public URL right now"
 		}
 		return m.setNotice(noticeWarn, "nothing to copy:", s.Name+" "+why)
 	}

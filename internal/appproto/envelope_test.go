@@ -133,6 +133,35 @@ func TestDecodeEnable(t *testing.T) {
 	}
 }
 
+// TestDecodeConflict uses the exact frame agentconn.go's sendConflict sends
+// (takeover_test.go's assertConflict pins the same shape).
+func TestDecodeConflict(t *testing.T) {
+	raw := json.RawMessage(`{"mcpwarp":{"v":1,"op":"conflict","id":"srv-svc-a","name":"svc-a","reason":"taken_over"}}`)
+	got, err := Decode(raw)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Op != OpConflict || got.ConflictID != "srv-svc-a" || got.ConflictName != "svc-a" || got.ConflictReason != "taken_over" {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+}
+
+func TestDecodeConflictDefaultsReason(t *testing.T) {
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"mcpwarp":{"v":1,"op":"conflict","id":"id1","name":"a"}}`),
+		json.RawMessage(`{"mcpwarp":{"v":1,"op":"conflict","id":"id1","name":"a","reason":null}}`),
+		json.RawMessage(`{"mcpwarp":{"v":1,"op":"conflict","id":"id1","name":"a","reason":""}}`),
+	} {
+		got, err := Decode(raw)
+		if err != nil {
+			t.Fatalf("%s: decode: %v", raw, err)
+		}
+		if got.Op != OpConflict || got.ConflictReason != ConflictReasonTakenOver {
+			t.Fatalf("%s: want reason defaulted to %q, got %+v", raw, ConflictReasonTakenOver, got)
+		}
+	}
+}
+
 func TestDecodeError(t *testing.T) {
 	raw := json.RawMessage(`{"mcpwarp":{"v":1,"op":"error","code":"OVERLOADED","message":"slow down"}}`)
 	got, err := Decode(raw)
@@ -179,6 +208,10 @@ func TestDecodeBadShapeErrors(t *testing.T) {
 		json.RawMessage(`{"mcpwarp":{"v":1,"op":"registered","services":"not-an-array"}}`),
 		json.RawMessage(`{"mcpwarp":{"v":1,"op":"disable","reason":"missing id"}}`),
 		json.RawMessage(`{"mcpwarp":{"v":1,"op":"enable","id":"id1"}}`),
+		json.RawMessage(`{"mcpwarp":{"v":1,"op":"conflict","name":"a","reason":"taken_over"}}`),
+		json.RawMessage(`{"mcpwarp":{"v":1,"op":"conflict","id":"id1","reason":"taken_over"}}`),
+		json.RawMessage(`{"mcpwarp":{"v":1,"op":"conflict","id":"id1","name":"","reason":"taken_over"}}`),
+		json.RawMessage(`{"mcpwarp":{"v":1,"op":"conflict","id":"id1","name":"a","reason":7}}`),
 		json.RawMessage(`{"mcpwarp":{"v":1,"op":"error","message":"missing code"}}`),
 		json.RawMessage(`{"mcpwarp":{"v":1,"op":"unregistered","services":[{"name":1}]}}`),
 	}

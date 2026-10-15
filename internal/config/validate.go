@@ -81,6 +81,12 @@ func validateConfig(raw []byte) (*Config, issueList) {
 	if len(rawServers) == 0 {
 		issues = append(issues, issue{path: "servers", message: "servers must not be empty"})
 	}
+	if len(rawServers) > MaxServers {
+		issues = append(issues, issue{
+			path:    "servers",
+			message: fmt.Sprintf("too many servers (%d): the tunnel accepts at most %d in one register message, which carries them all", len(rawServers), MaxServers),
+		})
+	}
 
 	servers := make([]Server, 0, len(rawServers))
 	names := map[string]int{}

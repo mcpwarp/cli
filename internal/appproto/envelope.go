@@ -53,6 +53,7 @@ const (
 	OpUnregistered = "unregistered"
 	OpDisable      = "disable"
 	OpEnable       = "enable"
+	OpConflict     = "conflict"
 	OpError        = "error"
 	// OpUnknown is Inbound.Op for a message whose op Decode doesn't
 	// recognize, or whose v isn't ProtocolVersion — DESIGN.md §8's
@@ -82,6 +83,11 @@ type Inbound struct {
 	EnableID   string
 	EnableName string
 
+	// "conflict"
+	ConflictID     string
+	ConflictName   string
+	ConflictReason string
+
 	// "error"
 	ErrorCode    string
 	ErrorMessage string
@@ -96,8 +102,14 @@ var knownOps = map[string]bool{
 	OpUnregistered: true,
 	OpDisable:      true,
 	OpEnable:       true,
+	OpConflict:     true,
 	OpError:        true,
 }
+
+// ConflictReasonTakenOver is the only "conflict" reason the tunnel sends
+// today (agentconn.go's sendConflict), and the one Decode fills in when the
+// field is absent.
+const ConflictReasonTakenOver = "taken_over"
 
 // DecodeError is returned by Decode when a recognized op's body fails to
 // match its expected shape — a genuine protocol violation, unlike an
@@ -284,6 +296,31 @@ func Decode(raw json.RawMessage) (*Inbound, error) {
 			return nil, &DecodeError{Op: head.Op, Message: "missing name"}
 		}
 		return &Inbound{Op: OpEnable, EnableID: *body.ID, EnableName: *body.Name}, nil
+
+	case OpConflict:
+		// id and name are required like enable's. reason is optional with
+		// a "taken_over" default, as ws-mixer-go's mcpwarp/envelope.go
+		// decodes it: rejecting a frame for a missing reason would drop
+		// the one signal that this connection lost the name.
+		var body struct {
+			ID     *string `json:"id"`
+			Name   *string `json:"name"`
+			Reason *string `json:"reason"`
+		}
+		if err := json.Unmarshal(wrapper.Mcpwarp, &body); err != nil {
+			return nil, &DecodeError{Op: head.Op, Message: err.Error()}
+		}
+		if body.ID == nil || *body.ID == "" {
+			return nil, &DecodeError{Op: head.Op, Message: "missing id"}
+		}
+		if body.Name == nil || *body.Name == "" {
+			return nil, &DecodeError{Op: head.Op, Message: "missing name"}
+		}
+		reason := ConflictReasonTakenOver
+		if body.Reason != nil && *body.Reason != "" {
+			reason = *body.Reason
+		}
+		return &Inbound{Op: OpConflict, ConflictID: *body.ID, ConflictName: *body.Name, ConflictReason: reason}, nil
 
 	case OpError:
 		var body struct {

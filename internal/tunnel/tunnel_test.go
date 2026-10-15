@@ -1,10 +1,12 @@
 package tunnel
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -2391,5 +2393,723 @@ func TestNonRetryableTokenFailureIsFatal(t *testing.T) {
 	}
 	if n := srv.connCount(); n != 1 {
 		t.Fatalf("expected no reconnect after a fatal token failure, got %d conns", n)
+	}
+}
+
+// replyRegisteredAll answers every "register" on c with a "registered" that
+// accepts each name it carried, at id "id-<name>" and URL
+// "https://<name>.example/mcp". seen, if non-nil, gets each batch's names
+// first (c.OnApp takes one handler, so a test can't add its own).
+func replyRegisteredAll(c *wsmixer.Conn, seen func(names []string)) {
+	c.OnApp(func(raw json.RawMessage) {
+		names := registeredNames(raw)
+		if names == nil {
+			return
+		}
+		if seen != nil {
+			seen(names)
+		}
+		services := make([]map[string]any, len(names))
+		for i, n := range names {
+			services[i] = map[string]any{"name": n, "id": "id-" + n, "url": "https://" + n + ".example/mcp", "created": false}
+		}
+		_ = c.SendApp(context.Background(), map[string]any{
+			"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": services, "errors": []any{}},
+		})
+	})
+}
+
+// requestOver opens a stream on c the way the tunnel routes a public
+// request, sends a GET for host, and returns the response status.
+func requestOver(t *testing.T, c *wsmixer.Conn, host string) int {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := c.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	fmt.Fprintf(stream, "GET /mcp HTTP/1.1\r\nHost: %s\r\n\r\n", host)
+	_ = stream.CloseWrite()
+	resp, err := http.ReadResponse(bufio.NewReader(stream), nil)
+	if err != nil {
+		t.Fatalf("reading the response for %s: %v", host, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
+// waitForRow polls tun's registry until name's row satisfies ok.
+func waitForRow(t *testing.T, tun *Tunnel, what, name string, ok func(registry.Row, bool) bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var row registry.Row
+		found := false
+		for _, r := range tun.Registry().Rows() {
+			if r.Name == name {
+				row, found = r, true
+			}
+		}
+		if ok(row, found) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s; rows: %+v", what, tun.Registry().Rows())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestConflictTakesOverOnlyThatName covers the tunnel's per-name "conflict"
+// op (mcpwarp-saas agentconn.go's sendConflict): only that name turns
+// rejected (CONFLICT) with the take-over hint while the other name keeps
+// serving, and a later successful "registered" for it (here `e`,
+// RegisterService) makes it active and routable again.
+func TestConflictTakesOverOnlyThatName(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(target.Close)
+	targetURL, _ := url.Parse(target.URL + "/mcp")
+
+	var serverConn atomic.Pointer[wsmixer.Conn]
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		serverConn.Store(c)
+		replyRegisteredAll(c, nil)
+	})
+
+	bus := eventbus.New(64)
+	go func() {
+		for range bus.Telemetry {
+		}
+	}()
+	t.Cleanup(bus.Close)
+
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "http"}},
+		Targets:     map[string]*url.URL{"svc-a": targetURL, "svc-b": targetURL},
+		Bus:         bus,
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	for _, name := range []string{"svc-a", "svc-b"} {
+		waitForRow(t, tun, name+" active", name, func(r registry.Row, ok bool) bool {
+			return ok && r.Rejected == "" && r.URL != ""
+		})
+	}
+	c := serverConn.Load()
+	if got := requestOver(t, c, "svc-a.example"); got != 200 {
+		t.Fatalf("svc-a before the conflict: status %d, want 200", got)
+	}
+
+	_ = c.SendApp(context.Background(), map[string]any{
+		"mcpwarp": map[string]any{"v": 1, "op": "conflict", "id": "id-svc-a", "name": "svc-a", "reason": "taken_over"},
+	})
+
+	var appErr eventbus.AppError
+	deadline := time.After(2 * time.Second)
+	for appErr.Code == "" {
+		select {
+		case evt := <-bus.Control:
+			if ae, ok := evt.(eventbus.AppError); ok {
+				appErr = ae
+			}
+		case <-deadline:
+			t.Fatal("expected a CONFLICT AppError, got none")
+		}
+	}
+	go func() {
+		for range bus.Control {
+		}
+	}()
+	if appErr.Code != "CONFLICT" || appErr.Service != "svc-a" || !strings.Contains(appErr.Message, "taken_over") {
+		t.Fatalf("AppError = %+v, want CONFLICT for svc-a carrying the reason", appErr)
+	}
+	if appErr.Hint != takenOverHint {
+		t.Fatalf("AppError hint = %q, want the take-over hint %q", appErr.Hint, takenOverHint)
+	}
+
+	waitForRow(t, tun, "svc-a rejected", "svc-a", func(r registry.Row, ok bool) bool {
+		return ok && r.Rejected == "CONFLICT"
+	})
+	waitForRow(t, tun, "svc-b untouched", "svc-b", func(r registry.Row, ok bool) bool {
+		return ok && r.Rejected == "" && !r.Disabled
+	})
+	if got := requestOver(t, c, "svc-b.example"); got != 200 {
+		t.Fatalf("svc-b after svc-a's conflict: status %d, want 200", got)
+	}
+
+	tun.RegisterService("svc-a")
+	waitForRow(t, tun, "svc-a active again", "svc-a", func(r registry.Row, ok bool) bool {
+		return ok && r.Rejected == "" && !r.Reregistering && r.URL == "https://svc-a.example/mcp"
+	})
+	if got := requestOver(t, c, "svc-a.example"); got != 200 {
+		t.Fatalf("svc-a after re-registering: status %d, want 200", got)
+	}
+	if got := exitCode.Load(); got != -1 {
+		t.Fatalf("expected no FatalExit, got exit code %d", got)
+	}
+}
+
+// TestConflictIDMismatchWarnsAndApplies: a conflict is keyed on its name;
+// an id that differs from the one this name registered with is logged and
+// the conflict still applies. A conflict for a name this config doesn't
+// hold is ignored and adds no row.
+func TestConflictIDMismatchWarnsAndApplies(t *testing.T) {
+	var serverConn atomic.Pointer[wsmixer.Conn]
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		serverConn.Store(c)
+		replyRegisteredAll(c, nil)
+	})
+
+	logs := &recordingHandler{}
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
+		Bus:         newTestBus(t),
+		Log:         slog.New(logs),
+		FatalExit:   func(int) {},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	waitForRow(t, tun, "svc active", "svc", func(r registry.Row, ok bool) bool { return ok && r.URL != "" })
+	c := serverConn.Load()
+	_ = c.SendApp(context.Background(), map[string]any{
+		"mcpwarp": map[string]any{"v": 1, "op": "conflict", "id": "id-other", "name": "not-mine", "reason": "taken_over"},
+	})
+	_ = c.SendApp(context.Background(), map[string]any{
+		"mcpwarp": map[string]any{"v": 1, "op": "conflict", "id": "id-other", "name": "svc", "reason": "taken_over"},
+	})
+
+	waitForRow(t, tun, "svc rejected despite the id mismatch", "svc", func(r registry.Row, ok bool) bool {
+		return ok && r.Rejected == "CONFLICT"
+	})
+	rec, ok := logs.find("conflict id differs from this name's registered id; applying it by name")
+	if !ok {
+		t.Fatal("expected a warn log for the id mismatch")
+	}
+	if v, _ := recordAttr(rec, "registeredId"); v.String() != "id-svc" {
+		t.Fatalf("registeredId attr = %q, want id-svc", v.String())
+	}
+	if _, ok := logs.find("conflict for a name this connection doesn't hold; ignoring"); !ok {
+		t.Fatal("expected the conflict for an unconfigured name to be logged and ignored")
+	}
+	for _, r := range tun.Registry().Rows() {
+		if r.Name == "not-mine" {
+			t.Fatalf("a conflict for an unconfigured name added a row: %+v", r)
+		}
+	}
+}
+
+// TestConflictIsStickyUntilLocalEnable: a taken-over name stays with the
+// other session, like ws-mixer-go's mcpwarp layer (TestAgentStickyConflict
+// ClosesClient): a dashboard "enable" for it is ignored, a reconnect's
+// register batch leaves it out, and only a local `e` (RegisterService)
+// re-registers it, whose success makes it active again.
+func TestConflictIsStickyUntilLocalEnable(t *testing.T) {
+	var mu sync.Mutex
+	var batches [][]string
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		replyRegisteredAll(c, func(names []string) {
+			mu.Lock()
+			batches = append(batches, names)
+			mu.Unlock()
+		})
+	})
+	batchCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(batches)
+	}
+	batchAt := func(i int) []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), batches[i]...)
+	}
+	waitForBatch := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for batchCount() < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for register batch #%d, got %d so far", n, batchCount())
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	logs := &recordingHandler{}
+	var enabled atomic.Int32
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "http"}},
+		Bus:         newTestBus(t),
+		Log:         slog.New(logs),
+		FatalExit:   func(int) {},
+		OnEnable:    func(string) { enabled.Add(1) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	waitForBatch(1)
+	waitForRow(t, tun, "svc-a active", "svc-a", func(r registry.Row, ok bool) bool { return ok && r.URL != "" })
+	first := srv.latestConn()
+	_ = first.SendApp(context.Background(), map[string]any{
+		"mcpwarp": map[string]any{"v": 1, "op": "conflict", "id": "id-svc-a", "name": "svc-a", "reason": "taken_over"},
+	})
+	waitForRow(t, tun, "svc-a rejected", "svc-a", func(r registry.Row, ok bool) bool { return ok && r.Rejected == "CONFLICT" })
+
+	_ = first.SendApp(context.Background(), map[string]any{
+		"mcpwarp": map[string]any{"v": 1, "op": "enable", "id": "id-svc-a", "name": "svc-a"},
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := logs.find("enable for a name another session took over; ignoring"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expected the dashboard enable for a taken-over name to be ignored")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if n := enabled.Load(); n != 0 {
+		t.Fatalf("OnEnable fired %d times for a taken-over name, want 0", n)
+	}
+	if n := batchCount(); n != 1 {
+		t.Fatalf("the ignored enable sent a register: %d batches, want 1", n)
+	}
+
+	_ = first.Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
+	waitForBatch(2)
+	if got := batchAt(1); len(got) != 1 || got[0] != "svc-b" {
+		t.Fatalf("register batch after the take-over = %v, want [svc-b]", got)
+	}
+	waitForRow(t, tun, "svc-a still rejected after the reconnect", "svc-a", func(r registry.Row, ok bool) bool {
+		return ok && r.Rejected == "CONFLICT"
+	})
+
+	tun.RegisterService("svc-a")
+	waitForBatch(3)
+	if got := batchAt(2); len(got) != 1 || got[0] != "svc-a" {
+		t.Fatalf("register batch after e = %v, want [svc-a]", got)
+	}
+	waitForRow(t, tun, "svc-a active after e", "svc-a", func(r registry.Row, ok bool) bool {
+		return ok && r.Rejected == "" && !r.Reregistering && r.URL == "https://svc-a.example/mcp"
+	})
+}
+
+// TestConflictBeforeItsRegisteredReplyStands: a "conflict" can overtake the
+// "registered" reply naming that same success (the tunnel records the hold
+// before replying, and a concurrent take-over's frame can go first). The
+// late success must not flip the name back to active with a URL — on the
+// first batch, and on an `e` whose reply loses the same race — and the next
+// batch must still leave it out. A later `e` that isn't overtaken wins.
+func TestConflictBeforeItsRegisteredReplyStands(t *testing.T) {
+	var raceConflict atomic.Bool
+	raceConflict.Store(true)
+	var mu sync.Mutex
+	var batches [][]string
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		c.OnApp(func(raw json.RawMessage) {
+			names := registeredNames(raw)
+			if names == nil {
+				return
+			}
+			mu.Lock()
+			batches = append(batches, names)
+			mu.Unlock()
+			services := make([]map[string]any, len(names))
+			for i, n := range names {
+				if n == "svc-a" && raceConflict.Load() {
+					_ = c.SendApp(context.Background(), map[string]any{
+						"mcpwarp": map[string]any{"v": 1, "op": "conflict", "id": "id-svc-a", "name": "svc-a", "reason": "taken_over"},
+					})
+				}
+				services[i] = map[string]any{"name": n, "id": "id-" + n, "url": "https://" + n + ".example/mcp", "created": false}
+			}
+			_ = c.SendApp(context.Background(), map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": services, "errors": []any{}},
+			})
+			// Handled after the reply: once its warn is logged, so is the
+			// reply's effect.
+			_ = c.SendApp(context.Background(), map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "sentinel"},
+			})
+		})
+	})
+	batchCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(batches)
+	}
+	batchAt := func(i int) []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), batches[i]...)
+	}
+
+	logs := &recordingHandler{}
+	sentinels := func() int {
+		logs.mu.Lock()
+		defer logs.mu.Unlock()
+		n := 0
+		for _, r := range logs.records {
+			if r.Message == "ignoring unrecognized mcpwarp app message" {
+				n++
+			}
+		}
+		return n
+	}
+	waitUntil := func(what string, ok func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for !ok() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "http"}},
+		Bus:         newTestBus(t),
+		Log:         slog.New(logs),
+		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	stillTakenOver := func(when string) {
+		t.Helper()
+		for _, r := range tun.Registry().Rows() {
+			if r.Name == "svc-a" && (r.Rejected != "CONFLICT" || r.URL != "" || r.Reregistering) {
+				t.Fatalf("svc-a %s = %+v, want rejected CONFLICT with no URL", when, r)
+			}
+		}
+		if _, ok := tun.Registry().Get("svc-a"); ok {
+			t.Fatalf("svc-a %s got a routable entry from the overtaken success", when)
+		}
+	}
+
+	waitUntil("the first batch's reply", func() bool { return sentinels() >= 1 })
+	stillTakenOver("after the first batch")
+	waitForRow(t, tun, "svc-b active", "svc-b", func(r registry.Row, ok bool) bool { return ok && r.URL != "" })
+
+	_ = srv.latestConn().Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
+	waitUntil("the reconnect's reply", func() bool { return batchCount() >= 2 && sentinels() >= 2 })
+	if got := batchAt(1); len(got) != 1 || got[0] != "svc-b" {
+		t.Fatalf("register batch after the take-over = %v, want [svc-b]", got)
+	}
+
+	tun.RegisterService("svc-a")
+	waitUntil("the overtaken e's reply", func() bool { return batchCount() >= 3 && sentinels() >= 3 })
+	if got := batchAt(2); len(got) != 1 || got[0] != "svc-a" {
+		t.Fatalf("register batch after e = %v, want [svc-a]", got)
+	}
+	stillTakenOver("after an e whose reply was overtaken")
+
+	raceConflict.Store(false)
+	tun.RegisterService("svc-a")
+	waitForRow(t, tun, "svc-a active after an e that wins", "svc-a", func(r registry.Row, ok bool) bool {
+		return ok && r.Rejected == "" && !r.Reregistering && r.URL == "https://svc-a.example/mcp"
+	})
+	if got := exitCode.Load(); got != -1 {
+		t.Fatalf("expected no FatalExit, got exit code %d", got)
+	}
+}
+
+// TestConflictBeforeItsRegisterErrorStands is the error-side sibling of
+// TestConflictBeforeItsRegisteredReplyStands: a stale reply's error for a
+// taken-over name (here SERVER_DISABLED, which would read as "disabled",
+// resumable by a dashboard enable that OpEnable ignores for it) must not
+// replace its CONFLICT.
+func TestConflictBeforeItsRegisterErrorStands(t *testing.T) {
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		c.OnApp(func(raw json.RawMessage) {
+			if registeredNames(raw) == nil {
+				return
+			}
+			_ = c.SendApp(context.Background(), map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "conflict", "id": "id-svc-a", "name": "svc-a", "reason": "taken_over"},
+			})
+			_ = c.SendApp(context.Background(), map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []any{
+					map[string]any{"name": "svc-b", "id": "id-svc-b", "url": "https://svc-b.example/mcp", "created": false},
+				}, "errors": []map[string]any{
+					{"name": "svc-a", "code": "SERVER_DISABLED", "message": "server is disabled"},
+				}},
+			})
+			_ = c.SendApp(context.Background(), map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "sentinel"},
+			})
+		})
+	})
+
+	logs := &recordingHandler{}
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "http"}},
+		Bus:         newTestBus(t),
+		Log:         slog.New(logs),
+		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := logs.find("ignoring unrecognized mcpwarp app message"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the sentinel after the reply")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	waitForRow(t, tun, "svc-a still rejected CONFLICT", "svc-a", func(r registry.Row, ok bool) bool {
+		return ok && r.Rejected == "CONFLICT" && !r.Disabled && r.URL == ""
+	})
+	waitForRow(t, tun, "svc-b active", "svc-b", func(r registry.Row, ok bool) bool {
+		return ok && r.Rejected == "" && r.URL == "https://svc-b.example/mcp"
+	})
+	if got := exitCode.Load(); got != -1 {
+		t.Fatalf("expected no FatalExit, got exit code %d", got)
+	}
+}
+
+// TestTooManyServicesRejectsEveryPendingName: the tunnel refuses an
+// oversized register as a whole with an error op and no "registered" reply.
+// Every name that batch carried must read rejected with the code (not stay
+// pending forever), one AppError with the hint is published, and it isn't
+// fatal.
+func TestTooManyServicesRejectsEveryPendingName(t *testing.T) {
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		c.OnApp(func(raw json.RawMessage) {
+			if registeredNames(raw) == nil {
+				return
+			}
+			_ = c.SendApp(context.Background(), map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "error", "code": "TOO_MANY_SERVICES",
+					"message": "register carries 2 services, max 1 per message"},
+			})
+			// A sentinel the dispatcher handles after the error op: once
+			// its warn is logged, every event the error op published is
+			// already in bus.Control.
+			_ = c.SendApp(context.Background(), map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "sentinel"},
+			})
+		})
+	})
+
+	bus := eventbus.New(64)
+	go func() {
+		for range bus.Telemetry {
+		}
+	}()
+	t.Cleanup(bus.Close)
+
+	logs := &recordingHandler{}
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "stdio"}},
+		Bus:         bus,
+		Log:         slog.New(logs),
+		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := logs.find("ignoring unrecognized mcpwarp app message"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the sentinel after the TOO_MANY_SERVICES error")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	var appErrs []eventbus.AppError
+collect:
+	for {
+		select {
+		case evt := <-bus.Control:
+			if ae, ok := evt.(eventbus.AppError); ok {
+				appErrs = append(appErrs, ae)
+			}
+		default:
+			break collect
+		}
+	}
+	go func() {
+		for range bus.Control {
+		}
+	}()
+	if len(appErrs) != 1 {
+		t.Fatalf("expected exactly one AppError, got %d: %+v", len(appErrs), appErrs)
+	}
+	if ae := appErrs[0]; ae.Code != "TOO_MANY_SERVICES" || ae.Service != "" || ae.Hint != tooManyServicesHint {
+		t.Fatalf("AppError = %+v, want TOO_MANY_SERVICES with no service and hint %q", ae, tooManyServicesHint)
+	}
+	for name, kind := range map[string]string{"svc-a": "http", "svc-b": "stdio"} {
+		waitForRow(t, tun, name+" rejected", name, func(r registry.Row, ok bool) bool {
+			return ok && r.Rejected == "TOO_MANY_SERVICES" && r.Kind == kind && r.URL == ""
+		})
+	}
+	if _, ok := logs.find(tooManyServicesHint); !ok {
+		t.Fatal("expected the hint to be logged")
+	}
+	if got := exitCode.Load(); got != -1 {
+		t.Fatalf("expected no FatalExit for TOO_MANY_SERVICES, got exit code %d", got)
+	}
+}
+
+// TestDrainHandOverKeepsConnectedState pins the ws-mixer-go v0.9.0 drain
+// hand-over: the drained connection keeps serving its in-flight stream past
+// the replacement's welcome, and its end, reported afterwards as
+// Superseded, must not publish "disconnected" over the replacement's
+// "connected".
+func TestDrainHandOverKeepsConnectedState(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(target.Close)
+	targetURL, _ := url.Parse(target.URL + "/mcp")
+
+	var registers atomic.Int32
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		c.OnApp(func(raw json.RawMessage) {
+			names := registeredNames(raw)
+			if names == nil {
+				return
+			}
+			_ = c.SendApp(context.Background(), map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []map[string]any{
+					{"name": "svc", "id": "id-svc", "url": "https://svc.example/mcp", "created": false},
+				}, "errors": []any{}},
+			})
+			registers.Add(1)
+		})
+	})
+
+	bus := eventbus.New(64)
+	var statesMu sync.Mutex
+	var states []string
+	go func() {
+		for evt := range bus.Control {
+			if cs, ok := evt.(eventbus.ConnStateChanged); ok {
+				statesMu.Lock()
+				states = append(states, cs.State)
+				statesMu.Unlock()
+			}
+		}
+	}()
+	go func() {
+		for range bus.Telemetry {
+		}
+	}()
+	t.Cleanup(bus.Close)
+
+	logs := &recordingHandler{}
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
+		Targets:     map[string]*url.URL{"svc": targetURL},
+		Bus:         bus,
+		Log:         slog.New(logs),
+		FatalExit:   func(int) {},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	waitUntil := func(what string, ok func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for !ok() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	waitUntil("the first register", func() bool { return registers.Load() >= 1 })
+	old := srv.latestConn()
+
+	// A stream left open on the old connection keeps it alive past the
+	// replacement's welcome, so the hand-over (not a plain reconnect) runs.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := old.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	go func() { _ = old.Drain(ctx, "rollout", wsmixer.DrainOptions{Deadline: 5 * time.Second}) }()
+
+	waitUntil("the replacement's register", func() bool { return srv.connCount() >= 2 && registers.Load() >= 2 })
+
+	fmt.Fprintf(stream, "GET /mcp HTTP/1.1\r\nHost: svc.example\r\n\r\n")
+	_ = stream.CloseWrite()
+	resp, err := http.ReadResponse(bufio.NewReader(stream), nil)
+	if err != nil {
+		t.Fatalf("the drained connection stopped serving its in-flight stream: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("in-flight stream on the drained connection: status %d, want 200", resp.StatusCode)
+	}
+
+	waitUntil("the superseded connection's end", func() bool {
+		_, ok := logs.find("drained tunnel connection retired; its replacement is live")
+		return ok
+	})
+	time.Sleep(50 * time.Millisecond)
+	statesMu.Lock()
+	got := append([]string(nil), states...)
+	statesMu.Unlock()
+	if len(got) == 0 || got[len(got)-1] != "connected" {
+		t.Fatalf("connection states = %v, want the last one connected", got)
+	}
+	for _, s := range got {
+		if s == "disconnected" {
+			t.Fatalf("connection states = %v, want no disconnected across a drain hand-over", got)
+		}
 	}
 }

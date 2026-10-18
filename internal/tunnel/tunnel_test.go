@@ -3113,3 +3113,116 @@ func TestDrainHandOverKeepsConnectedState(t *testing.T) {
 		}
 	}
 }
+
+// TestDrainHandOverIgnoresRetiringConnApp: app messages are bound per
+// connection, so once the replacement has registered, a "disable" still
+// arriving on the drained connection (which keeps serving until its drain
+// deadline + 1s) is dropped, while the same message on the replacement is
+// applied.
+func TestDrainHandOverIgnoresRetiringConnApp(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(target.Close)
+	targetURL, _ := url.Parse(target.URL + "/mcp")
+
+	var registers atomic.Int32
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		c.OnApp(func(raw json.RawMessage) {
+			if registeredNames(raw) == nil {
+				return
+			}
+			_ = c.SendApp(context.Background(), map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []map[string]any{
+					{"name": "svc", "id": "id-svc", "url": "https://svc.example/mcp", "created": false},
+				}, "errors": []any{}},
+			})
+			registers.Add(1)
+		})
+	})
+
+	var disables atomic.Int32
+	logs := &recordingHandler{}
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
+		Targets:     map[string]*url.URL{"svc": targetURL},
+		Bus:         newTestBus(t),
+		Log:         slog.New(logs),
+		FatalExit:   func(int) {},
+		OnDisable:   func(string, string, string) { disables.Add(1) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	waitUntil := func(what string, ok func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for !ok() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	active := func(r registry.Row, ok bool) bool { return ok && !r.Disabled && r.URL != "" }
+
+	waitUntil("the first register", func() bool { return registers.Load() >= 1 })
+	waitForRow(t, tun, "svc active", "svc", active)
+	old := srv.latestConn()
+
+	// As in TestDrainHandOverKeepsConnectedState, an in-flight stream keeps
+	// the drained connection open past the replacement's welcome.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := old.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	go func() { _ = old.Drain(ctx, "rollout", wsmixer.DrainOptions{Deadline: 5 * time.Second}) }()
+
+	// The replacement's register is sent from onConnect after it bound its
+	// handler, so by now the old connection is superseded.
+	waitUntil("the replacement's register", func() bool { return srv.connCount() >= 2 && registers.Load() >= 2 })
+	replacement := srv.latestConn()
+
+	disable := map[string]any{"mcpwarp": map[string]any{"v": 1, "op": "disable", "id": "id-svc", "reason": "stale"}}
+	if err := old.SendApp(ctx, disable); err != nil {
+		t.Fatalf("SendApp on the drained connection: %v", err)
+	}
+	waitUntil("the drained connection's disable to be dropped", func() bool {
+		_, ok := logs.find("ignoring an app message from a superseded tunnel connection")
+		return ok
+	})
+	rec, _ := logs.find("ignoring an app message from a superseded tunnel connection")
+	if v, ok := recordAttr(rec, "session"); !ok || v.String() != old.Session() {
+		t.Fatalf("dropped message logged session %v, want the drained connection's %q", v, old.Session())
+	}
+	waitForRow(t, tun, "svc still active after the drained connection's disable", "svc", active)
+	if n := disables.Load(); n != 0 {
+		t.Fatalf("OnDisable ran %d times for the drained connection's disable, want 0", n)
+	}
+
+	// Still serving, and still routing svc: the dropped disable would have
+	// made relay answer 503.
+	fmt.Fprintf(stream, "GET /mcp HTTP/1.1\r\nHost: svc.example\r\n\r\n")
+	_ = stream.CloseWrite()
+	resp, err := http.ReadResponse(bufio.NewReader(stream), nil)
+	if err != nil {
+		t.Fatalf("the drained connection stopped serving its in-flight stream: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("in-flight stream on the drained connection: status %d, want 200", resp.StatusCode)
+	}
+
+	if err := replacement.SendApp(ctx, disable); err != nil {
+		t.Fatalf("SendApp on the replacement: %v", err)
+	}
+	waitForRow(t, tun, "svc disabled by the replacement's disable", "svc", func(r registry.Row, ok bool) bool { return ok && r.Disabled })
+	waitUntil("OnDisable for the replacement's disable", func() bool { return disables.Load() == 1 })
+}

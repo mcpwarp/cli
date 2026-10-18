@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mcpwarp/cli/internal/appproto"
@@ -159,6 +160,10 @@ type Tunnel struct {
 	// this process makes, same as Node client.ts's sawFirstRegistered. Only
 	// handleApp's dispatcher goroutine touches it, so it needs no lock.
 	sawFirstRegistered bool
+
+	// liveConn is the connection onConnect last bound, stored on the SDK's
+	// callback goroutine and read on the dispatcher's (see superseded).
+	liveConn atomic.Pointer[wsmixer.Conn]
 }
 
 // Connection state, stream-open/close and app-error events are published
@@ -229,10 +234,18 @@ func Start(ctx context.Context, cfg Config) (*Tunnel, error) {
 		// accepts then drops right away can't pin us at Base.
 		Reconnect:    wsmixer.ReconnectOptions{Base: time.Second, Cap: 30 * time.Second, StableAfter: 10 * time.Second},
 		OnConnect:    t.onConnect,
-		OnApp:        t.onApp,
 		OnStream:     t.onStream,
 		OnDrain:      t.onDrain,
 		OnDisconnect: t.onDisconnect,
+		// Every new connection starts with this handler and keeps it until
+		// onConnect binds its own: OnConnect runs on the SDK's callback
+		// goroutine while the connection's delivery goroutine is already
+		// live, so a frame can land first (the reply to an `e` re-register
+		// sent on t.client.Conn() in that window, or a disable/enable fanned
+		// out to it). Whatever arrives here comes from the newest connection
+		// — a retiring one already has its own handler bound — so it is
+		// applied.
+		OnApp: func(raw json.RawMessage) { t.onApp(nil, raw) },
 	})
 
 	if err := t.client.Connect(ctx); err != nil {
@@ -281,6 +294,15 @@ func connectionLimitMessage(raw string) string {
 
 func (t *Tunnel) onConnect(c *wsmixer.Conn, welcome *wsmixer.WelcomeMsg) {
 	session := welcome.Session
+	// DESIGN.md §8's drain hand-over: the drained connection keeps serving
+	// for up to its drain deadline + 1s after this welcome, so its app
+	// messages are bound to it rather than client-wide and dropped once it
+	// is superseded. Stored before binding, so a message from c is never
+	// checked against the previous connection; bound before the register
+	// below is enqueued, so the registered reply can't arrive ahead of the
+	// handler.
+	t.liveConn.Store(c)
+	c.OnApp(func(raw json.RawMessage) { t.onApp(c, raw) })
 	t.disp.enqueue(func() {
 		t.connLimitReported = false
 		if a, ok := t.cfg.TokenSource.(accepter); ok {
@@ -296,7 +318,10 @@ func (t *Tunnel) onConnect(c *wsmixer.Conn, welcome *wsmixer.WelcomeMsg) {
 	})
 }
 
-func (t *Tunnel) onApp(raw json.RawMessage) {
+// onApp decodes one app message that arrived on c, or on a connection
+// onConnect hadn't bound yet when c is nil (ClientConfig.OnApp), and hands it
+// to handleApp unless c has been superseded by then.
+func (t *Tunnel) onApp(c *wsmixer.Conn, raw json.RawMessage) {
 	msg, err := appproto.Decode(raw)
 	if err != nil {
 		t.disp.enqueue(func() {
@@ -307,7 +332,30 @@ func (t *Tunnel) onApp(raw json.RawMessage) {
 	if msg == nil {
 		return // no mcpwarp envelope at all, or an unparseable one — nothing worth logging
 	}
-	t.disp.enqueue(func() { t.handleApp(msg) })
+	t.disp.enqueue(func() {
+		if t.superseded(c) {
+			t.log.Debug("ignoring an app message from a superseded tunnel connection", "session", c.Session(), "op", msg.Op)
+			return
+		}
+		t.handleApp(msg)
+	})
+}
+
+// superseded reports whether c is no longer the live connection, like
+// ws-mixer-go's mcpwarp session.supersededLocked: onConnect has bound a newer
+// one, or the client already switched to a newer one whose onConnect hasn't
+// run yet. nil (an unbound, so newest, connection) never is, and neither is
+// the last bound connection once the client has none: an app message that
+// arrived before it ended is still owed.
+func (t *Tunnel) superseded(c *wsmixer.Conn) bool {
+	if c == nil {
+		return false
+	}
+	if c != t.liveConn.Load() {
+		return true
+	}
+	active := t.client.Conn()
+	return active != nil && active != c
 }
 
 func (t *Tunnel) handleApp(msg *appproto.Inbound) {
@@ -339,15 +387,14 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 		// A "conflict" can land before the reply naming that same name: the
 		// tunnel records this session's hold before replying, so a
 		// concurrent take-over's frame can overtake the reply (an `e` reply
-		// in flight can lose the same race, and during a drain hand-over a
-		// stale reply can arrive from the retiring connection). The
-		// take-over is the newer fact, so neither a success nor an error for
-		// a taken-over name may replace its CONFLICT: a success would flip
-		// the row back to active with a dead URL, a SERVER_DISABLED would
-		// read as resumable by a dashboard enable that OpEnable ignores.
-		// The fatal check above and the per-error log below still read the
-		// raw reply, so a first batch whose only success was taken over
-		// isn't mistaken for a fatal zero-success one.
+		// in flight can lose the same race). The take-over is the newer
+		// fact, so neither a success nor an error for a taken-over name may
+		// replace its CONFLICT: a success would flip the row back to active
+		// with a dead URL, a SERVER_DISABLED would read as resumable by a
+		// dashboard enable that OpEnable ignores. The fatal check above and
+		// the per-error log below still read the raw reply, so a first batch
+		// whose only success was taken over isn't mistaken for a fatal
+		// zero-success one.
 		taken := t.takenOverSnapshot()
 
 		// Recorded before any early return below: a rejected name never

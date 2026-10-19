@@ -367,22 +367,27 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 		t.log.Warn("ignoring unrecognized mcpwarp app message", "op", msg.UnknownOp, "v", msg.UnknownV)
 
 	case appproto.OpRegistered:
-		// Node client.ts's item B: zero successes in a batch is only fatal
-		// the first time this connection has ever registered anything, and
-		// never when every error is SERVER_DISABLED (resumable via a later
-		// "enable" instead) — a transient all-error reply to a
+		// ws-mixer-spec MCPWARP.md §6A.6 G5 (fixture tunnel/
+		// ms_11_first_reply_disabled_and_refused_not_fatal): zero successes
+		// in a batch is only fatal while this process has never registered
+		// anything, and never when any error is SERVER_DISABLED. That name is
+		// disabled, not rejected, and its dashboard "enable" arrives on this
+		// connection, so not every service is refused — however the reply
+		// refused the others. Transient codes (INTERNAL) still count as
+		// refusals here, unlike G5, since the CLI does not retry per name
+		// (ws-mixer-spec §11 row 50). A transient all-error reply to a
 		// sendRegisterFor re-register, or a reconnect whose only server
 		// bounces SERVER_DISABLED, must not kill an otherwise-healthy
-		// process.
+		// process either.
 		zeroSuccesses := len(msg.Services) == 0 && len(msg.Errors) > 0
-		allServerDisabled := zeroSuccesses
+		anyServerDisabled := false
 		for _, svcErr := range msg.Errors {
-			if svcErr.Code != "SERVER_DISABLED" {
-				allServerDisabled = false
+			if svcErr.Code == "SERVER_DISABLED" {
+				anyServerDisabled = true
 				break
 			}
 		}
-		fatal := zeroSuccesses && !allServerDisabled && !t.sawFirstRegistered
+		fatal := zeroSuccesses && !anyServerDisabled && !t.sawFirstRegistered
 
 		// A "conflict" can land before the reply naming that same name: the
 		// tunnel records this session's hold before replying, so a
@@ -404,7 +409,7 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 		t.registry.ApplyRegisterErrors(withoutTaken(msg.Errors, taken, func(e appproto.ServiceError) string { return e.Name }), t.kindByName)
 		for _, svcErr := range msg.Errors {
 			t.log.Warn("register error", "name", svcErr.Name, "code", svcErr.Code, "message", svcErr.Message)
-			hint := registerErrorHint(svcErr.Code, t.cfg.WebURL, fatal)
+			hint := registerErrorHint(svcErr.Code, t.cfg.WebURL)
 			t.publish(eventbus.AppError{Code: svcErr.Code, Message: svcErr.Message, Service: svcErr.Name, Hint: hint})
 			if hint != "" {
 				t.log.Warn(hint)
@@ -563,16 +568,13 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 // registerErrorHint returns the code-specific next step for a "registered"
 // reply's per-service error, or "" when the code has none — the single
 // source both the log line and the AppError event's Hint are drawn from.
-func registerErrorHint(code, webURL string, fatal bool) string {
+func registerErrorHint(code, webURL string) string {
 	switch code {
 	case "QUOTA_EXCEEDED":
 		return fmt.Sprintf("upgrade your plan at %s/settings to add more servers", webURL)
 	case "CONFLICT":
 		return "a server with this name is already registered — rename it, or check its kind"
 	case "SERVER_DISABLED":
-		if fatal {
-			return "this server was disabled in the dashboard"
-		}
 		return "this server was disabled in the dashboard — waiting, toggle it on to resume"
 	case "INVALID_NAME":
 		return "fix the name in your config — it is the public URL slug and must match [a-z0-9]([a-z0-9-]*[a-z0-9])? (max 30 chars)"

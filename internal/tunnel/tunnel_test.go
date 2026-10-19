@@ -455,7 +455,7 @@ func TestRegisteredZeroSuccessesFirstConnectQuotaExceededIsFatal(t *testing.T) {
 }
 
 // TestRegisteredZeroSuccessesFirstConnectInvalidNameIsFatal pins that
-// INVALID_NAME is not folded into the allServerDisabled loop alongside
+// INVALID_NAME is not folded into the anyServerDisabled loop alongside
 // SERVER_DISABLED: a "registered" reply with zero services and only an
 // INVALID_NAME error, on a connection that has never registered anything
 // successfully, must still exit — same fatal path as
@@ -568,6 +568,162 @@ func TestRegisteredAllServerDisabledIsNotFatal(t *testing.T) {
 processed:
 	if got := exitCode.Load(); got != -1 {
 		t.Fatalf("expected no FatalExit for a SERVER_DISABLED-only registered reply, got exit code %d", got)
+	}
+}
+
+// TestRegisteredFirstReplyDisabledAndRefusedNotFatal is ws-mixer-spec
+// fixture tunnel/ms_11_first_reply_disabled_and_refused_not_fatal
+// (MCPWARP.md §6A.6 G5): a first "registered" with no successes that mixes
+// SERVER_DISABLED with another refusal must not exit, since the disabled
+// name isn't refused and its dashboard "enable" arrives on this connection.
+// svc-a reads SERVER_DISABLED (cli.registrationOf shows it disabled) and
+// svc-b QUOTA_EXCEEDED (rejected); the later enable re-registers svc-a and
+// its success flips it to active while svc-b stays rejected.
+func TestRegisteredFirstReplyDisabledAndRefusedNotFatal(t *testing.T) {
+	var registers atomic.Int32
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		c.OnApp(func(raw json.RawMessage) {
+			names := registeredNames(raw)
+			if names == nil {
+				return
+			}
+			if registers.Add(1) == 1 {
+				_ = c.SendApp(context.Background(), map[string]any{
+					"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []any{}, "errors": []map[string]any{
+						{"name": "svc-a", "code": "SERVER_DISABLED", "message": "disabled in dashboard"},
+						{"name": "svc-b", "code": "QUOTA_EXCEEDED", "message": "server limit reached"},
+					}},
+				})
+				return
+			}
+			if len(names) != 1 || names[0] != "svc-a" {
+				t.Errorf("expected the enable to re-register only svc-a, got %v", names)
+				return
+			}
+			_ = c.SendApp(context.Background(), map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []any{
+					map[string]any{"name": "svc-a", "id": "id-a", "url": "https://svc-a.example/mcp", "created": true},
+				}, "errors": []any{}},
+			})
+		})
+	})
+
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "http"}},
+		Bus:         newTestBus(t),
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	rowFor := func(name string) (registry.Row, bool) {
+		for _, r := range tun.Registry().Rows() {
+			if r.Name == name {
+				return r, true
+			}
+		}
+		return registry.Row{}, false
+	}
+	waitFor := func(what string, ok func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for !ok() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s; rows: %+v", what, tun.Registry().Rows())
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	waitFor("the first reply's per-name outcomes", func() bool {
+		a, okA := rowFor("svc-a")
+		b, okB := rowFor("svc-b")
+		return okA && okB && a.Rejected == "SERVER_DISABLED" && b.Rejected == "QUOTA_EXCEEDED"
+	})
+	if a, _ := rowFor("svc-a"); a.URL != "" {
+		t.Fatalf("disabled svc-a row = %+v, want no URL", a)
+	}
+
+	_ = srv.latestConn().SendApp(context.Background(), map[string]any{
+		"mcpwarp": map[string]any{"v": 1, "op": "enable", "id": "id-a", "name": "svc-a"},
+	})
+	waitFor("svc-a active after the enable's re-register", func() bool {
+		a, ok := rowFor("svc-a")
+		return ok && a.Rejected == "" && !a.Disabled && !a.Reregistering && a.URL == "https://svc-a.example/mcp"
+	})
+	if b, _ := rowFor("svc-b"); b.Rejected != "QUOTA_EXCEEDED" || b.URL != "" {
+		t.Fatalf("svc-b row after svc-a's enable = %+v, want still rejected QUOTA_EXCEEDED with no URL", b)
+	}
+
+	// A wrongly chosen FatalExit runs on its own goroutine, spawned while the
+	// first reply was handled (well before the enable above was): give it a
+	// bounded window to land rather than read exitCode once.
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if got := exitCode.Load(); got != -1 {
+			t.Fatalf("expected no FatalExit for a first reply mixing SERVER_DISABLED with QUOTA_EXCEEDED, got exit code %d", got)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestRegisteredFirstReplyAllRefusedIsFatal is ws-mixer-spec fixture
+// tunnel/ms_09_fatal_first_reply (MCPWARP.md §6A.6 G5): a first
+// "registered" refusing every service, none with SERVER_DISABLED, exits 1,
+// and each name still lands rejected with its own code first.
+func TestRegisteredFirstReplyAllRefusedIsFatal(t *testing.T) {
+	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+		c.OnApp(func(raw json.RawMessage) {
+			if registeredNames(raw) == nil {
+				return
+			}
+			_ = c.SendApp(context.Background(), map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []any{}, "errors": []map[string]any{
+					{"name": "svc-a", "code": "QUOTA_EXCEEDED", "message": "server limit reached"},
+					{"name": "svc-b", "code": "CONFLICT", "message": "name in use"},
+				}},
+			})
+		})
+	})
+
+	var exitCode atomic.Int32
+	exitCode.Store(-1)
+	tun, err := Start(context.Background(), Config{
+		URL:         srv.url,
+		TokenSource: staticToken{token: "t"},
+		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "http"}},
+		Bus:         newTestBus(t),
+		Log:         slog.New(slog.DiscardHandler),
+		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tun.Close(context.Background())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for exitCode.Load() == -1 {
+		if time.Now().After(deadline) {
+			t.Fatal("FatalExit was never called for a first reply refusing every service with QUOTA_EXCEEDED and CONFLICT")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := exitCode.Load(); got != 1 {
+		t.Fatalf("expected exit code 1, got %d", got)
+	}
+	rejected := map[string]string{}
+	for _, r := range tun.Registry().Rows() {
+		rejected[r.Name] = r.Rejected
+	}
+	if rejected["svc-a"] != "QUOTA_EXCEEDED" || rejected["svc-b"] != "CONFLICT" {
+		t.Fatalf("expected svc-a rejected QUOTA_EXCEEDED and svc-b CONFLICT, got %v", rejected)
 	}
 }
 

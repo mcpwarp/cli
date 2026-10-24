@@ -299,6 +299,81 @@ func TestRegistrationStatesRendered(t *testing.T) {
 	}
 }
 
+// TestTakenOverRendersLikeRejected: a taken-over row shows "taken_over" in
+// the error style with no URL, on an http row and over a healthy stdio
+// one alike, and a ServiceChanged's Code/Hint reach the `last error` pair.
+func TestTakenOverRendersLikeRejected(t *testing.T) {
+	m := newTestModel([]Server{
+		{Name: "notes", Kind: "http", State: RegistrationActive, Registration: RegistrationActive, URL: shortURL},
+		{Name: "fs", Kind: "stdio", State: "healthy", Registration: RegistrationTakenOver},
+	}, nil)
+	next, _ := m.Update(controlEventMsg{evt: eventbus.ServiceChanged{
+		Name: "notes", Kind: "http", State: RegistrationTakenOver, Code: "TAKEN_OVER",
+		Hint: "another session registered this name; press e to reclaim it",
+	}})
+	m = next.(Model)
+
+	out := renderAt(t, m, 100, 24)
+	want := map[string]string{"notes": "taken_over", "fs": "taken_over"}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(strings.TrimPrefix(line, ">"))
+		if len(fields) < 3 {
+			continue
+		}
+		if state, ok := want[fields[0]]; ok {
+			if fields[2] != state || len(fields) != 4 {
+				t.Fatalf("%s row = %q, want STATE %q and no URL; got:\n%s", fields[0], line, state, out)
+			}
+			delete(want, fields[0])
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("rows not found: %v; got:\n%s", want, out)
+	}
+	if strings.Contains(out, shortURL) {
+		t.Fatalf("a taken-over row must not show its old URL; got:\n%s", out)
+	}
+	for _, line := range []string{"last error: [TAKEN_OVER] notes: taken_over", "another session registered this name; press e to reclaim it"} {
+		if !strings.Contains(out, line) {
+			t.Fatalf("expected %q; got:\n%s", line, out)
+		}
+	}
+	if raw := m.renderTable(); !strings.Contains(raw, styleBad.Render(RegistrationTakenOver)) {
+		t.Fatalf("expected the taken_over STATE cell in the error style; got %q", raw)
+	}
+}
+
+// TestHeaderShowsConnReasonWhileNotConnected: a ConnStateChanged's Reason
+// follows the state word while the connection is down, and a header without
+// one, or once connected again, reads as it always did.
+func TestHeaderShowsConnReasonWhileNotConnected(t *testing.T) {
+	header := func(m Model) string {
+		return strings.Split(renderAt(t, m, 100, 24), "\n")[0]
+	}
+	m := newTestModel(nil, nil)
+
+	next, _ := m.Update(controlEventMsg{evt: eventbus.ConnStateChanged{State: "disconnected"}})
+	m = next.(Model)
+	if got, want := header(m), "mcpwarp up  DISCONNECTED  streams=0"; got != want {
+		t.Fatalf("header without reason = %q, want %q", got, want)
+	}
+
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ConnStateChanged{State: "disconnected", Reason: "retrying in 4s"}})
+	m = next.(Model)
+	if got, want := header(m), "mcpwarp up  DISCONNECTED (retrying in 4s)  streams=0"; got != want {
+		t.Fatalf("header with reason = %q, want %q", got, want)
+	}
+	if raw := m.renderHeader(); !strings.Contains(raw, styleWarn.Render("DISCONNECTED (retrying in 4s)")) {
+		t.Fatalf("expected the reason in the state's style; got %q", raw)
+	}
+
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ConnStateChanged{State: "connected", Session: "sess-1", Reason: "connection lost"}})
+	m = next.(Model)
+	if got, want := header(m), "mcpwarp up  CONNECTED  session=sess-1  streams=0"; got != want {
+		t.Fatalf("connected header = %q, want %q (no stale reason)", got, want)
+	}
+}
+
 // TestFooterAndHelpListCopyKey: `c` is advertised in both the footer hint
 // and the `?` overlay, and the footer still fits an 80-column terminal.
 func TestFooterAndHelpListCopyKey(t *testing.T) {

@@ -137,3 +137,70 @@ func TestRunPlainNeverBlocksProducer(t *testing.T) {
 		t.Fatalf("Publish blocked — RunPlain stopped draining Control")
 	}
 }
+
+// TestRunPlainPrintsServiceTransitions: each eventbus.ServiceChanged is one
+// line in DESIGN.md §9's STATE vocabulary — the active line carries the
+// public URL (plain mode's only place for it), a rejected/taken_over line
+// the wire code, the message and the hint, and pending/disabled a bare
+// state.
+func TestRunPlainPrintsServiceTransitions(t *testing.T) {
+	bus := eventbus.New(8)
+	buf := &syncBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- RunPlain(ctx, bus, buf) }()
+
+	bus.Publish(eventbus.ServiceChanged{Name: "anki", Kind: "http", State: "pending"})
+	bus.Publish(eventbus.ServiceChanged{Name: "anki", Kind: "http", State: "active", URL: "https://anki-anatoly.tunnel.mcpwarp.io/mcp"})
+	bus.Publish(eventbus.ServiceChanged{Name: "deepwiki", Kind: "http", State: "rejected", Code: "QUOTA_EXCEEDED", Message: "server limit reached", Hint: "upgrade your plan at https://web.mcpwarp.io/settings to add more servers"})
+	bus.Publish(eventbus.ServiceChanged{Name: "notes", Kind: "stdio", State: "taken_over", Code: "TAKEN_OVER", Hint: "press e to reclaim it"})
+	bus.Publish(eventbus.ServiceChanged{Name: "fs", Kind: "stdio", State: "disabled"})
+
+	want := "· anki: pending\n" +
+		"✓ anki: active https://anki-anatoly.tunnel.mcpwarp.io/mcp\n" +
+		"✗ deepwiki: rejected (QUOTA_EXCEEDED): server limit reached · upgrade your plan at https://web.mcpwarp.io/settings to add more servers\n" +
+		"✗ notes: taken_over (TAKEN_OVER) · press e to reclaim it\n" +
+		"· fs: disabled\n"
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(buf.String(), "fs: disabled") {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for the last ServiceChanged line; got:\n%s", buf.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if got := buf.String(); got != want {
+		t.Fatalf("plain output =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// TestServiceLineOptionalPartsAndColor: the code, message and hint parts
+// appear only when present (a hint without a code, a code without a hint,
+// a message without a code), a hint's own em dash stays intact behind the
+// " · " separator, and with color on, rejected/taken_over get the red ✗ and
+// active the green ✓.
+func TestServiceLineOptionalPartsAndColor(t *testing.T) {
+	for _, tc := range []struct {
+		evt   eventbus.ServiceChanged
+		color bool
+		want  string
+	}{
+		{eventbus.ServiceChanged{Name: "notes", State: "taken_over", Hint: "press e to reclaim it"}, false, "✗ notes: taken_over · press e to reclaim it\n"},
+		{eventbus.ServiceChanged{Name: "notes", State: "taken_over", Message: "another session took it", Hint: "e reclaims it — no config change"}, false, "✗ notes: taken_over: another session took it · e reclaims it — no config change\n"},
+		{eventbus.ServiceChanged{Name: "fs", State: "disabled", Code: "DISABLED"}, false, "· fs: disabled (DISABLED)\n"},
+		{eventbus.ServiceChanged{Name: "fs", State: "active"}, false, "✓ fs: active\n"},
+		{eventbus.ServiceChanged{Name: "fs", State: "weird"}, false, "! fs: weird\n"},
+		{eventbus.ServiceChanged{Name: "notes", State: "taken_over"}, true, colorRed + "✗" + colorReset + " notes: taken_over\n"},
+		{eventbus.ServiceChanged{Name: "fs", State: "active", URL: "https://x"}, true, colorGreen + "✓" + colorReset + " fs: active https://x\n"},
+	} {
+		var b bytes.Buffer
+		writeControlLine(&b, tc.color, tc.evt)
+		if got := b.String(); got != tc.want {
+			t.Errorf("writeControlLine(%+v, color=%v) = %q, want %q", tc.evt, tc.color, got, tc.want)
+		}
+	}
+}

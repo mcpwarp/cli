@@ -46,7 +46,19 @@ const (
 	// RegistrationDisabled: disabled locally (`d`) or in the dashboard,
 	// including a SERVER_DISABLED register error, which is resumable.
 	RegistrationDisabled = "disabled"
+	// RegistrationTakenOver: another session of the account registered this
+	// name (a `conflict` take-over, DESIGN.md §8). Shown like rejected (error
+	// style, no URL) but named apart, since the fix is different: `e`
+	// reclaims the name rather than a config or plan change.
+	RegistrationTakenOver = "taken_over"
 )
+
+// registrationProblem reports whether a displayed state is one of the two
+// "the tunnel won't route this name" states: error style, no URL to show
+// or copy, detail on the `last error` line.
+func registrationProblem(state string) bool {
+	return state == RegistrationRejected || state == RegistrationTakenOver
+}
 
 // Controller is the set of actions the dashboard can invoke on a selected
 // server, implemented by the caller (M3B, on top of internal/supervisor) so
@@ -70,6 +82,14 @@ type Controller interface {
 // value. A row not yet in the model is added as given, State included —
 // the seed value a caller supplies (e.g. the initial snapshot at startup)
 // stands until the first real update for that name arrives.
+//
+// eventbus.ServiceChanged is the push-per-transition counterpart for a
+// row's registration (Model.applyServiceChanged). The two never both carry
+// rows into one running Program: once the tunnel adapter publishes
+// ServiceChanged, the once-a-second poll stops sending server rows and only
+// publishes the bytes_total metric, and the startup rows come from the
+// servers handed to tuiRunFunc. Until then the poll's SnapshotMsg is the
+// only registration source.
 type SnapshotMsg struct {
 	Servers []Server
 }

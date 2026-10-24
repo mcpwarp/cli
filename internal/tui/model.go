@@ -308,10 +308,10 @@ func (m *Model) copySelectedURL() tea.Cmd {
 	}
 	s := m.servers[m.cursor]
 	if s.URL == "" {
-		// Neutral for a rejected row: it may have been refused on register
-		// or taken over by another session; `last error` says which.
+		// Neutral for a rejected or taken-over row: the URL may come back
+		// (`e`, a reconnect), and `last error` says what to do.
 		why := "has no public URL yet"
-		if displayState(s) == RegistrationRejected {
+		if registrationProblem(displayState(s)) {
 			why = "has no public URL right now"
 		}
 		return m.setNotice(noticeWarn, "nothing to copy:", s.Name+" "+why)
@@ -403,6 +403,8 @@ func (m *Model) applyControl(evt any) {
 		m.connReason = e.Reason
 	case eventbus.ServerStateChanged:
 		m.upsertServerState(e.Name, e.State, e.Restarts)
+	case eventbus.ServiceChanged:
+		m.applyServiceChanged(e)
 	case eventbus.StreamOpened:
 		m.streamsOpened++
 	case eventbus.StreamClosed:
@@ -440,6 +442,73 @@ func (m *Model) upsertServerState(name, state string, restarts int) {
 	m.clampCursor()
 }
 
+// applyServiceChanged applies one registration transition to its row.
+// Registration always takes the new state; State does too unless the row
+// is stdio, whose State belongs to ServerStateChanged (a row of unknown
+// Kind is treated as stdio, so a supervisor state is never overwritten on
+// a guess). Unlike a SnapshotMsg row, whose URL is always written, the URL
+// here follows the registration: a new one replaces the old,
+// rejected/taken_over clear it (the tunnel no longer routes the name, so an
+// old URL is a dead link to show or `c`), and pending/disabled keep it,
+// since a name's URL is stable and works again once it is back. A name not
+// yet in the table is added seeded with State = the registration state,
+// as SnapshotMsg seeds a new row, so a stdio row doesn't show an empty
+// STATE cell until its first ServerStateChanged overwrites it.
+//
+// A non-empty Code or Hint also sets the `last error` pair, as
+// "[CODE] name: message" (Message, else the state; no "[CODE] " without a
+// Code) over Hint, which replaces any previous hint even when empty. This
+// is the only source of that line for a register outcome —
+// eventbus.ServiceChanged documents that its producer doesn't also publish
+// an AppError for it — and AppError keeps setting it for connection-level
+// errors. Like AppError's, the line is sticky: a later transition without
+// Code/Hint (e.g. back to active) leaves it as the record of the last
+// thing that went wrong.
+func (m *Model) applyServiceChanged(e eventbus.ServiceChanged) {
+	i := -1
+	for j := range m.servers {
+		if m.servers[j].Name == e.Name {
+			i = j
+			break
+		}
+	}
+	if i < 0 {
+		m.servers = append(m.servers, Server{Name: e.Name, Kind: e.Kind, State: e.State})
+		i = len(m.servers) - 1
+		m.clampCursor()
+	}
+	row := &m.servers[i]
+	if e.Kind != "" {
+		row.Kind = e.Kind
+	}
+	row.Registration = e.State
+	if row.Kind != "stdio" && row.Kind != "" {
+		row.State = e.State
+	}
+	switch {
+	case e.URL != "":
+		row.URL = e.URL
+	case registrationProblem(e.State):
+		row.URL = ""
+	}
+
+	if e.Code != "" || e.Hint != "" {
+		text := e.Message
+		if text == "" {
+			text = e.State
+		}
+		m.lastErr = e.Name + ": " + text
+		if e.Code != "" {
+			m.lastErr = "[" + e.Code + "] " + m.lastErr
+		}
+		m.lastErrHint = e.Hint
+	}
+}
+
+// applySnapshot merges a SnapshotMsg (rules in types.go). It shares the
+// registration columns with applyServiceChanged, so the two must not both
+// feed a running Program: once the tunnel adapter publishes ServiceChanged,
+// the once-a-second poll stops sending server rows (SnapshotMsg's doc).
 func (m *Model) applySnapshot(snap []Server) {
 	byName := make(map[string]int, len(m.servers))
 	for i, s := range m.servers {

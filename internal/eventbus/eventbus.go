@@ -39,10 +39,54 @@ type MetricSample struct {
 // ConnStateChanged, StreamOpened, StreamClosed and AppError are the
 // canonical M3B/M4 control-channel event shapes (DESIGN.md §3/§8), published
 // directly by internal/tunnel.
+//
+// Reason is optional, short, user-facing text for why the connection is in
+// State (e.g. "retrying in 4s", "connection lost") — empty when there is
+// nothing to add. The TUI header shows it only while State is not
+// connected (DESIGN.md §9), so a producer need not clear it on reconnect.
 type ConnStateChanged struct {
 	State   string
 	Session string
 	Reason  string
+}
+
+// ServiceChanged is one service's registration state transition (DESIGN.md
+// §9's STATE column), published once per change rather than per poll.
+//
+//   - Name is the configured server name (also the public URL slug).
+//   - Kind is the config kind, "stdio" or "http"; consumers use it to tell
+//     whether State is the whole row (http, no local process) or only the
+//     tunnel's side of it (stdio, whose process state comes from
+//     ServerStateChanged).
+//   - State is one of "pending", "active", "rejected", "disabled",
+//     "taken_over". The SDK's "unregistered" (a name removed and waiting
+//     for, or past, its unregister) is not a state here: the producer maps
+//     it to "disabled", since either way the name is out of play.
+//   - URL is the public URL, set only with State "active".
+//   - Code is the SDK's code behind the transition (ws-mixer-go
+//     mcpwarp.ServiceStatus.Code): DISABLED or TAKEN_OVER, or for a
+//     rejection the wire code as received (QUOTA_EXCEEDED, CONFLICT,
+//     TOO_MANY_SERVICES, INVALID_NAME, USERNAME_REQUIRED, ...), so not
+//     always a mcpwarp.StatusCode; "" when there is none (a plain
+//     pending/active, or a local disable).
+//   - Message is the edge's or SDK's own text for Code (the SDK's
+//     LastError, a conflict's reason) or "" when it has none.
+//   - Hint is the user-facing next step for Code (where to upgrade, how to
+//     rename, `e` to reclaim) or "" when there is nothing to do.
+//
+// A per-service register outcome is published as a ServiceChanged and not
+// also as an AppError: consumers take the last-error line for it from
+// Code/Hint here, so publishing both would report it twice. AppError stays
+// for connection-level errors and for service problems that aren't a
+// registration transition (e.g. a stdio child that failed for good).
+type ServiceChanged struct {
+	Name    string
+	Kind    string
+	State   string
+	Code    string
+	Message string
+	URL     string
+	Hint    string
 }
 
 type StreamOpened struct {

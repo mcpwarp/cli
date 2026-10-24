@@ -130,9 +130,11 @@ func (m Model) logPaneHeightBudget() int {
 
 func (m Model) renderHeader() string {
 	stateStyle := m.styles.dim
+	connected := false
 	switch m.connState {
 	case "connected", "healthy":
 		stateStyle = styleGood
+		connected = true
 	case "disconnected", "reconnecting":
 		stateStyle = styleWarn
 	case "closed", "error":
@@ -143,13 +145,19 @@ func (m Model) renderHeader() string {
 		state = "unknown"
 	}
 
+	// While not connected, ConnStateChanged's optional Reason (e.g.
+	// "retrying in 4s"; DESIGN.md §9) follows the state word in the same
+	// style, so the header says what is happening and not only that
+	// something is. Once connected it is dropped: a reason from the outage
+	// before would only be stale.
+	label := strings.ToUpper(state)
+	if m.connReason != "" && !connected {
+		label += " (" + m.connReason + ")"
+	}
 	var parts []string
-	parts = append(parts, stateStyle.Render(strings.ToUpper(state)))
+	parts = append(parts, stateStyle.Render(label))
 	if m.connSession != "" {
 		parts = append(parts, "session="+m.connSession)
-	}
-	if m.connReason != "" {
-		parts = append(parts, "reason="+m.connReason)
 	}
 	if m.haveLatency {
 		parts = append(parts, fmt.Sprintf("latency=%dms", int64(m.latencyMs)))
@@ -203,11 +211,12 @@ var tableCols = []string{"NAME", "KIND", "STATE", "RESTARTS", "URL"}
 // "healthy" and an http row's registry-derived "active" are the same fact
 // from a user's point of view, so both display as "active" — but only once
 // the tunnel agrees: a healthy stdio row whose registration is still
-// pending, was rejected, or is disabled shows that instead, since a healthy
-// local process with no public URL isn't "active" to anyone. Any other
-// supervisor state (restarting, failed, ...) wins over the registration,
-// keeping a local problem visible. The model itself keeps whichever values
-// it was given (tests that assert on stored state are unaffected).
+// pending, was rejected or taken over, or is disabled shows that instead,
+// since a healthy local process with no public URL isn't "active" to
+// anyone. Any other supervisor state (restarting, failed, ...) wins over
+// the registration, keeping a local problem visible. The model itself keeps
+// whichever values it was given (tests that assert on stored state are
+// unaffected).
 func displayState(s Server) string {
 	if s.State != "healthy" {
 		return s.State
@@ -264,11 +273,11 @@ func (m Model) renderTable() string {
 		if i == m.cursor {
 			rowStyle, prefix = styleSelected, "> "
 		}
-		// The STATE cell is rendered on its own so "rejected" can carry the
-		// error style without its reset cutting a selected row's highlight
-		// short for the cells after it.
+		// The STATE cell is rendered on its own so "rejected"/"taken_over"
+		// can carry the error style without its reset cutting a selected
+		// row's highlight short for the cells after it.
 		stateStyle := rowStyle
-		if state == RegistrationRejected {
+		if registrationProblem(state) {
 			stateStyle = styleBad
 		}
 		row := rowStyle.Render(prefix+padRight(s.Name, nameW)+"  "+padRight(s.Kind, kindW)+"  ") +

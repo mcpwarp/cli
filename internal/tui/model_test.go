@@ -351,6 +351,113 @@ func TestSnapshotPendingRejectedThenActive(t *testing.T) {
 	}
 }
 
+// TestServiceChangedUpdatesRowAndLastError: a ServiceChanged updates its
+// row's registration (and, for http, State) and URL, and one carrying a
+// Code/Hint sets the `last error` pair — while a plain transition leaves
+// that pair as it was.
+func TestServiceChangedUpdatesRowAndLastError(t *testing.T) {
+	m := newTestModel([]Server{{Name: "deepwiki", Kind: "http", State: RegistrationPending, Registration: RegistrationPending}}, nil)
+
+	next, _ := m.Update(controlEventMsg{evt: eventbus.ServiceChanged{Name: "deepwiki", Kind: "http", State: RegistrationActive, URL: "https://dw.example/mcp"}})
+	m = next.(Model)
+	if s := m.servers[0]; s.State != RegistrationActive || s.Registration != RegistrationActive || s.URL != "https://dw.example/mcp" {
+		t.Fatalf("after active: %+v, want active with URL", s)
+	}
+	if m.lastErr != "" || m.lastErrHint != "" {
+		t.Fatalf("a transition without Code/Hint must not set last error, got %q / %q", m.lastErr, m.lastErrHint)
+	}
+
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ServiceChanged{Name: "deepwiki", Kind: "http", State: RegistrationRejected, Code: "QUOTA_EXCEEDED", Message: "server limit reached", Hint: "upgrade your plan"}})
+	m = next.(Model)
+	if s := m.servers[0]; s.State != RegistrationRejected || s.URL != "" {
+		t.Fatalf("after rejected: %+v, want rejected with no URL", s)
+	}
+	if m.lastErr != "[QUOTA_EXCEEDED] deepwiki: server limit reached" || m.lastErrHint != "upgrade your plan" {
+		t.Fatalf("last error = %q / %q", m.lastErr, m.lastErrHint)
+	}
+
+	// A hint with no code or message still sets the line, without the
+	// [CODE] prefix and with the state in place of the message.
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ServiceChanged{Name: "deepwiki", Kind: "http", State: RegistrationTakenOver, Hint: "press e to reclaim it"}})
+	m = next.(Model)
+	if m.lastErr != "deepwiki: taken_over" || m.lastErrHint != "press e to reclaim it" {
+		t.Fatalf("last error = %q / %q", m.lastErr, m.lastErrHint)
+	}
+
+	// A code with no hint replaces the line and clears the previous hint,
+	// rather than leaving one that belonged to another error.
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ServiceChanged{Name: "deepwiki", Kind: "http", State: RegistrationRejected, Code: "INVALID_NAME"}})
+	m = next.(Model)
+	if m.lastErr != "[INVALID_NAME] deepwiki: rejected" || m.lastErrHint != "" {
+		t.Fatalf("last error = %q / %q, want the code's line and no hint", m.lastErr, m.lastErrHint)
+	}
+
+	// Back to active: the row recovers, the last-error pair stays sticky
+	// like AppError's.
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ServiceChanged{Name: "deepwiki", Kind: "http", State: RegistrationActive, URL: "https://dw.example/mcp"}})
+	m = next.(Model)
+	if got := displayState(m.servers[0]); got != RegistrationActive || m.servers[0].URL != "https://dw.example/mcp" {
+		t.Fatalf("after re-activation: display %q, URL %q", got, m.servers[0].URL)
+	}
+	if m.lastErr != "[INVALID_NAME] deepwiki: rejected" {
+		t.Fatalf("last error should stay sticky, got %q", m.lastErr)
+	}
+}
+
+// TestServiceChangedStdioKeepsSupervisorState: on a stdio row only the
+// registration moves — State stays the supervisor's — and pending/disabled
+// keep the row's URL (it is stable and works again once back), while
+// taken_over clears it like rejected does.
+func TestServiceChangedStdioKeepsSupervisorState(t *testing.T) {
+	m := newTestModel([]Server{{Name: "fs", Kind: "stdio", State: "healthy", Registration: RegistrationActive, URL: "https://fs.example/mcp"}}, nil)
+
+	next, _ := m.Update(controlEventMsg{evt: eventbus.ServiceChanged{Name: "fs", Kind: "stdio", State: RegistrationDisabled}})
+	m = next.(Model)
+	if s := m.servers[0]; s.State != "healthy" || s.Registration != RegistrationDisabled || s.URL != "https://fs.example/mcp" {
+		t.Fatalf("after disabled: %+v, want healthy/disabled with the URL kept", s)
+	}
+
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ServiceChanged{Name: "fs", Kind: "stdio", State: RegistrationPending}})
+	m = next.(Model)
+	if s := m.servers[0]; s.Registration != RegistrationPending || s.URL != "https://fs.example/mcp" {
+		t.Fatalf("after pending: %+v, want pending with the URL kept", s)
+	}
+
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ServiceChanged{Name: "fs", Kind: "stdio", State: RegistrationTakenOver, Code: "TAKEN_OVER"}})
+	m = next.(Model)
+	if s := m.servers[0]; s.State != "healthy" || displayState(s) != RegistrationTakenOver || s.URL != "" {
+		t.Fatalf("after taken_over: %+v (display %q), want healthy/taken_over with no URL", s, displayState(s))
+	}
+}
+
+// TestServiceChangedUnknownNameAddsRow: like ServerStateChanged and
+// SnapshotMsg, a transition for a name not yet in the table adds its row,
+// seeded with the registration as its State — for stdio too, so the STATE
+// cell isn't blank until the supervisor's first ServerStateChanged.
+func TestServiceChangedUnknownNameAddsRow(t *testing.T) {
+	m := newTestModel([]Server{{Name: "fs", Kind: "stdio", State: "healthy"}}, nil)
+	next, _ := m.Update(controlEventMsg{evt: eventbus.ServiceChanged{Name: "anki", Kind: "http", State: RegistrationActive, URL: "https://anki.example/mcp"}})
+	m = next.(Model)
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ServiceChanged{Name: "git", Kind: "stdio", State: RegistrationPending}})
+	m = next.(Model)
+	if len(m.servers) != 3 {
+		t.Fatalf("expected anki and git appended, got %+v", m.servers)
+	}
+	if s := m.servers[1]; s.Name != "anki" || s.Kind != "http" || s.State != RegistrationActive || s.URL != "https://anki.example/mcp" {
+		t.Fatalf("appended http row = %+v", s)
+	}
+	if s := m.servers[2]; s.Name != "git" || s.Kind != "stdio" || s.State != RegistrationPending || displayState(s) != RegistrationPending {
+		t.Fatalf("appended stdio row = %+v (display %q), want pending", s, displayState(s))
+	}
+
+	// The supervisor's first report then takes the stdio row's State over.
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ServerStateChanged{Name: "git", State: "healthy"}})
+	m = next.(Model)
+	if got := displayState(m.servers[2]); got != RegistrationPending {
+		t.Fatalf("healthy stdio row with a pending registration displays %q, want pending", got)
+	}
+}
+
 // TestBackgroundColorPicksSecondaryGray: the terminal's background reply
 // swaps the secondary-text gray, and neither variant is the theme-defined
 // ANSI 8 that vanished on a mid-gray background.

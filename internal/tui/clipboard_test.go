@@ -136,15 +136,16 @@ func TestCopyKeyCopiesFullURLAndConfirms(t *testing.T) {
 	}
 }
 
-// TestCopyKeyWithoutURLCopiesNothing: `c` on a pending or rejected row
-// shows "nothing to copy" and returns only the clearing tick — no OSC 52,
-// no native write.
+// TestCopyKeyWithoutURLCopiesNothing: `c` on a pending, rejected or
+// taken-over row shows "nothing to copy" and returns only the clearing
+// tick — no OSC 52, no native write.
 func TestCopyKeyWithoutURLCopiesNothing(t *testing.T) {
 	for _, tc := range []struct {
 		name, state, want string
 	}{
 		{"pending", RegistrationPending, "nothing to copy: deepwiki has no public URL yet"},
 		{"rejected", RegistrationRejected, "nothing to copy: deepwiki has no public URL right now"},
+		{"taken_over", RegistrationTakenOver, "nothing to copy: deepwiki has no public URL right now"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clip := useFakeClipboard(t, nil)

@@ -64,6 +64,9 @@ func writeControlLine(w io.Writer, color bool, evt any) {
 		glyph, style := glyphFor(serverStateSeverity(e.State))
 		fmt.Fprintf(w, "%s %s: %s (restarts=%d)\n", colorize(color, style, glyph), e.Name, displayState(e.State), e.Restarts)
 
+	case eventbus.ServiceChanged:
+		writeServiceLine(w, color, e)
+
 	case eventbus.StreamOpened:
 		fmt.Fprintf(w, "%s stream %d opened\n", colorize(color, colorDim, "·"), e.ID)
 
@@ -88,6 +91,45 @@ func writeControlLine(w io.Writer, color bool, evt any) {
 	default:
 		fmt.Fprintf(w, "%s unknown event %#v\n", colorize(color, colorYellow, "!"), evt)
 	}
+}
+
+// writeServiceLine prints one registration transition (DESIGN.md §9's STATE
+// vocabulary), the only place plain mode shows a public URL:
+//
+//	✓ anki: active https://anki-x.tunnel.mcpwarp.io/mcp
+//	✗ deepwiki: rejected (QUOTA_EXCEEDED): server limit reached · upgrade your plan at ...
+//	✗ notes: taken_over (TAKEN_OVER) · press e to reclaim it
+//	· fs: disabled
+//	· fs: pending
+//
+// The URL, " (CODE)", ": message" and " · hint" parts each appear only when
+// the event carries them, whatever the state. The hint separator is the
+// AppError line's " · ", not a dash, since hints carry em dashes of their
+// own. An unknown state prints with "!".
+func writeServiceLine(w io.Writer, color bool, e eventbus.ServiceChanged) {
+	glyph, style := "!", colorYellow
+	switch e.State {
+	case "active":
+		glyph, style = "✓", colorGreen
+	case "rejected", "taken_over":
+		glyph, style = "✗", colorRed
+	case "pending", "disabled":
+		glyph, style = "·", colorDim
+	}
+	line := colorize(color, style, glyph) + " " + e.Name + ": " + e.State
+	if e.URL != "" {
+		line += " " + e.URL
+	}
+	if e.Code != "" {
+		line += " (" + e.Code + ")"
+	}
+	if e.Message != "" {
+		line += ": " + e.Message
+	}
+	if e.Hint != "" {
+		line += " · " + e.Hint
+	}
+	fmt.Fprintln(w, line)
 }
 
 // writeLogLine writes a forwarded LogLine to w. Callers pass the package's

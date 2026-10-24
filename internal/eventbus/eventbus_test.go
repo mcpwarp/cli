@@ -20,6 +20,28 @@ func TestBus_ControlIsLossless(t *testing.T) {
 	}
 }
 
+// TestBus_ServiceChangedIsLosslessAndOrdered: a service's registration
+// transitions ride Control, so a burst (pending → rejected → active) must
+// arrive whole and in order, fields intact — a dropped or reordered one
+// would leave the STATE column showing a stale state.
+func TestBus_ServiceChangedIsLosslessAndOrdered(t *testing.T) {
+	b := New(3)
+	want := []ServiceChanged{
+		{Name: "deepwiki", Kind: "http", State: "pending"},
+		{Name: "deepwiki", Kind: "http", State: "rejected", Code: "QUOTA_EXCEEDED", Hint: "upgrade your plan"},
+		{Name: "deepwiki", Kind: "http", State: "active", URL: "https://deepwiki.example/mcp"},
+	}
+	for _, evt := range want {
+		b.Publish(evt)
+	}
+	for i, w := range want {
+		got, ok := (<-b.Control).(ServiceChanged)
+		if !ok || got != w {
+			t.Fatalf("event %d = %#v, want %#v", i, got, w)
+		}
+	}
+}
+
 // TestBus_CloseDoesNotPanicUnderLiveProducers races Publish/PublishTelemetry
 // against Close — a bare close(chan) would panic ("send on closed
 // channel") if a send lands after the close. Run with -race.

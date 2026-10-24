@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -528,6 +529,507 @@ func TestSupervisor_StopContext_ReturnsEarlyOnCancellation(t *testing.T) {
 	s.StopContext(ctx)
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("StopContext took %v — did not return early on ctx.Done()", elapsed)
+	}
+}
+
+// gatedSpawn is a Deps.Spawn that counts calls, signals entered on each
+// one, and holds every spawn until release is closed — so a test can pile
+// callers up behind one in-flight spawn, or land Disable() inside it. The
+// children it returns stay alive until closed.
+type gatedSpawn struct {
+	t       *testing.T
+	entered chan struct{}
+	release chan struct{}
+
+	mu       sync.Mutex
+	spawns   int
+	children []*bridge.StdioChild
+}
+
+func newGatedSpawn(t *testing.T) *gatedSpawn {
+	return &gatedSpawn{t: t, entered: make(chan struct{}, 64), release: make(chan struct{})}
+}
+
+func (g *gatedSpawn) spawn(bridge.SpawnSpec, *slog.Logger, string) (*bridge.StdioChild, error) {
+	g.mu.Lock()
+	g.spawns++
+	g.mu.Unlock()
+	g.entered <- struct{}{}
+	<-g.release
+	c := spawnTestChild(g.t, 0, time.Hour)
+	g.mu.Lock()
+	g.children = append(g.children, c)
+	g.mu.Unlock()
+	return c, nil
+}
+
+func (g *gatedSpawn) count() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.spawns
+}
+
+func (g *gatedSpawn) lastChild() *bridge.StdioChild {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.children) == 0 {
+		return nil
+	}
+	return g.children[len(g.children)-1]
+}
+
+func waitEntered(t *testing.T, g *gatedSpawn) {
+	t.Helper()
+	select {
+	case <-g.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("spawn was never called")
+	}
+}
+
+// TestSupervisor_EnsureRunning_DisabledStartsChildAndWaitsUntilHealthy:
+// from Disabled, EnsureRunning spawns through the Enable path and only
+// returns once the new child is the bridge's live child and the state is
+// Healthy — the spawn is held open first to prove it actually waits.
+func TestSupervisor_EnsureRunning_DisabledStartsChildAndWaitsUntilHealthy(t *testing.T) {
+	child := spawnTestChild(t, 0, time.Hour)
+	fb := &fakeBridge{}
+	g := newGatedSpawn(t)
+	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: fb}, Deps{
+		Sleep: func(time.Duration) {},
+		Spawn: g.spawn,
+	})
+	t.Cleanup(func() { s.Stop() })
+
+	s.Disable()
+
+	errc := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		errc <- s.EnsureRunning(ctx)
+	}()
+
+	waitEntered(t, g)
+	select {
+	case err := <-errc:
+		t.Fatalf("EnsureRunning returned (%v) before the spawn finished", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(g.release)
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("EnsureRunning: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("EnsureRunning never returned")
+	}
+	if got := s.GetState(); got != Healthy {
+		t.Fatalf("want healthy as soon as EnsureRunning returns, got %v", got)
+	}
+	if fb.replacedCount() != 1 {
+		t.Fatalf("want the new child handed to the bridge once, got %d", fb.replacedCount())
+	}
+	if g.count() != 1 {
+		t.Fatalf("want 1 spawn, got %d", g.count())
+	}
+}
+
+// TestSupervisor_EnsureRunning_ConcurrentCallersSpawnOnce piles several
+// EnsureRunning callers and a dashboard-style Enable() onto one disabled
+// supervisor while the first spawn is held open: all of them must share
+// that one spawn, and every EnsureRunning caller must see it succeed.
+func TestSupervisor_EnsureRunning_ConcurrentCallersSpawnOnce(t *testing.T) {
+	child := spawnTestChild(t, 0, time.Hour)
+	fb := &fakeBridge{}
+	g := newGatedSpawn(t)
+	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: fb}, Deps{
+		Sleep: func(time.Duration) {},
+		Spawn: g.spawn,
+	})
+	t.Cleanup(func() { s.Stop() })
+
+	s.Disable()
+
+	const callers = 8
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- s.EnsureRunning(ctx)
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.Enable()
+	}()
+
+	waitEntered(t, g)
+	time.Sleep(50 * time.Millisecond) // let the rest reach the in-flight spawn
+	close(g.release)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("EnsureRunning: %v", err)
+		}
+	}
+	if g.count() != 1 {
+		t.Fatalf("want exactly 1 spawn across all callers, got %d", g.count())
+	}
+	if fb.replacedCount() != 1 {
+		t.Fatalf("want 1 ReplaceChild, got %d", fb.replacedCount())
+	}
+	if got := s.GetState(); got != Healthy {
+		t.Fatalf("want healthy, got %v", got)
+	}
+}
+
+// TestSupervisor_EnsureRunning_HealthyReturnsImmediately: an already
+// cancelled ctx proves the Healthy path never waits on anything, and no
+// spawn happens.
+func TestSupervisor_EnsureRunning_HealthyReturnsImmediately(t *testing.T) {
+	child := spawnTestChild(t, 0, time.Hour)
+	fb := &fakeBridge{}
+	g := newGatedSpawn(t)
+	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: fb}, Deps{
+		Sleep: func(time.Duration) {},
+		Spawn: g.spawn,
+	})
+	t.Cleanup(func() { s.Stop() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.EnsureRunning(ctx); err != nil {
+		t.Fatalf("want nil for a healthy child, got %v", err)
+	}
+	if g.count() != 0 {
+		t.Fatalf("want no spawn for a healthy child, got %d", g.count())
+	}
+}
+
+// TestSupervisor_EnsureRunning_DisableDuringWaitWins lands Disable() while
+// EnsureRunning's spawn is in flight: EnsureRunning must report
+// ErrDisabled, the supervisor must end Disabled, and the child spawned for
+// it must be closed rather than left running.
+func TestSupervisor_EnsureRunning_DisableDuringWaitWins(t *testing.T) {
+	child := spawnTestChild(t, 0, time.Hour)
+	fb := &fakeBridge{}
+	g := newGatedSpawn(t)
+	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: fb}, Deps{
+		Sleep: func(time.Duration) {},
+		Spawn: g.spawn,
+	})
+	t.Cleanup(func() { s.Stop() })
+
+	s.Disable()
+
+	errc := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		errc <- s.EnsureRunning(ctx)
+	}()
+	waitEntered(t, g)
+
+	disableDone := make(chan struct{})
+	go func() {
+		s.Disable()
+		close(disableDone)
+	}()
+	waitForState(t, s, Disabled, time.Second) // terminate() has flipped the state and is waiting on the spawn
+	close(g.release)
+
+	select {
+	case err := <-errc:
+		if !errors.Is(err, ErrDisabled) {
+			t.Fatalf("want ErrDisabled, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("EnsureRunning never returned")
+	}
+	select {
+	case <-disableDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Disable never returned")
+	}
+	if got := s.GetState(); got != Disabled {
+		t.Fatalf("want disabled, got %v", got)
+	}
+	spawned := g.lastChild()
+	if spawned == nil {
+		t.Fatal("spawn never produced a child")
+	}
+	waitForChildExit(t, spawned, 3*time.Second)
+}
+
+// TestSupervisor_EnsureRunning_DisableInFlightRefuses: EnsureRunning
+// called while Disable() is still closing the child refuses outright
+// rather than spawning behind it.
+func TestSupervisor_EnsureRunning_DisableInFlightRefuses(t *testing.T) {
+	child := spawnTestChild(t, 0, time.Hour)
+	fb := &fakeBridge{}
+	g := newGatedSpawn(t)
+	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: fb}, Deps{
+		Sleep: func(time.Duration) {},
+		Spawn: g.spawn,
+	})
+	t.Cleanup(func() { s.Stop() })
+
+	s.mu.Lock()
+	s.state = Disabled
+	s.terminating = make(chan struct{}) // a Disable() mid-close
+	s.mu.Unlock()
+
+	if err := s.EnsureRunning(context.Background()); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("want ErrDisabled while a Disable is in flight, got %v", err)
+	}
+	if g.count() != 0 {
+		t.Fatalf("want no spawn, got %d", g.count())
+	}
+	s.mu.Lock()
+	s.terminating = nil
+	s.mu.Unlock()
+}
+
+// TestSupervisor_EnsureRunning_FailedRefusesWithoutSpawning: a supervisor
+// that gave up stays Failed with its failure count intact — only an
+// explicit Enable forgives a crash loop.
+func TestSupervisor_EnsureRunning_FailedRefusesWithoutSpawning(t *testing.T) {
+	child := spawnTestChild(t, 1, 0)
+	fb := &fakeBridge{}
+	fixedNow := time.Unix(0, 0)
+	var mu sync.Mutex
+	spawns := 0
+	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: fb}, Deps{
+		Sleep: func(time.Duration) {},
+		Now:   func() time.Time { return fixedNow },
+		Spawn: func(bridge.SpawnSpec, *slog.Logger, string) (*bridge.StdioChild, error) {
+			mu.Lock()
+			spawns++
+			mu.Unlock()
+			return spawnTestChild(t, 1, 0), nil
+		},
+	})
+	t.Cleanup(func() { s.Stop() })
+
+	waitForState(t, s, Failed, 5*time.Second)
+	mu.Lock()
+	before := spawns
+	mu.Unlock()
+
+	if err := s.EnsureRunning(context.Background()); !errors.Is(err, ErrFailed) {
+		t.Fatalf("want ErrFailed, got %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	after := spawns
+	mu.Unlock()
+	if after != before {
+		t.Fatalf("EnsureRunning on a failed supervisor spawned (%d -> %d)", before, after)
+	}
+	if got := s.GetState(); got != Failed {
+		t.Fatalf("want failed, got %v", got)
+	}
+	s.mu.Lock()
+	failures := s.consecutiveFailures
+	s.mu.Unlock()
+	if failures != maxConsecutiveFailures {
+		t.Fatalf("want consecutiveFailures left at %d, got %d", maxConsecutiveFailures, failures)
+	}
+}
+
+// TestSupervisor_EnsureRunning_BackoffRefusesWithoutShortcutting holds a
+// crash restart inside its backoff sleep: EnsureRunning must refuse with
+// ErrRestarting and leave the sleep, the failure count and the spawn
+// count alone.
+func TestSupervisor_EnsureRunning_BackoffRefusesWithoutShortcutting(t *testing.T) {
+	child := spawnTestChild(t, 1, 0)
+	fb := &fakeBridge{}
+	sleepGate := make(chan struct{})
+	var mu sync.Mutex
+	spawns := 0
+	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: fb}, Deps{
+		Sleep: func(time.Duration) { <-sleepGate },
+		Spawn: func(bridge.SpawnSpec, *slog.Logger, string) (*bridge.StdioChild, error) {
+			mu.Lock()
+			spawns++
+			mu.Unlock()
+			return spawnTestChild(t, 0, time.Hour), nil
+		},
+	})
+	t.Cleanup(func() {
+		s.Stop()         // cuts the backoff short via sleepCancel
+		close(sleepGate) // then frees the abandoned Sleep goroutine
+	})
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		s.mu.Lock()
+		backingOff := s.backingOff
+		s.mu.Unlock()
+		if backingOff {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("supervisor never entered its backoff sleep")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := s.EnsureRunning(context.Background()); !errors.Is(err, ErrRestarting) {
+		t.Fatalf("want ErrRestarting during backoff, got %v", err)
+	}
+	if got := s.GetState(); got != Restarting {
+		t.Fatalf("want still restarting, got %v", got)
+	}
+	s.mu.Lock()
+	failures, backingOff := s.consecutiveFailures, s.backingOff
+	s.mu.Unlock()
+	if failures != 1 || !backingOff {
+		t.Fatalf("backoff altered: consecutiveFailures=%d backingOff=%v", failures, backingOff)
+	}
+	mu.Lock()
+	got := spawns
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("want no spawn while backing off, got %d", got)
+	}
+}
+
+// TestSupervisor_EnsureRunning_CtxBoundsWaitButSpawnCompletes: a ctx that
+// runs out mid-spawn returns its error to the caller, but the spawn it
+// started still lands Healthy for the next request.
+func TestSupervisor_EnsureRunning_CtxBoundsWaitButSpawnCompletes(t *testing.T) {
+	child := spawnTestChild(t, 0, time.Hour)
+	fb := &fakeBridge{}
+	g := newGatedSpawn(t)
+	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: fb}, Deps{
+		Sleep: func(time.Duration) {},
+		Spawn: g.spawn,
+	})
+	t.Cleanup(func() { s.Stop() })
+
+	s.Disable()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := s.EnsureRunning(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want DeadlineExceeded, got %v", err)
+	}
+	waitEntered(t, g)
+	close(g.release)
+	waitForState(t, s, Healthy, 3*time.Second)
+	if g.count() != 1 {
+		t.Fatalf("want 1 spawn, got %d", g.count())
+	}
+}
+
+// TestSupervisor_EnsureRunning_SpawnFailureFromDisabledReportsBackoff: a
+// spawn that fails outright hands off to handleExit's crash backoff, which
+// replaces s.restarting with its own channel; the waiter on the enable's
+// channel must still be released and report ErrRestarting, with the
+// backoff left running.
+func TestSupervisor_EnsureRunning_SpawnFailureFromDisabledReportsBackoff(t *testing.T) {
+	child := spawnTestChild(t, 0, time.Hour)
+	fb := &fakeBridge{}
+	sleepGate := make(chan struct{})
+	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: fb}, Deps{
+		Sleep: func(time.Duration) { <-sleepGate },
+		Spawn: func(bridge.SpawnSpec, *slog.Logger, string) (*bridge.StdioChild, error) {
+			return nil, errors.New("exec: no such file")
+		},
+	})
+	t.Cleanup(func() {
+		s.Stop()         // cuts the backoff short via sleepCancel
+		close(sleepGate) // then frees the abandoned Sleep goroutine
+	})
+
+	s.Disable()
+
+	errc := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		errc <- s.EnsureRunning(ctx)
+	}()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, ErrRestarting) {
+			t.Fatalf("want ErrRestarting after a failed spawn, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("EnsureRunning stranded after a failed spawn")
+	}
+	s.mu.Lock()
+	state, backingOff := s.state, s.backingOff
+	s.mu.Unlock()
+	if state != Restarting || !backingOff {
+		t.Fatalf("want restarting with a backoff in progress, got state=%v backingOff=%v", state, backingOff)
+	}
+}
+
+// TestSupervisor_EnsureRunning_JoinsInFlightRestart: EnsureRunning called
+// while a Restart() spawn is held open waits on that spawn rather than
+// refusing or starting its own, and succeeds once it lands.
+func TestSupervisor_EnsureRunning_JoinsInFlightRestart(t *testing.T) {
+	child := spawnTestChild(t, 0, time.Hour)
+	fb := &fakeBridge{}
+	g := newGatedSpawn(t)
+	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: fb}, Deps{
+		Sleep: func(time.Duration) {},
+		Spawn: g.spawn,
+	})
+	t.Cleanup(func() { s.Stop() })
+
+	restartDone := make(chan struct{})
+	go func() {
+		s.Restart()
+		close(restartDone)
+	}()
+	waitEntered(t, g)
+
+	errc := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		errc <- s.EnsureRunning(ctx)
+	}()
+	select {
+	case err := <-errc:
+		t.Fatalf("EnsureRunning returned (%v) before the restart's spawn finished", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(g.release)
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("EnsureRunning: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("EnsureRunning never returned")
+	}
+	<-restartDone
+	if g.count() != 1 {
+		t.Fatalf("want the restart's spawn only, got %d", g.count())
+	}
+}
+
+func TestSupervisor_EnsureRunning_StoppedRefuses(t *testing.T) {
+	child := spawnTestChild(t, 0, time.Hour)
+	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: &fakeBridge{}}, Deps{Sleep: func(time.Duration) {}})
+	s.Stop()
+	if err := s.EnsureRunning(context.Background()); !errors.Is(err, ErrStopped) {
+		t.Fatalf("want ErrStopped, got %v", err)
 	}
 }
 

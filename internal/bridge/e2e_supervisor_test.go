@@ -1,6 +1,7 @@
 package bridge_test
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -95,5 +97,64 @@ func TestBridgeSupervisor_CrashRecoveryThroughRealSupervisor(t *testing.T) {
 	}
 	if body["result"] != "pong" {
 		t.Fatalf("unexpected result after supervisor-driven recovery: %+v", body)
+	}
+}
+
+// TestBridgeSupervisor_EnsureRunningLazilyRespawnsDisabledChild wires
+// EnsureChild to a real supervisor's EnsureRunning, the way `up` will: a
+// request reaching a bridge whose child was disabled (before the CLI has
+// seen the dashboard enable) brings the child back and is served, with no
+// Enable() call anywhere.
+func TestBridgeSupervisor_EnsureRunningLazilyRespawnsDisabledChild(t *testing.T) {
+	bin := buildFakeMCPBinary(t)
+	spec := bridge.SpawnSpec{Command: bin}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var sup atomic.Pointer[supervisor.Supervisor]
+	b, err := bridge.StartBridge(bridge.StartBridgeOptions{
+		Name:      "fake",
+		SpawnSpec: spec,
+		Log:       log,
+		EnsureChild: func(ctx context.Context) error {
+			return sup.Load().EnsureRunning(ctx)
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartBridge: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+
+	s := supervisor.New(supervisor.Options{
+		Name:      "fake",
+		SpawnSpec: spec,
+		Log:       log,
+		Child:     b.GetCurrentChild(),
+		Bridge:    b,
+	}, supervisor.Deps{})
+	sup.Store(s)
+	t.Cleanup(s.Stop)
+
+	s.Disable()
+	if !b.GetCurrentChild().HasExited() {
+		t.Fatal("Disable left the bridge's child running")
+	}
+
+	resp, err := http.Post(b.URL(), "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["result"] != "pong" {
+		t.Fatalf("unexpected result after a lazy respawn: %+v", body)
+	}
+	if got := s.GetState(); got != supervisor.Healthy {
+		t.Fatalf("want healthy after the lazy respawn, got %v", got)
 	}
 }

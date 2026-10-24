@@ -40,6 +40,13 @@ const (
 	// bridge, which has no such cap — that 64 KiB figure belongs to the
 	// M3 relay's parser — but keeping the setting here matches DESIGN.md.
 	maxHeaderBytes = 64 * 1024
+	// ensureChildTimeout bounds how long one request waits on
+	// StartBridgeOptions.EnsureChild to bring a down child back up before
+	// falling through to the usual "local server is not running" 502. A
+	// fresh stdio child is normally up well within it; the bound is there
+	// so a slow spawn can't hold the request hostage the way the 5 min
+	// request timeout would (DESIGN.md §7).
+	ensureChildTimeout = 5 * time.Second
 
 	subscriptionIDMetaKey = "io.modelcontextprotocol/subscriptionId"
 )
@@ -122,6 +129,26 @@ type StartBridgeOptions struct {
 	// telemetry (DESIGN.md §3) — the same wiring a supervisor's own
 	// respawned children get via supervisor.Deps.Spawn.
 	Bus *eventbus.Bus
+	// EnsureChild, if non-nil, is the lazy-respawn safety net (DESIGN.md
+	// §7): when a POST carrying a method (a request, a notification or
+	// subscriptions/listen) finds the current child has exited, the bridge
+	// calls it once, with a context bounded by ensureChildTimeout (and by
+	// the request's own context), before routing it. A bare client response
+	// never triggers it: it answers a request from the dead child's own id
+	// space, so a stray late one must not resurrect a disabled service.
+	// Returning nil means the supervisor believes a child is live (normally
+	// one just handed over via ReplaceChild), and the request proceeds
+	// against the current child; a child that has in fact exited, but whose
+	// exit the supervisor hasn't processed yet so it still reads healthy,
+	// still yields the 502. Returning an error refuses the respawn, and the
+	// request gets the same "local server is not running" 502 it would
+	// without EnsureChild. The expected implementation is a
+	// supervisor's EnsureRunning behind a guard: return an error, without
+	// calling EnsureRunning, for a service the user disabled locally (`d`,
+	// §9), so a stray request can never undo that. It runs on the request's
+	// goroutine and must be safe for concurrent calls. Nil keeps the old
+	// behaviour exactly.
+	EnsureChild func(ctx context.Context) error
 }
 
 type pendingEntry struct {
@@ -197,8 +224,9 @@ type Bridge struct {
 	name string
 	log  *slog.Logger
 
-	timeout    time.Duration
-	maxPending int
+	timeout     time.Duration
+	maxPending  int
+	ensureChild func(ctx context.Context) error
 
 	listener net.Listener
 	server   *http.Server
@@ -256,6 +284,7 @@ func StartBridge(opts StartBridgeOptions) (*Bridge, error) {
 		log:           log,
 		timeout:       timeout,
 		maxPending:    maxPending,
+		ensureChild:   opts.EnsureChild,
 		child:         child,
 		session:       newSession(),
 		pushHub:       newPushStreamHub(log.With("server", opts.Name)),
@@ -326,6 +355,22 @@ func (b *Bridge) currentChild() *StdioChild {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.child
+}
+
+// ensureLiveChild runs StartBridgeOptions.EnsureChild when the current
+// child has exited (DESIGN.md §7's lazy respawn). It reports nothing: the
+// caller re-reads currentChild() afterwards, so a successful respawn is
+// picked up through ReplaceChild, and a refused or failed one leaves the
+// dead child in place to produce today's "not running" response.
+func (b *Bridge) ensureLiveChild(parent context.Context) {
+	if b.ensureChild == nil || !b.currentChild().HasExited() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, ensureChildTimeout)
+	defer cancel()
+	if err := b.ensureChild(ctx); err != nil {
+		b.log.Debug("stdio child is down and was not respawned for this request", "server", b.name, "err", err)
+	}
 }
 
 func (b *Bridge) addAbandoned(id int64) {
@@ -861,6 +906,16 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	hasSession := check.kind == sessionOK
 	if hasSession {
 		sessionID = check.sessionID
+	}
+
+	// Every branch below that reaches the child reads currentChild() after
+	// this, so one lazy respawn here covers requests, notifications and
+	// subscriptions/listen alike. A bare client response (!hasMethod) is
+	// left out: it answers the dead child's own request, which a fresh
+	// child never issued, so respawning for it would only resurrect a
+	// disabled service on a stray late reply.
+	if hasMethod {
+		b.ensureLiveChild(r.Context())
 	}
 
 	if method == "subscriptions/listen" {

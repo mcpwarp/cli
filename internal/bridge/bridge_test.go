@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -927,4 +929,150 @@ func TestBridge_ConcurrentRequestsGetDistinctInternalIDsRewrittenBack(t *testing
 	for err := range errs {
 		t.Error(err)
 	}
+}
+
+// startEnsureBridge starts a fakemcp bridge whose EnsureChild runs ensure
+// against the bridge itself (nil leaves EnsureChild unset). The bridge is
+// published through an atomic so the handler goroutine's read of it is
+// ordered after StartBridge returns, as far as -race is concerned.
+func startEnsureBridge(t *testing.T, ensure func(ctx context.Context, b *Bridge) error) *Bridge {
+	t.Helper()
+	bin := buildFakeMCP(t)
+	var self atomic.Pointer[Bridge]
+	opts := StartBridgeOptions{
+		Name:      "fake",
+		SpawnSpec: SpawnSpec{Command: bin},
+		Log:       testLogger(),
+	}
+	if ensure != nil {
+		opts.EnsureChild = func(ctx context.Context) error { return ensure(ctx, self.Load()) }
+	}
+	b, err := StartBridge(opts)
+	if err != nil {
+		t.Fatalf("StartBridge: %v", err)
+	}
+	self.Store(b)
+	t.Cleanup(func() { _ = b.Close() })
+	return b
+}
+
+// killCurrentChild closes the bridge's live child directly (as a
+// supervisor Disable would) and returns once it has exited.
+func killCurrentChild(t *testing.T, b *Bridge) {
+	t.Helper()
+	child := b.GetCurrentChild()
+	_ = child.Close()
+	if !child.HasExited() {
+		t.Fatal("child still running after Close")
+	}
+}
+
+func assertNotRunning(t *testing.T, resp *http.Response) {
+	t.Helper()
+	if resp.StatusCode != 502 {
+		resp.Body.Close()
+		t.Fatalf("want 502 for a down child, got %d", resp.StatusCode)
+	}
+	body := decodeBody(t, resp)
+	if body["error"] != "local server is not running" {
+		t.Fatalf("want the existing not-running body, got %+v", body)
+	}
+}
+
+// TestBridge_EnsureChild_LazySpawnServesRequest: a request that finds the
+// child down calls EnsureChild once with a bounded context, and is then
+// served by the child EnsureChild handed over; a live child never
+// triggers EnsureChild.
+func TestBridge_EnsureChild_LazySpawnServesRequest(t *testing.T) {
+	var calls atomic.Int32
+	var deadlineOK atomic.Bool
+	b := startEnsureBridge(t, func(ctx context.Context, b *Bridge) error {
+		calls.Add(1)
+		if dl, ok := ctx.Deadline(); ok && time.Until(dl) <= ensureChildTimeout {
+			deadlineOK.Store(true)
+		}
+		c, err := NewStdioChild(SpawnSpec{Command: buildFakeMCP(t)}, testLogger(), "fake")
+		if err != nil {
+			return err
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		b.ReplaceChild(c)
+		return nil
+	})
+
+	live := postJSON(t, b.URL(), map[string]any{"jsonrpc": "2.0", "id": 1, "method": "ping"}, nil)
+	if decodeBody(t, live)["result"] != "pong" {
+		t.Fatal("ping against the initial child failed")
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("EnsureChild called %d times for a live child", calls.Load())
+	}
+
+	killCurrentChild(t, b)
+
+	resp := postJSON(t, b.URL(), map[string]any{"jsonrpc": "2.0", "id": 2, "method": "ping"}, nil)
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		t.Fatalf("want 200 after a lazy spawn, got %d", resp.StatusCode)
+	}
+	body := decodeBody(t, resp)
+	if body["result"] != "pong" || body["id"] != float64(2) {
+		t.Fatalf("unexpected body after lazy spawn: %+v", body)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("want EnsureChild called once, got %d", calls.Load())
+	}
+	if !deadlineOK.Load() {
+		t.Fatal("EnsureChild's context carried no deadline within ensureChildTimeout")
+	}
+}
+
+// TestBridge_EnsureChild_ErrorKeepsNotRunningResponse: an EnsureChild
+// that refuses (a locally disabled service) leaves the request with the
+// same 502 it gets without one.
+func TestBridge_EnsureChild_ErrorKeepsNotRunningResponse(t *testing.T) {
+	var calls atomic.Int32
+	b := startEnsureBridge(t, func(context.Context, *Bridge) error {
+		calls.Add(1)
+		return errors.New("disabled locally")
+	})
+	killCurrentChild(t, b)
+
+	assertNotRunning(t, postJSON(t, b.URL(), map[string]any{"jsonrpc": "2.0", "id": 1, "method": "ping"}, nil))
+	if calls.Load() != 1 {
+		t.Fatalf("want EnsureChild consulted once, got %d", calls.Load())
+	}
+
+	// Notifications take the same route to the child, and the same refusal.
+	note := postJSON(t, b.URL(), map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"}, nil)
+	assertNotRunning(t, note)
+	if calls.Load() != 2 {
+		t.Fatalf("want EnsureChild consulted for the notification too, got %d", calls.Load())
+	}
+}
+
+// TestBridge_EnsureChild_BareResponseDoesNotRespawn: a client response
+// answers a request in the dead child's id space, so it must never call
+// EnsureChild — a stray late one would otherwise resurrect a disabled
+// service. It gets the existing not-running 502.
+func TestBridge_EnsureChild_BareResponseDoesNotRespawn(t *testing.T) {
+	var calls atomic.Int32
+	b := startEnsureBridge(t, func(context.Context, *Bridge) error {
+		calls.Add(1)
+		return nil
+	})
+	killCurrentChild(t, b)
+
+	assertNotRunning(t, postJSON(t, b.URL(), map[string]any{"jsonrpc": "2.0", "id": 5, "result": map[string]any{}}, nil))
+	if calls.Load() != 0 {
+		t.Fatalf("want EnsureChild never called for a bare client response, got %d", calls.Load())
+	}
+}
+
+// TestBridge_EnsureChild_NilUnchanged: without EnsureChild a down child
+// answers exactly as before.
+func TestBridge_EnsureChild_NilUnchanged(t *testing.T) {
+	b := startEnsureBridge(t, nil)
+	killCurrentChild(t, b)
+	assertNotRunning(t, postJSON(t, b.URL(), map[string]any{"jsonrpc": "2.0", "id": 1, "method": "ping"}, nil))
 }

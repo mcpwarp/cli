@@ -11,6 +11,8 @@ package supervisor
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"math/rand"
@@ -37,6 +39,15 @@ const (
 	Failed     State = "failed"
 	Disabled   State = "disabled"
 	Stopped    State = "stopped"
+)
+
+// EnsureRunning's refusals, wrapped with the service name so callers can
+// errors.Is them while logs still say which service refused.
+var (
+	ErrDisabled   = errors.New("service is disabled")
+	ErrFailed     = errors.New("service gave up restarting after too many consecutive crashes; waiting for an explicit enable")
+	ErrRestarting = errors.New("service is restarting after a crash; waiting out its backoff")
+	ErrStopped    = errors.New("supervisor is stopped")
 )
 
 // SupervisedBridge is the subset of bridge.Bridge the supervisor drives —
@@ -109,6 +120,11 @@ type Supervisor struct {
 	restarting          chan struct{} // non-nil while a restart/enable is in flight
 	terminating         chan struct{} // non-nil while disable()/stop() is in flight
 	sleepCancel         chan struct{} // non-nil while a backoff sleep is in flight; closed to cut it short
+	// backingOff is true from the moment handleExit schedules a crash
+	// restart until its backoff sleep ends — the part of Restarting that
+	// EnsureRunning refuses rather than waits on (DESIGN.md §7: a lazy
+	// respawn must never shortcut the crash backoff).
+	backingOff bool
 }
 
 // New constructs a Supervisor already wired to opts.Child. Pass a zero
@@ -255,35 +271,142 @@ func (s *Supervisor) terminate(target State, ctx context.Context) {
 // Enable respawns the child immediately (no backoff) with fresh
 // backoff/failure counters — the tunnel's remote enable{id}. A no-op
 // unless the current state is Disabled or Failed.
+//
+// The Disabled/Failed check and the move to Restarting happen under one
+// hold of s.mu, so an Enable racing EnsureRunning (a dashboard enable
+// landing just as a request lazily respawns the same child) coalesces
+// into a single spawn: whichever moves first wins, the other sees
+// Restarting and backs off. Two spawns would leak the first child, since
+// the second activate() overwrites s.current without closing it.
 func (s *Supervisor) Enable() {
 	s.mu.Lock()
-	if s.state != Disabled && s.state != Failed {
-		state := s.state
-		s.mu.Unlock()
-		s.log.Debug("enable requested but service is not disabled/failed; ignoring", "name", s.name, "state", state)
-		return
-	}
-	terminating := s.terminating
-	s.mu.Unlock()
-
-	if terminating != nil {
-		<-terminating
-		s.mu.Lock()
+	for {
 		if s.state != Disabled && s.state != Failed {
 			state := s.state
 			s.mu.Unlock()
-			s.log.Debug("enable requested but a race left the service in a non-resurrectable state; ignoring", "name", s.name, "state", state)
+			s.log.Debug("enable requested but service is not disabled/failed; ignoring", "name", s.name, "state", state)
 			return
 		}
+		terminating := s.terminating
+		if terminating == nil {
+			break
+		}
 		s.mu.Unlock()
+		<-terminating
+		s.mu.Lock()
+	}
+	done := s.beginEnableLocked()
+	s.mu.Unlock()
+
+	s.runEnable(done)
+}
+
+// EnsureRunning is the bridge's lazy-respawn safety net (DESIGN.md §7): a
+// request can reach a stdio service's bridge before the CLI has applied
+// the dashboard enable that would respawn its child (§8), so the bridge
+// asks the supervisor to bring the child up itself rather than answering
+// 502 straight away.
+//
+//   - Healthy: returns nil at once, without waiting on anything.
+//   - Disabled: starts the child exactly as Enable does (fresh counters, no
+//     backoff) and waits, bounded by ctx, until activate() has handed it to
+//     the bridge and the state is Healthy.
+//   - Restarting because an Enable/Restart/post-backoff spawn is already in
+//     flight: joins that spawn and waits for it the same way. Concurrent
+//     callers therefore coalesce onto one spawn, since the first one moves
+//     the state to Restarting under s.mu before anyone else can look.
+//   - Restarting while a crash backoff sleep is still running: ErrRestarting,
+//     leaving the backoff and its failure count untouched.
+//   - Failed: ErrFailed, also untouched — only an explicit Enable forgives a
+//     crash loop. Stopped: ErrStopped.
+//
+// A Disable() that lands while EnsureRunning is waiting wins: terminate()
+// flips the state to Disabled before waiting on the in-flight spawn,
+// activate() sees that and closes the child it just spawned, and
+// EnsureRunning returns ErrDisabled. A Disable() still in flight when
+// EnsureRunning is called also yields ErrDisabled, never a spawn.
+//
+// ctx only bounds the wait: a spawn EnsureRunning started keeps going after
+// ctx is done, and the child still comes up Healthy (or crashes into the
+// usual backoff) for the next request.
+func (s *Supervisor) EnsureRunning(ctx context.Context) error {
+	s.mu.Lock()
+	var wait chan struct{}
+	spawn := false
+	switch s.state {
+	case Healthy:
+		s.mu.Unlock()
+		return nil
+	case Disabled:
+		if s.terminating != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("%s: %w", s.name, ErrDisabled)
+		}
+		wait = s.beginEnableLocked()
+		spawn = true
+	case Restarting:
+		if s.backingOff || s.restarting == nil {
+			failures := s.consecutiveFailures
+			s.mu.Unlock()
+			return fmt.Errorf("%s: %w (%d consecutive crashes)", s.name, ErrRestarting, failures)
+		}
+		wait = s.restarting
+	case Failed:
+		failures := s.consecutiveFailures
+		s.mu.Unlock()
+		return fmt.Errorf("%s: %w (%d consecutive crashes)", s.name, ErrFailed, failures)
+	default:
+		s.mu.Unlock()
+		return fmt.Errorf("%s: %w", s.name, ErrStopped)
+	}
+	s.mu.Unlock()
+
+	if spawn {
+		go s.runEnable(wait)
+	}
+	select {
+	case <-wait:
+	case <-ctx.Done():
+		return fmt.Errorf("%s: child not up yet: %w", s.name, ctx.Err())
 	}
 
 	s.mu.Lock()
+	state := s.state
+	failures := s.consecutiveFailures
+	s.mu.Unlock()
+	switch state {
+	case Healthy:
+		return nil
+	case Disabled:
+		return fmt.Errorf("%s: %w", s.name, ErrDisabled)
+	case Failed:
+		return fmt.Errorf("%s: %w (%d consecutive crashes)", s.name, ErrFailed, failures)
+	case Stopped:
+		return fmt.Errorf("%s: %w", s.name, ErrStopped)
+	default:
+		// The spawn failed or the new child crashed straight away, and
+		// handleExit has already scheduled a backoff restart.
+		return fmt.Errorf("%s: %w (%d consecutive crashes)", s.name, ErrRestarting, failures)
+	}
+}
+
+// beginEnableLocked moves a Disabled/Failed supervisor to Restarting with
+// fresh counters and returns the s.restarting channel runEnable closes.
+// The caller holds s.mu and has checked the state and that no terminate()
+// is in flight.
+func (s *Supervisor) beginEnableLocked() chan struct{} {
 	s.consecutiveFailures = 0
+	s.backingOff = false
 	s.state = Restarting
 	done := make(chan struct{})
 	s.restarting = done
-	s.mu.Unlock()
+	return done
+}
+
+// runEnable is the second half of Enable/EnsureRunning: spawn and hand
+// off the child, then release whoever waits on done (terminate(),
+// Restart(), EnsureRunning callers).
+func (s *Supervisor) runEnable(done chan struct{}) {
 	s.publish(Restarting)
 
 	s.activate()
@@ -389,6 +512,7 @@ func (s *Supervisor) handleExit(child *bridge.StdioChild, info bridge.ExitInfo) 
 
 	delay := s.backoffDelayLocked()
 	s.state = Restarting
+	s.backingOff = true
 	done := make(chan struct{})
 	s.restarting = done
 	s.mu.Unlock()
@@ -449,6 +573,7 @@ func (s *Supervisor) restartAfter(delay time.Duration) {
 	if s.sleepCancel == cancel {
 		s.sleepCancel = nil
 	}
+	s.backingOff = false
 	state := s.state
 	s.mu.Unlock()
 	if state == Disabled || state == Stopped {

@@ -440,10 +440,15 @@ type upDeps struct {
 
 	// FatalExit is a DI seam over shutdown.FatalExit (default when nil):
 	// invoked when RunUI's quit return value is true (the TUI's `q`), the
-	// same bounded shutdown a SIGINT/SIGTERM would trigger, exit code 0.
+	// same bounded shutdown a SIGINT/SIGTERM would trigger, exit code 0, and
+	// handed to the tunnel for its fatal disconnects and refusals (exit 1).
 	// Tests substitute a non-exiting stub — the real one calls os.Exit,
 	// which would kill the test binary.
 	FatalExit func(code int)
+
+	// Reconnect is passed to the tunnel as-is; the zero value keeps its
+	// default backoff (tunnel.Config.Reconnect).
+	Reconnect wsmixer.ReconnectOptions
 }
 
 func (d upDeps) resolve() upDeps {
@@ -734,6 +739,8 @@ func runUp(ctx *Context, noTUI bool, deps upDeps) error {
 		Log:         ctx.Log,
 		OnDisable:   onDisable,
 		OnEnable:    onEnable,
+		FatalExit:   deps.FatalExit,
+		Reconnect:   deps.Reconnect,
 	})
 	if err != nil {
 		stopEverythingStarted()

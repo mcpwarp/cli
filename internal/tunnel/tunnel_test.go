@@ -20,6 +20,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/mcpwarp/cli/internal/appproto"
 	"github.com/mcpwarp/cli/internal/eventbus"
+	"github.com/mcpwarp/cli/internal/fakeedge"
 	"github.com/mcpwarp/cli/internal/registry"
 	"github.com/mcpwarp/ws-mixer-go/wsmixer"
 )
@@ -28,102 +29,6 @@ import (
 type staticToken struct{ token string }
 
 func (s staticToken) Token(context.Context) (string, error) { return s.token, nil }
-
-// fakeTunnelServer is a scripted in-process stand-in for the SaaS tunnel:
-// a real net/http server upgrading to WebSocket and running wsmixer's own
-// server-side handshake (AcceptConn) — the "in-process fake tunnel" the
-// task calls for, as opposed to a subprocess conformance harness.
-type fakeTunnelServer struct {
-	srv *httptest.Server
-	url string
-
-	mu       sync.Mutex
-	conns    []*wsmixer.Conn
-	rawConns []*websocket.Conn     // the underlying coder/websocket conn behind each conns entry, same order
-	onConn   func(c *wsmixer.Conn) // called once per accepted connection, on its own goroutine
-}
-
-func newFakeTunnelServer(t *testing.T, onConn func(c *wsmixer.Conn)) *fakeTunnelServer {
-	t.Helper()
-	f := &fakeTunnelServer{onConn: onConn}
-	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			Subprotocols:    []string{wsmixer.Subprotocol},
-			CompressionMode: websocket.CompressionDisabled,
-		})
-		if err != nil {
-			return
-		}
-		defer ws.CloseNow()
-
-		bearer := r.Header.Get("Authorization")
-		if !strings.HasPrefix(bearer, "Bearer ") {
-			// A malformed/missing Authorization header used to panic here
-			// (slicing past the header's length) instead of failing the
-			// test cleanly.
-			t.Errorf("fake tunnel: request missing a Bearer Authorization header, got %q", bearer)
-			ws.Close(websocket.StatusPolicyViolation, "missing bearer token")
-			return
-		}
-		bearer = strings.TrimPrefix(bearer, "Bearer ")
-		c, err := wsmixer.AcceptConn(r.Context(), ws, bearer, wsmixer.AcceptOptions{
-			ServerInfo: &wsmixer.ServerInfo{Name: "fake-tunnel", Version: "test"},
-			Authenticate: func(ctx context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
-				return wsmixer.WelcomeMeta{}, nil
-			},
-			Request: r,
-		})
-		if err != nil {
-			return
-		}
-		f.mu.Lock()
-		f.conns = append(f.conns, c)
-		f.rawConns = append(f.rawConns, ws)
-		f.mu.Unlock()
-		if f.onConn != nil {
-			f.onConn(c)
-		}
-		c.Run()
-		<-c.Done()
-	}))
-	f.url = "ws" + f.srv.URL[len("http"):]
-	t.Cleanup(f.srv.Close)
-	return f
-}
-
-// connCount reports how many connections this fake server has accepted so
-// far (across every reconnect).
-func (f *fakeTunnelServer) connCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return len(f.conns)
-}
-
-// latestConn returns the most recently accepted connection, or nil if none
-// yet — unlike a CompareAndSwap-guarded atomic.Pointer, this always reflects
-// the current connection across any number of reconnects.
-func (f *fakeTunnelServer) latestConn() *wsmixer.Conn {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if len(f.conns) == 0 {
-		return nil
-	}
-	return f.conns[len(f.conns)-1]
-}
-
-// latestRawConn returns the underlying coder/websocket conn behind the most
-// recently accepted connection — for a test that needs to close the wire
-// directly, below wsmixer's own Conn.Close (which always sends a stream-0
-// error{} frame before the WS close), to produce a bare close frame with no
-// preceding error{}.
-func (f *fakeTunnelServer) latestRawConn() *websocket.Conn {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if len(f.rawConns) == 0 {
-		return nil
-	}
-	return f.rawConns[len(f.rawConns)-1]
-}
 
 func newTestBus(t *testing.T) *eventbus.Bus {
 	t.Helper()
@@ -145,7 +50,7 @@ func newTestBus(t *testing.T) *eventbus.Bus {
 
 func TestRegisterOnConnect(t *testing.T) {
 	var registerSeen atomic.Bool
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
 				Mcpwarp struct {
@@ -169,7 +74,7 @@ func TestRegisterOnConnect(t *testing.T) {
 	})
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -204,7 +109,7 @@ func TestRegisterOnConnect(t *testing.T) {
 
 func TestUnregisterOnClose(t *testing.T) {
 	unregisterCh := make(chan struct{}, 1)
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
 				Mcpwarp struct {
@@ -230,7 +135,7 @@ func TestUnregisterOnClose(t *testing.T) {
 	})
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -265,9 +170,9 @@ func TestUnregisterOnClose(t *testing.T) {
 // bare-time.After behaviour this would instead block for
 // relayShutdownBudget (5s).
 func TestCloseBoundedByCancelledCtx(t *testing.T) {
-	srv := newFakeTunnelServer(t, nil)
+	srv := fakeedge.Serve(t, nil)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Bus:         newTestBus(t),
 		Log:         slog.New(slog.DiscardHandler),
@@ -297,8 +202,8 @@ func TestDisableAndEnableCallbacks(t *testing.T) {
 	disabledName.Store("")
 	enabledName.Store("")
 
-	var serverConn atomic.Pointer[wsmixer.Conn]
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	var serverConn atomic.Pointer[fakeedge.Conn]
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		serverConn.Store(c)
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
@@ -316,7 +221,7 @@ func TestDisableAndEnableCallbacks(t *testing.T) {
 	})
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -370,7 +275,7 @@ func TestDisableAndEnableCallbacks(t *testing.T) {
 }
 
 func TestUnsupportedVersionIsFatal(t *testing.T) {
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
 			_ = c.SendApp(context.Background(), map[string]any{
 				"mcpwarp": map[string]any{"v": 1, "op": "error", "code": "UNSUPPORTED_VERSION", "message": "upgrade"},
@@ -381,7 +286,7 @@ func TestUnsupportedVersionIsFatal(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -411,7 +316,7 @@ func TestUnsupportedVersionIsFatal(t *testing.T) {
 // anything successfully, must exit — Node client.ts's
 // "!sawFirstRegistered" fatal path.
 func TestRegisteredZeroSuccessesFirstConnectQuotaExceededIsFatal(t *testing.T) {
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
 				Mcpwarp struct{ Op string } `json:"mcpwarp"`
@@ -430,7 +335,7 @@ func TestRegisteredZeroSuccessesFirstConnectQuotaExceededIsFatal(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -461,7 +366,7 @@ func TestRegisteredZeroSuccessesFirstConnectQuotaExceededIsFatal(t *testing.T) {
 // successfully, must still exit — same fatal path as
 // TestRegisteredZeroSuccessesFirstConnectQuotaExceededIsFatal above.
 func TestRegisteredZeroSuccessesFirstConnectInvalidNameIsFatal(t *testing.T) {
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
 				Mcpwarp struct{ Op string } `json:"mcpwarp"`
@@ -480,7 +385,7 @@ func TestRegisteredZeroSuccessesFirstConnectInvalidNameIsFatal(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "bad-name", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -508,7 +413,7 @@ func TestRegisteredZeroSuccessesFirstConnectInvalidNameIsFatal(t *testing.T) {
 // a "registered" reply whose only error is SERVER_DISABLED must not exit,
 // even on the very first connect — it's resumable via a later "enable".
 func TestRegisteredAllServerDisabledIsNotFatal(t *testing.T) {
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
 				Mcpwarp struct{ Op string } `json:"mcpwarp"`
@@ -539,7 +444,7 @@ func TestRegisteredAllServerDisabledIsNotFatal(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         bus,
@@ -581,9 +486,9 @@ processed:
 // its success flips it to active while svc-b stays rejected.
 func TestRegisteredFirstReplyDisabledAndRefusedNotFatal(t *testing.T) {
 	var registers atomic.Int32
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
-			names := registeredNames(raw)
+			names := fakeedge.RegisterNames(raw)
 			if names == nil {
 				return
 			}
@@ -611,7 +516,7 @@ func TestRegisteredFirstReplyDisabledAndRefusedNotFatal(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -651,7 +556,7 @@ func TestRegisteredFirstReplyDisabledAndRefusedNotFatal(t *testing.T) {
 		t.Fatalf("disabled svc-a row = %+v, want no URL", a)
 	}
 
-	_ = srv.latestConn().SendApp(context.Background(), map[string]any{
+	_ = srv.Latest().SendApp(context.Background(), map[string]any{
 		"mcpwarp": map[string]any{"v": 1, "op": "enable", "id": "id-a", "name": "svc-a"},
 	})
 	waitFor("svc-a active after the enable's re-register", func() bool {
@@ -679,9 +584,9 @@ func TestRegisteredFirstReplyDisabledAndRefusedNotFatal(t *testing.T) {
 // "registered" refusing every service, none with SERVER_DISABLED, exits 1,
 // and each name still lands rejected with its own code first.
 func TestRegisteredFirstReplyAllRefusedIsFatal(t *testing.T) {
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
-			if registeredNames(raw) == nil {
+			if fakeedge.RegisterNames(raw) == nil {
 				return
 			}
 			_ = c.SendApp(context.Background(), map[string]any{
@@ -696,7 +601,7 @@ func TestRegisteredFirstReplyAllRefusedIsFatal(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -734,7 +639,7 @@ func TestRegisteredFirstReplyAllRefusedIsFatal(t *testing.T) {
 // stays up and each error's AppError event is published with its code,
 // mirroring TestRegisteredAllServerDisabledIsNotFatal's approach.
 func TestRegisteredInvalidNameAndUsernameRequiredHints(t *testing.T) {
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
 				Mcpwarp struct{ Op string } `json:"mcpwarp"`
@@ -764,7 +669,7 @@ func TestRegisteredInvalidNameAndUsernameRequiredHints(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "good", Kind: "http"}},
 		Bus:         bus,
@@ -825,7 +730,7 @@ func TestRegisteredInvalidNameAndUsernameRequiredHints(t *testing.T) {
 // handleApp branch) must clear it.
 func TestRegisteredQuotaExceededRecordedThenClearedByReRegister(t *testing.T) {
 	var registers atomic.Int32
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
 				Mcpwarp struct{ Op string } `json:"mcpwarp"`
@@ -856,7 +761,7 @@ func TestRegisteredQuotaExceededRecordedThenClearedByReRegister(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "good", Kind: "http"}, {Name: "deepwiki", Kind: "http"}},
 		Bus:         bus,
@@ -925,7 +830,7 @@ func TestRegisteredQuotaExceededRecordedThenClearedByReRegister(t *testing.T) {
 // in the registry; cli.pollTunnelForTUI drops it for a rejected row.
 func TestReconnectAllServicesRejectedIsNotFatal(t *testing.T) {
 	var conns atomic.Int32
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		n := conns.Add(1)
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
@@ -956,7 +861,7 @@ func TestReconnectAllServicesRejectedIsNotFatal(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "good", Kind: "http"}, {Name: "deepwiki", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -995,7 +900,7 @@ func TestReconnectAllServicesRejectedIsNotFatal(t *testing.T) {
 		return allRows(func(r registry.Row) bool { return r.URL != "" && r.Rejected == "" })
 	}, 2*time.Second)
 
-	_ = srv.latestConn().Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
+	_ = srv.Latest().Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
 
 	waitFor("the reconnect's rejections", func() bool {
 		return allRows(func(r registry.Row) bool { return r.Rejected == "QUOTA_EXCEEDED" })
@@ -1013,8 +918,8 @@ func TestReconnectAllServicesRejectedIsNotFatal(t *testing.T) {
 
 func TestReconnectsAndReregisters(t *testing.T) {
 	var registerCount atomic.Int32
-	var firstConn atomic.Pointer[wsmixer.Conn]
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	var firstConn atomic.Pointer[fakeedge.Conn]
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		firstConn.CompareAndSwap(nil, c)
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
@@ -1028,7 +933,7 @@ func TestReconnectsAndReregisters(t *testing.T) {
 	})
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -1069,8 +974,8 @@ func TestReconnectsAndReregisters(t *testing.T) {
 // still result in this package's OnConnect registering again.
 func TestReconnectsOnGoingAway(t *testing.T) {
 	var registerCount atomic.Int32
-	var firstConn atomic.Pointer[wsmixer.Conn]
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	var firstConn atomic.Pointer[fakeedge.Conn]
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		firstConn.CompareAndSwap(nil, c)
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
@@ -1084,7 +989,7 @@ func TestReconnectsOnGoingAway(t *testing.T) {
 	})
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -1126,15 +1031,15 @@ func TestReconnectsOnGoingAway(t *testing.T) {
 // goFatal (no retry), so the fake tunnel closing with UnauthorizedCode here
 // must surface as FatalExit(1) with Node client.ts's exact wording.
 func TestUnauthorizedCloseIsFatalWithSessionExpiredMessage(t *testing.T) {
-	var firstConn atomic.Pointer[wsmixer.Conn]
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	var firstConn atomic.Pointer[fakeedge.Conn]
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		firstConn.CompareAndSwap(nil, c)
 	})
 
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -1167,7 +1072,7 @@ func TestUnauthorizedCloseIsFatalWithSessionExpiredMessage(t *testing.T) {
 		t.Fatalf("expected exit code 1, got %d", exitCode.Load())
 	}
 
-	if got := classifyFatalMessage(srv.url, wsmixer.DisconnectReason{Fatal: true, WSCode: 4011}); got != "session expired, run `mcpwarp login`" {
+	if got := classifyFatalMessage(srv.URL, wsmixer.DisconnectReason{Fatal: true, WSCode: 4011}); got != "session expired, run `mcpwarp login`" {
 		t.Fatalf("unexpected classifyFatalMessage for wsCode 4011: %q", got)
 	}
 }
@@ -1180,8 +1085,8 @@ func TestUnauthorizedCloseIsFatalWithSessionExpiredMessage(t *testing.T) {
 // retrying underneath it.
 func TestConnectionLimitCloseIsNonFatalWithHintAndReconnects(t *testing.T) {
 	var conns atomic.Int32
-	var firstConn atomic.Pointer[wsmixer.Conn]
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	var firstConn atomic.Pointer[fakeedge.Conn]
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		conns.Add(1)
 		firstConn.CompareAndSwap(nil, c)
 	})
@@ -1196,7 +1101,7 @@ func TestConnectionLimitCloseIsNonFatalWithHintAndReconnects(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         bus,
@@ -1277,8 +1182,8 @@ func TestConnectionLimitCloseIsNonFatalWithHintAndReconnects(t *testing.T) {
 // never sent by the tunnel for its connection cap — and must not be
 // reported as a CONNECTION_LIMIT AppError.
 func TestPlainEnhanceYourCalmCloseIsNotConnectionLimit(t *testing.T) {
-	var firstConn atomic.Pointer[wsmixer.Conn]
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	var firstConn atomic.Pointer[fakeedge.Conn]
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		firstConn.CompareAndSwap(nil, c)
 	})
 
@@ -1315,7 +1220,7 @@ func TestPlainEnhanceYourCalmCloseIsNotConnectionLimit(t *testing.T) {
 	}()
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         bus,
@@ -1354,8 +1259,8 @@ func TestPlainEnhanceYourCalmCloseIsNotConnectionLimit(t *testing.T) {
 // close and must fall through to the generic Info log, not a
 // CONNECTION_LIMIT AppError.
 func TestApplicationCloseWithOtherPrefixIsNotConnectionLimit(t *testing.T) {
-	var firstConn atomic.Pointer[wsmixer.Conn]
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	var firstConn atomic.Pointer[fakeedge.Conn]
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		firstConn.CompareAndSwap(nil, c)
 	})
 
@@ -1386,7 +1291,7 @@ func TestApplicationCloseWithOtherPrefixIsNotConnectionLimit(t *testing.T) {
 	}()
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         bus,
@@ -1430,9 +1335,9 @@ func TestApplicationCloseWithOtherPrefixIsNotConnectionLimit(t *testing.T) {
 // directly, bypassing wsmixer.Conn.Close (which always sends error{}
 // first).
 func TestConnectionLimitBareCloseWithoutErrorFrame(t *testing.T) {
-	var firstConn atomic.Pointer[wsmixer.Conn]
+	var firstConn atomic.Pointer[fakeedge.Conn]
 	var registerSeen atomic.Bool
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		firstConn.CompareAndSwap(nil, c)
 		// Wait for the client's own register write to have landed before this
 		// test's raw close below tears down the socket — otherwise closing
@@ -1441,7 +1346,7 @@ func TestConnectionLimitBareCloseWithoutErrorFrame(t *testing.T) {
 		// error), which the client reports as a generic disconnect instead
 		// of ever reading this test's close frame/reason at all.
 		c.OnApp(func(raw json.RawMessage) {
-			if names := registeredNames(raw); names != nil {
+			if names := fakeedge.RegisterNames(raw); names != nil {
 				registerSeen.Store(true)
 			}
 		})
@@ -1457,7 +1362,7 @@ func TestConnectionLimitBareCloseWithoutErrorFrame(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         bus,
@@ -1477,12 +1382,12 @@ func TestConnectionLimitBareCloseWithoutErrorFrame(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	raw := srv.latestRawConn()
-	if raw == nil {
-		t.Fatal("fake tunnel never captured the underlying websocket conn")
+	c := srv.Latest()
+	if c == nil {
+		t.Fatal("fake tunnel never accepted a connection")
 	}
 	const reason = "CONNECTION_LIMIT: too many agent connections for this account (limit 10)"
-	go func() { _ = raw.Close(websocket.StatusCode(connectionLimitWSCode), reason) }()
+	go func() { _ = c.CloseBare(websocket.StatusCode(connectionLimitWSCode), reason) }()
 
 	var appErr eventbus.AppError
 	found := false
@@ -1523,8 +1428,8 @@ func TestOnStreamNeverBlocksOnApp(t *testing.T) {
 	var disabledAt atomic.Value
 	disabledAt.Store(time.Time{})
 
-	var serverConn atomic.Pointer[wsmixer.Conn]
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	var serverConn atomic.Pointer[fakeedge.Conn]
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		serverConn.Store(c)
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
@@ -1568,7 +1473,7 @@ func TestOnStreamNeverBlocksOnApp(t *testing.T) {
 	t.Cleanup(bus.Close)
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Targets:     map[string]*url.URL{"svc": targetURL},
@@ -1658,7 +1563,7 @@ func (h *capturingHandler) hasMessage(want string) bool {
 // (DESIGN.md §8's "ignored-with-log"): an unrecognized op must warn-log and
 // otherwise be ignored — never treated as fatal.
 func TestUnknownOpWarnsWithoutFatal(t *testing.T) {
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
 				Mcpwarp struct{ Op string } `json:"mcpwarp"`
@@ -1676,7 +1581,7 @@ func TestUnknownOpWarnsWithoutFatal(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -1705,7 +1610,7 @@ func TestUnknownOpWarnsWithoutFatal(t *testing.T) {
 // best-effort just before the matching close) must publish an AppError with
 // a non-empty Hint and must never be treated as fatal.
 func TestConnectionLimitAppErrorHasHint(t *testing.T) {
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
 				Mcpwarp struct{ Op string } `json:"mcpwarp"`
@@ -1730,7 +1635,7 @@ func TestConnectionLimitAppErrorHasHint(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         bus,
@@ -1780,7 +1685,7 @@ func TestConnectionLimitAppErrorHasHint(t *testing.T) {
 func TestConnectionLimitAppErrorAndCloseDedupe(t *testing.T) {
 	const reason = "CONNECTION_LIMIT: too many agent connections for this account (limit 10)"
 	var served atomic.Int32
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		if served.Add(1) != 1 {
 			return
 		}
@@ -1806,7 +1711,7 @@ func TestConnectionLimitAppErrorAndCloseDedupe(t *testing.T) {
 	t.Cleanup(bus.Close)
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         bus,
@@ -1840,8 +1745,8 @@ func TestConnectionLimitAppErrorAndCloseDedupe(t *testing.T) {
 // (hasConfiguredService) accepts the enable itself — otherwise a later
 // "registered" batch that reuses that id could resolve a now-stale disable.
 func TestEnableClearsPendingDisableEvenWhenNameNotConfigured(t *testing.T) {
-	var serverConn atomic.Pointer[wsmixer.Conn]
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	var serverConn atomic.Pointer[fakeedge.Conn]
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		serverConn.Store(c)
 	})
 
@@ -1849,7 +1754,7 @@ func TestEnableClearsPendingDisableEvenWhenNameNotConfigured(t *testing.T) {
 	disabledName.Store("")
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -1919,27 +1824,6 @@ func TestEnableClearsPendingDisableEvenWhenNameNotConfigured(t *testing.T) {
 	}
 }
 
-// registeredNames extracts the sorted "register" batch's service names from
-// a raw app message, or nil if raw isn't a "register".
-func registeredNames(raw json.RawMessage) []string {
-	var wrapper struct {
-		Mcpwarp struct {
-			Op       string `json:"op"`
-			Services []struct {
-				Name string `json:"name"`
-			} `json:"services"`
-		} `json:"mcpwarp"`
-	}
-	if json.Unmarshal(raw, &wrapper) != nil || wrapper.Mcpwarp.Op != "register" {
-		return nil
-	}
-	names := make([]string, len(wrapper.Mcpwarp.Services))
-	for i, s := range wrapper.Mcpwarp.Services {
-		names[i] = s.Name
-	}
-	return names
-}
-
 // TestLocalDisablePersistsAcrossReconnect covers the bug fix: a local `d`
 // (UnregisterService) must survive a reconnect instead of the next
 // welcome's register batch silently resurrecting the name, and a following
@@ -1948,9 +1832,9 @@ func TestLocalDisablePersistsAcrossReconnect(t *testing.T) {
 	var mu sync.Mutex
 	var batches [][]string
 
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
-			if names := registeredNames(raw); names != nil {
+			if names := fakeedge.RegisterNames(raw); names != nil {
 				mu.Lock()
 				batches = append(batches, names)
 				mu.Unlock()
@@ -1959,7 +1843,7 @@ func TestLocalDisablePersistsAcrossReconnect(t *testing.T) {
 	})
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services: []appproto.RegisterService{
 			{Name: "svc-a", Kind: "http"},
@@ -2002,16 +1886,16 @@ func TestLocalDisablePersistsAcrossReconnect(t *testing.T) {
 		t.Fatalf("first register batch = %v, want both services", got)
 	}
 
-	waitForConn := func(n int) *wsmixer.Conn {
+	waitForConn := func(n int) *fakeedge.Conn {
 		t.Helper()
 		deadline := time.Now().Add(5 * time.Second)
-		for srv.connCount() < n {
+		for srv.ConnCount() < n {
 			if time.Now().After(deadline) {
 				t.Fatalf("timed out waiting for the fake tunnel to accept connection #%d", n)
 			}
 			time.Sleep(time.Millisecond)
 		}
-		return srv.latestConn()
+		return srv.Latest()
 	}
 
 	// A local `d` on svc-a, then force a reconnect.
@@ -2057,9 +1941,9 @@ func TestLocalDisableOfOnlyServiceSendsNoRegisterOnReconnect(t *testing.T) {
 	var mu sync.Mutex
 	var batches [][]string
 
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
-			if names := registeredNames(raw); names != nil {
+			if names := fakeedge.RegisterNames(raw); names != nil {
 				mu.Lock()
 				batches = append(batches, names)
 				mu.Unlock()
@@ -2068,7 +1952,7 @@ func TestLocalDisableOfOnlyServiceSendsNoRegisterOnReconnect(t *testing.T) {
 	})
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -2095,16 +1979,16 @@ func TestLocalDisableOfOnlyServiceSendsNoRegisterOnReconnect(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
-	waitForConn := func(n int) *wsmixer.Conn {
+	waitForConn := func(n int) *fakeedge.Conn {
 		t.Helper()
 		deadline := time.Now().Add(5 * time.Second)
-		for srv.connCount() < n {
+		for srv.ConnCount() < n {
 			if time.Now().After(deadline) {
 				t.Fatalf("timed out waiting for the fake tunnel to accept connection #%d", n)
 			}
 			time.Sleep(time.Millisecond)
 		}
-		return srv.latestConn()
+		return srv.Latest()
 	}
 
 	waitForBatch(1)
@@ -2134,12 +2018,12 @@ func TestLocalDisableOfOnlyServiceSendsNoRegisterOnReconnect(t *testing.T) {
 func TestServerDisablePersistsAcrossReconnect(t *testing.T) {
 	var mu sync.Mutex
 	var batches [][]string
-	var conn atomic.Pointer[wsmixer.Conn]
+	var conn atomic.Pointer[fakeedge.Conn]
 
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		conn.Store(c)
 		c.OnApp(func(raw json.RawMessage) {
-			if names := registeredNames(raw); names != nil {
+			if names := fakeedge.RegisterNames(raw); names != nil {
 				mu.Lock()
 				batches = append(batches, names)
 				mu.Unlock()
@@ -2156,7 +2040,7 @@ func TestServerDisablePersistsAcrossReconnect(t *testing.T) {
 	disabledName.Store("")
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -2219,12 +2103,12 @@ func TestServerDisablePersistsAcrossReconnect(t *testing.T) {
 func TestServerEnableClearsLocalDisable(t *testing.T) {
 	var mu sync.Mutex
 	var batches [][]string
-	var conn atomic.Pointer[wsmixer.Conn]
+	var conn atomic.Pointer[fakeedge.Conn]
 
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		conn.Store(c)
 		c.OnApp(func(raw json.RawMessage) {
-			if names := registeredNames(raw); names != nil {
+			if names := fakeedge.RegisterNames(raw); names != nil {
 				mu.Lock()
 				batches = append(batches, names)
 				mu.Unlock()
@@ -2238,7 +2122,7 @@ func TestServerEnableClearsLocalDisable(t *testing.T) {
 	})
 
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -2416,8 +2300,8 @@ func recordAttr(r slog.Record, key string) (slog.Value, bool) {
 // only fires for a non-fatal PhaseDial disconnect whose Cause wraps
 // ErrTokenUnavailable, so seeing it pins that DisconnectReason shape.
 func TestRetryableTokenFailureReconnects(t *testing.T) {
-	var firstConn atomic.Pointer[wsmixer.Conn]
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	var firstConn atomic.Pointer[fakeedge.Conn]
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		firstConn.CompareAndSwap(nil, c)
 	})
 
@@ -2428,7 +2312,7 @@ func TestRetryableTokenFailureReconnects(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: tokens,
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -2481,12 +2365,12 @@ func TestRetryableTokenFailureReconnects(t *testing.T) {
 	// Full-jitter backoff after one failed dial is at most a few seconds with
 	// this package's 1s Base.
 	deadline = time.Now().Add(15 * time.Second)
-	for srv.connCount() < 2 || tun.client.State() != "connected" {
+	for srv.ConnCount() < 2 || tun.client.State() != "connected" {
 		if state := tun.client.State(); state == "closed" {
 			t.Fatalf("client closed after a retryable token failure, want it to reconnect")
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("expected a second connection after the token failure, got %d conns, state %q", srv.connCount(), tun.client.State())
+			t.Fatalf("expected a second connection after the token failure, got %d conns, state %q", srv.ConnCount(), tun.client.State())
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -2502,8 +2386,8 @@ func TestRetryableTokenFailureReconnects(t *testing.T) {
 // that isn't Retryable() stays unmarked, so the SDK closes the client and
 // onDisconnect must exit instead of waiting on a retry that never comes.
 func TestNonRetryableTokenFailureIsFatal(t *testing.T) {
-	var firstConn atomic.Pointer[wsmixer.Conn]
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	var firstConn atomic.Pointer[fakeedge.Conn]
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		firstConn.CompareAndSwap(nil, c)
 	})
 
@@ -2512,7 +2396,7 @@ func TestNonRetryableTokenFailureIsFatal(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: tokens,
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -2547,37 +2431,14 @@ func TestNonRetryableTokenFailureIsFatal(t *testing.T) {
 	if state := tun.client.State(); state != "closed" {
 		t.Fatalf("expected the client closed after a fatal token failure, got state %q", state)
 	}
-	if n := srv.connCount(); n != 1 {
+	if n := srv.ConnCount(); n != 1 {
 		t.Fatalf("expected no reconnect after a fatal token failure, got %d conns", n)
 	}
 }
 
-// replyRegisteredAll answers every "register" on c with a "registered" that
-// accepts each name it carried, at id "id-<name>" and URL
-// "https://<name>.example/mcp". seen, if non-nil, gets each batch's names
-// first (c.OnApp takes one handler, so a test can't add its own).
-func replyRegisteredAll(c *wsmixer.Conn, seen func(names []string)) {
-	c.OnApp(func(raw json.RawMessage) {
-		names := registeredNames(raw)
-		if names == nil {
-			return
-		}
-		if seen != nil {
-			seen(names)
-		}
-		services := make([]map[string]any, len(names))
-		for i, n := range names {
-			services[i] = map[string]any{"name": n, "id": "id-" + n, "url": "https://" + n + ".example/mcp", "created": false}
-		}
-		_ = c.SendApp(context.Background(), map[string]any{
-			"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": services, "errors": []any{}},
-		})
-	})
-}
-
 // requestOver opens a stream on c the way the tunnel routes a public
 // request, sends a GET for host, and returns the response status.
-func requestOver(t *testing.T, c *wsmixer.Conn, host string) int {
+func requestOver(t *testing.T, c *fakeedge.Conn, host string) int {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2630,10 +2491,10 @@ func TestConflictTakesOverOnlyThatName(t *testing.T) {
 	t.Cleanup(target.Close)
 	targetURL, _ := url.Parse(target.URL + "/mcp")
 
-	var serverConn atomic.Pointer[wsmixer.Conn]
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	var serverConn atomic.Pointer[fakeedge.Conn]
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		serverConn.Store(c)
-		replyRegisteredAll(c, nil)
+		c.ReplyRegisteredAll(nil)
 	})
 
 	bus := eventbus.New(64)
@@ -2646,7 +2507,7 @@ func TestConflictTakesOverOnlyThatName(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "http"}},
 		Targets:     map[string]*url.URL{"svc-a": targetURL, "svc-b": targetURL},
@@ -2723,15 +2584,15 @@ func TestConflictTakesOverOnlyThatName(t *testing.T) {
 // the conflict still applies. A conflict for a name this config doesn't
 // hold is ignored and adds no row.
 func TestConflictIDMismatchWarnsAndApplies(t *testing.T) {
-	var serverConn atomic.Pointer[wsmixer.Conn]
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	var serverConn atomic.Pointer[fakeedge.Conn]
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		serverConn.Store(c)
-		replyRegisteredAll(c, nil)
+		c.ReplyRegisteredAll(nil)
 	})
 
 	logs := &recordingHandler{}
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -2780,8 +2641,8 @@ func TestConflictIDMismatchWarnsAndApplies(t *testing.T) {
 func TestConflictIsStickyUntilLocalEnable(t *testing.T) {
 	var mu sync.Mutex
 	var batches [][]string
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
-		replyRegisteredAll(c, func(names []string) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
+		c.ReplyRegisteredAll(func(names []string) {
 			mu.Lock()
 			batches = append(batches, names)
 			mu.Unlock()
@@ -2811,7 +2672,7 @@ func TestConflictIsStickyUntilLocalEnable(t *testing.T) {
 	logs := &recordingHandler{}
 	var enabled atomic.Int32
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -2826,7 +2687,7 @@ func TestConflictIsStickyUntilLocalEnable(t *testing.T) {
 
 	waitForBatch(1)
 	waitForRow(t, tun, "svc-a active", "svc-a", func(r registry.Row, ok bool) bool { return ok && r.URL != "" })
-	first := srv.latestConn()
+	first := srv.Latest()
 	_ = first.SendApp(context.Background(), map[string]any{
 		"mcpwarp": map[string]any{"v": 1, "op": "conflict", "id": "id-svc-a", "name": "svc-a", "reason": "taken_over"},
 	})
@@ -2882,9 +2743,9 @@ func TestConflictBeforeItsRegisteredReplyStands(t *testing.T) {
 	raceConflict.Store(true)
 	var mu sync.Mutex
 	var batches [][]string
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
-			names := registeredNames(raw)
+			names := fakeedge.RegisterNames(raw)
 			if names == nil {
 				return
 			}
@@ -2947,7 +2808,7 @@ func TestConflictBeforeItsRegisteredReplyStands(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -2975,7 +2836,7 @@ func TestConflictBeforeItsRegisteredReplyStands(t *testing.T) {
 	stillTakenOver("after the first batch")
 	waitForRow(t, tun, "svc-b active", "svc-b", func(r registry.Row, ok bool) bool { return ok && r.URL != "" })
 
-	_ = srv.latestConn().Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
+	_ = srv.Latest().Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
 	waitUntil("the reconnect's reply", func() bool { return batchCount() >= 2 && sentinels() >= 2 })
 	if got := batchAt(1); len(got) != 1 || got[0] != "svc-b" {
 		t.Fatalf("register batch after the take-over = %v, want [svc-b]", got)
@@ -3004,9 +2865,9 @@ func TestConflictBeforeItsRegisteredReplyStands(t *testing.T) {
 // resumable by a dashboard enable that OpEnable ignores for it) must not
 // replace its CONFLICT.
 func TestConflictBeforeItsRegisterErrorStands(t *testing.T) {
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
-			if registeredNames(raw) == nil {
+			if fakeedge.RegisterNames(raw) == nil {
 				return
 			}
 			_ = c.SendApp(context.Background(), map[string]any{
@@ -3029,7 +2890,7 @@ func TestConflictBeforeItsRegisterErrorStands(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "http"}},
 		Bus:         newTestBus(t),
@@ -3068,9 +2929,9 @@ func TestConflictBeforeItsRegisterErrorStands(t *testing.T) {
 // pending forever), one AppError with the hint is published, and it isn't
 // fatal.
 func TestTooManyServicesRejectsEveryPendingName(t *testing.T) {
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
-			if registeredNames(raw) == nil {
+			if fakeedge.RegisterNames(raw) == nil {
 				return
 			}
 			_ = c.SendApp(context.Background(), map[string]any{
@@ -3097,7 +2958,7 @@ func TestTooManyServicesRejectsEveryPendingName(t *testing.T) {
 	var exitCode atomic.Int32
 	exitCode.Store(-1)
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "stdio"}},
 		Bus:         bus,
@@ -3167,9 +3028,9 @@ func TestDrainHandOverKeepsConnectedState(t *testing.T) {
 	targetURL, _ := url.Parse(target.URL + "/mcp")
 
 	var registers atomic.Int32
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
-			names := registeredNames(raw)
+			names := fakeedge.RegisterNames(raw)
 			if names == nil {
 				return
 			}
@@ -3202,7 +3063,7 @@ func TestDrainHandOverKeepsConnectedState(t *testing.T) {
 
 	logs := &recordingHandler{}
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Targets:     map[string]*url.URL{"svc": targetURL},
@@ -3226,7 +3087,7 @@ func TestDrainHandOverKeepsConnectedState(t *testing.T) {
 		}
 	}
 	waitUntil("the first register", func() bool { return registers.Load() >= 1 })
-	old := srv.latestConn()
+	old := srv.Latest()
 
 	// A stream left open on the old connection keeps it alive past the
 	// replacement's welcome, so the hand-over (not a plain reconnect) runs.
@@ -3238,7 +3099,7 @@ func TestDrainHandOverKeepsConnectedState(t *testing.T) {
 	}
 	go func() { _ = old.Drain(ctx, "rollout", wsmixer.DrainOptions{Deadline: 5 * time.Second}) }()
 
-	waitUntil("the replacement's register", func() bool { return srv.connCount() >= 2 && registers.Load() >= 2 })
+	waitUntil("the replacement's register", func() bool { return srv.ConnCount() >= 2 && registers.Load() >= 2 })
 
 	fmt.Fprintf(stream, "GET /mcp HTTP/1.1\r\nHost: svc.example\r\n\r\n")
 	_ = stream.CloseWrite()
@@ -3283,9 +3144,9 @@ func TestDrainHandOverIgnoresRetiringConnApp(t *testing.T) {
 	targetURL, _ := url.Parse(target.URL + "/mcp")
 
 	var registers atomic.Int32
-	srv := newFakeTunnelServer(t, func(c *wsmixer.Conn) {
+	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
-			if registeredNames(raw) == nil {
+			if fakeedge.RegisterNames(raw) == nil {
 				return
 			}
 			_ = c.SendApp(context.Background(), map[string]any{
@@ -3300,7 +3161,7 @@ func TestDrainHandOverIgnoresRetiringConnApp(t *testing.T) {
 	var disables atomic.Int32
 	logs := &recordingHandler{}
 	tun, err := Start(context.Background(), Config{
-		URL:         srv.url,
+		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
 		Targets:     map[string]*url.URL{"svc": targetURL},
@@ -3328,7 +3189,7 @@ func TestDrainHandOverIgnoresRetiringConnApp(t *testing.T) {
 
 	waitUntil("the first register", func() bool { return registers.Load() >= 1 })
 	waitForRow(t, tun, "svc active", "svc", active)
-	old := srv.latestConn()
+	old := srv.Latest()
 
 	// As in TestDrainHandOverKeepsConnectedState, an in-flight stream keeps
 	// the drained connection open past the replacement's welcome.
@@ -3342,8 +3203,8 @@ func TestDrainHandOverIgnoresRetiringConnApp(t *testing.T) {
 
 	// The replacement's register is sent from onConnect after it bound its
 	// handler, so by now the old connection is superseded.
-	waitUntil("the replacement's register", func() bool { return srv.connCount() >= 2 && registers.Load() >= 2 })
-	replacement := srv.latestConn()
+	waitUntil("the replacement's register", func() bool { return srv.ConnCount() >= 2 && registers.Load() >= 2 })
+	replacement := srv.Latest()
 
 	disable := map[string]any{"mcpwarp": map[string]any{"v": 1, "op": "disable", "id": "id-svc", "reason": "stale"}}
 	if err := old.SendApp(ctx, disable); err != nil {

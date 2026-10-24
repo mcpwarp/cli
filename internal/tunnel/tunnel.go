@@ -81,6 +81,30 @@ type Config struct {
 	// disconnect. Tests substitute a non-exiting stub — the real one calls
 	// os.Exit, which would kill the test binary.
 	FatalExit func(code int)
+	// Reconnect overrides the SDK's reconnect backoff. A zero Base, Cap or
+	// StableAfter keeps this CLI's own value (withReconnectDefaults); a test
+	// sets a short Cap so a redial scheduled at random(0, Cap) doesn't take
+	// up to 30s.
+	Reconnect wsmixer.ReconnectOptions
+}
+
+// withReconnectDefaults fills r's zero Base/Cap/StableAfter with this CLI's
+// policy. Cap: Node client.ts's BACKOFF_CAP_MS caps full-jitter backoff at
+// 30s, not the SDK's own 60s default. StableAfter: the backoff attempt
+// counter resets only once a connection has stayed up this long past
+// welcome, so a server that accepts then drops right away can't pin us at
+// Base.
+func withReconnectDefaults(r wsmixer.ReconnectOptions) wsmixer.ReconnectOptions {
+	if r.Base == 0 {
+		r.Base = time.Second
+	}
+	if r.Cap == 0 {
+		r.Cap = 30 * time.Second
+	}
+	if r.StableAfter == 0 {
+		r.StableAfter = 10 * time.Second
+	}
+	return r
 }
 
 // Tunnel is the running wsmixer.Client wrapper. Build with Start.
@@ -181,6 +205,7 @@ func Start(ctx context.Context, cfg Config) (*Tunnel, error) {
 	if cfg.FatalExit == nil {
 		cfg.FatalExit = shutdown.FatalExit
 	}
+	cfg.Reconnect = withReconnectDefaults(cfg.Reconnect)
 	kindByName := make(map[string]string, len(cfg.Services))
 	regServices := make([]appproto.RegisterService, len(cfg.Services))
 	unregServices := make([]appproto.UnregisterService, len(cfg.Services))
@@ -227,12 +252,7 @@ func Start(ctx context.Context, cfg Config) (*Tunnel, error) {
 		Options: wsmixer.Options{
 			Metrics: newBusMetrics(cfg.Bus),
 		},
-		// Node client.ts's BACKOFF_CAP_MS: cap full-jitter backoff at 30s,
-		// not the SDK's own 60s default.
-		// StableAfter: the backoff attempt counter resets only once a
-		// connection has stayed up this long past welcome, so a server that
-		// accepts then drops right away can't pin us at Base.
-		Reconnect:    wsmixer.ReconnectOptions{Base: time.Second, Cap: 30 * time.Second, StableAfter: 10 * time.Second},
+		Reconnect:    cfg.Reconnect,
 		OnConnect:    t.onConnect,
 		OnStream:     t.onStream,
 		OnDrain:      t.onDrain,

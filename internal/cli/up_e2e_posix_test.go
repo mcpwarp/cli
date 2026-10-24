@@ -9,22 +9,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
 	"github.com/mcpwarp/cli/internal/bridge"
+	"github.com/mcpwarp/cli/internal/fakeedge"
 	"github.com/mcpwarp/cli/internal/shutdown"
 	"github.com/mcpwarp/cli/internal/tunnel"
-	"github.com/mcpwarp/ws-mixer-go/wsmixer"
 )
 
 // buildFakeMCPBinary builds internal/bridge/testdata/fakemcp's fixture, the
@@ -43,135 +39,28 @@ func buildFakeMCPBinary(t *testing.T) string {
 	return out
 }
 
-// fakeTunnelServer is an in-process stand-in for the SaaS tunnel: a real
-// net/http server upgrading to WebSocket and running wsmixer's own
-// server-side handshake (AcceptConn) — the same pattern internal/tunnel's
-// own tests use (tunnel_test.go), reimplemented here since that package's
-// version is unexported.
-type fakeTunnelServer struct {
-	srv *httptest.Server
-	url string
-
-	registerCh   chan struct{}
-	unregisterCh chan struct{}
-	conn         atomic.Pointer[wsmixer.Conn]
-
-	publicHost string
-	serviceID  string
-
-	// unregisterSeenAt is set the instant the "unregister" frame arrives,
-	// for TestUpE2E_RegisterRelayShutdownUnregister to compare against the
-	// child's actual death time (S-5) — a channel send alone can't be
-	// timestamped from the receiving side without racing whatever the
-	// test does before it gets around to reading it.
-	mu               sync.Mutex
-	unregisterSeenAt time.Time
-}
-
-func newFakeTunnelServer(t *testing.T, publicHost, serviceID string) *fakeTunnelServer {
+// newEchoEdge starts a fakeedge.Server that answers every register with a
+// success for "echo" at serviceID, served at https://<publicHost>/mcp.
+func newEchoEdge(t *testing.T, publicHost, serviceID string) *fakeedge.Server {
 	t.Helper()
-	f := &fakeTunnelServer{
-		registerCh:   make(chan struct{}, 8),
-		unregisterCh: make(chan struct{}, 8),
-		publicHost:   publicHost,
-		serviceID:    serviceID,
-	}
-	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			Subprotocols:    []string{wsmixer.Subprotocol},
-			CompressionMode: websocket.CompressionDisabled,
-		})
-		if err != nil {
-			return
-		}
-		defer ws.CloseNow()
-
-		bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		c, err := wsmixer.AcceptConn(r.Context(), ws, bearer, wsmixer.AcceptOptions{
-			ServerInfo: &wsmixer.ServerInfo{Name: "fake-tunnel", Version: "test"},
-			Authenticate: func(ctx context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
-				return wsmixer.WelcomeMeta{}, nil
-			},
-			Request: r,
-		})
-		if err != nil {
-			return
-		}
-		f.conn.Store(c)
-		c.OnApp(func(raw json.RawMessage) {
-			var wrapper struct {
-				Mcpwarp struct {
-					Op string `json:"op"`
-				} `json:"mcpwarp"`
+	return fakeedge.New(t, fakeedge.Options{
+		OnApp: func(c *fakeedge.Conn, f fakeedge.Frame) {
+			if f.Op == "register" {
+				_ = c.Registered([]fakeedge.Service{
+					{Name: "echo", ID: serviceID, URL: "https://" + publicHost + "/mcp", Created: true},
+				}, nil)
 			}
-			if json.Unmarshal(raw, &wrapper) != nil {
-				return
-			}
-			switch wrapper.Mcpwarp.Op {
-			case "register":
-				_ = c.SendApp(context.Background(), map[string]any{
-					"mcpwarp": map[string]any{
-						"v":  1,
-						"op": "registered",
-						"services": []map[string]any{
-							{"name": "echo", "id": f.serviceID, "url": "https://" + f.publicHost + "/mcp", "created": true},
-						},
-						"errors": []any{},
-					},
-				})
-				select {
-				case f.registerCh <- struct{}{}:
-				default:
-				}
-			case "unregister":
-				f.mu.Lock()
-				f.unregisterSeenAt = time.Now()
-				f.mu.Unlock()
-				select {
-				case f.unregisterCh <- struct{}{}:
-				default:
-				}
-			}
-		})
-		c.Run()
-		<-c.Done()
-	}))
-	f.url = "ws" + f.srv.URL[len("http"):]
-	t.Cleanup(f.srv.Close)
-	return f
+		},
+	})
 }
 
-func (f *fakeTunnelServer) waitRegistered(t *testing.T) {
+// openHTTPStream opens a server-initiated stream on edge's latest connection
+// (mirroring a public request arriving at the SaaS tunnel) carrying a raw
+// HTTP request with Host set to publicHost — DESIGN.md §3's "OPEN carries no
+// metadata, routed by Host header" — and returns the parsed response.
+func openHTTPStream(t *testing.T, edge *fakeedge.Server, publicHost, path string, body []byte) *http.Response {
 	t.Helper()
-	select {
-	case <-f.registerCh:
-	case <-time.After(5 * time.Second):
-		t.Fatal("fake tunnel never received a register")
-	}
-}
-
-func (f *fakeTunnelServer) waitUnregistered(t *testing.T) {
-	t.Helper()
-	select {
-	case <-f.unregisterCh:
-	case <-time.After(5 * time.Second):
-		t.Fatal("fake tunnel never received an unregister")
-	}
-}
-
-func (f *fakeTunnelServer) unregisterAt() time.Time {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.unregisterSeenAt
-}
-
-// openHTTPStream opens a server-initiated stream (mirroring a public
-// request arriving at the SaaS tunnel) carrying a raw HTTP request with
-// Host set to f.publicHost — DESIGN.md §3's "OPEN carries no metadata,
-// routed by Host header" — and returns the parsed response.
-func (f *fakeTunnelServer) openHTTPStream(t *testing.T, path string, body []byte) *http.Response {
-	t.Helper()
-	c := f.conn.Load()
+	c := edge.Latest()
 	if c == nil {
 		t.Fatal("no server-side connection yet")
 	}
@@ -179,11 +68,11 @@ func (f *fakeTunnelServer) openHTTPStream(t *testing.T, path string, body []byte
 	if err != nil {
 		t.Fatalf("OpenStream: %v", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, "http://"+f.publicHost+path, bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, "http://"+publicHost+path, bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Host = f.publicHost
+	req.Host = publicHost
 	req.Header.Set("Content-Type", "application/json")
 	req.ContentLength = int64(len(body))
 	if err := req.Write(stream); err != nil {
@@ -199,8 +88,8 @@ func (f *fakeTunnelServer) openHTTPStream(t *testing.T, path string, body []byte
 }
 
 // waitForRegistryActive polls th's registry until host resolves — the
-// fake tunnel's registerCh fires the instant it *sends* "registered" over
-// the wire, which races the real client's dispatcher goroutine actually
+// fake edge records the register (and sends "registered") the instant it
+// arrives, which races the real client's dispatcher goroutine actually
 // applying that reply into its registry (registry.ApplyRegistered). A
 // stream opened before that application lands finds nothing in
 // ResolveByHost and 404s/503s, so callers must wait here first.
@@ -253,7 +142,8 @@ func TestUpE2E_RegisterRelayShutdownUnregister(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fake := newFakeTunnelServer(t, "echo.e2e.mcpwarp.test", "e2e-service-1")
+	const publicHost = "echo.e2e.mcpwarp.test"
+	fake := newEchoEdge(t, publicHost, "e2e-service-1")
 
 	shutdown.ResetForTests()
 	t.Cleanup(shutdown.ResetForTests)
@@ -269,7 +159,7 @@ func TestUpE2E_RegisterRelayShutdownUnregister(t *testing.T) {
 	ctx := &Context{
 		ConfigPath:         configPath,
 		HomeDir:            dir,
-		ConnectURLOverride: fake.url,
+		ConnectURLOverride: fake.URL,
 		Log:                NewLogger(false),
 		Ctx:                upCtx,
 	}
@@ -302,7 +192,7 @@ func TestUpE2E_RegisterRelayShutdownUnregister(t *testing.T) {
 		}
 	})
 
-	fake.waitRegistered(t)
+	fake.WaitRegister(t, 1)
 
 	bridgeMu.Lock()
 	br := startedBridge
@@ -325,16 +215,16 @@ func TestUpE2E_RegisterRelayShutdownUnregister(t *testing.T) {
 	if th == nil {
 		t.Fatal("StartTunnel seam was never called")
 	}
-	// The fake tunnel's registerCh fires as soon as it *sends* "registered",
-	// which races the real client applying that reply into its own
-	// registry — wait for the registry itself before relying on it below.
-	waitForRegistryActive(t, th, "echo.e2e.mcpwarp.test")
+	// The fake edge saw the register as soon as it arrived, which races the
+	// real client applying the "registered" reply into its own registry —
+	// wait for the registry itself before relying on it below.
+	waitForRegistryActive(t, th, publicHost)
 
 	// A "ping" request opened as a stream (mirroring a public HTTP request
 	// hitting the tunnel) should reach the bridge, which reaches the real
 	// fakemcp child, and come back with a real "pong" — the full
 	// tunnel -> registry -> relay -> bridge -> stdio path.
-	resp := fake.openHTTPStream(t, "/mcp", []byte(`{"jsonrpc":"2.0","id":7,"method":"ping"}`))
+	resp := openHTTPStream(t, fake, publicHost, "/mcp", []byte(`{"jsonrpc":"2.0","id":7,"method":"ping"}`))
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("relayed request status = %d", resp.StatusCode)
@@ -350,7 +240,7 @@ func TestUpE2E_RegisterRelayShutdownUnregister(t *testing.T) {
 	// --- shutdown: run the same bounded sequence shutdown.Run/FatalExit
 	// would, without exiting the test binary, then assert its effects.
 	// The pidAlive watcher starts before RunHandlersForTests (not after
-	// waitUnregistered returns) so childDeadAt reflects when the child
+	// the unregister is seen) so childDeadAt reflects when the child
 	// actually died, not merely when this goroutine got scheduled to look
 	// — otherwise the ordering assertion below is tautological (S-5).
 	childDead := make(chan time.Time, 1)
@@ -367,8 +257,12 @@ func TestUpE2E_RegisterRelayShutdownUnregister(t *testing.T) {
 
 	shutdown.RunHandlersForTests(context.Background())
 
-	fake.waitUnregistered(t)
-	unregisterSeenAt := fake.unregisterAt()
+	// Event.At is stamped the instant the frame arrives, so it can be
+	// compared against the child's death time (S-5) without racing whatever
+	// this goroutine does before it looks.
+	unregisterSeenAt := fake.WaitEvent(t, "an unregister", func(e fakeedge.Event) bool {
+		return e.Kind == fakeedge.EventApp && e.Frame.Op == "unregister"
+	}).At
 
 	var childDeadAt time.Time
 	select {

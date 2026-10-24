@@ -249,11 +249,19 @@ func (s *Supervisor) terminate(target State, ctx context.Context) {
 	current := s.current
 	s.mu.Unlock()
 
+	// current is nil when there is no live child to close: Restart() clears
+	// s.current before its spawn, and activate() closes that spawn's child
+	// without tracking it once this terminate() has set the terminal state;
+	// a failed spawn leaves it nil too.
 	closeDone := make(chan struct{})
-	go func() {
-		_ = current.Close()
+	if current != nil {
+		go func() {
+			_ = current.Close()
+			close(closeDone)
+		}()
+	} else {
 		close(closeDone)
-	}()
+	}
 	select {
 	case <-closeDone:
 	case <-ctx.Done():
@@ -298,7 +306,7 @@ func (s *Supervisor) Enable() {
 	done := s.beginEnableLocked()
 	s.mu.Unlock()
 
-	s.runEnable(done)
+	s.runSpawn(done, nil)
 }
 
 // EnsureRunning is the bridge's lazy-respawn safety net (DESIGN.md §7): a
@@ -362,7 +370,7 @@ func (s *Supervisor) EnsureRunning(ctx context.Context) error {
 	s.mu.Unlock()
 
 	if spawn {
-		go s.runEnable(wait)
+		go s.runSpawn(wait, nil)
 	}
 	select {
 	case <-wait:
@@ -391,7 +399,7 @@ func (s *Supervisor) EnsureRunning(ctx context.Context) error {
 }
 
 // beginEnableLocked moves a Disabled/Failed supervisor to Restarting with
-// fresh counters and returns the s.restarting channel runEnable closes.
+// fresh counters and returns the s.restarting channel runSpawn closes.
 // The caller holds s.mu and has checked the state and that no terminate()
 // is in flight.
 func (s *Supervisor) beginEnableLocked() chan struct{} {
@@ -403,12 +411,17 @@ func (s *Supervisor) beginEnableLocked() chan struct{} {
 	return done
 }
 
-// runEnable is the second half of Enable/EnsureRunning: spawn and hand
-// off the child, then release whoever waits on done (terminate(),
+// runSpawn is the second half of Enable/EnsureRunning/Restart: close prev
+// (Restart's outgoing child; nil for Enable/EnsureRunning, whose old child
+// terminate() already closed or that has already exited), spawn and hand
+// off the replacement, then release whoever waits on done (terminate(),
 // Restart(), EnsureRunning callers).
-func (s *Supervisor) runEnable(done chan struct{}) {
+func (s *Supervisor) runSpawn(done chan struct{}, prev *bridge.StdioChild) {
 	s.publish(Restarting)
 
+	if prev != nil {
+		_ = prev.Close()
+	}
 	s.activate()
 
 	s.mu.Lock()
@@ -426,22 +439,37 @@ func (s *Supervisor) runEnable(done chan struct{}) {
 // consecutiveFailures, so it doesn't forgive an ongoing crash loop the
 // way Enable's fresh-counters semantics do. A no-op once Disable()/Stop()
 // has already made the supervisor terminal. Publishes
-// ServerStateChanged restarting→healthy, same shape as Enable.
+// ServerStateChanged restarting→healthy, same shape as Enable, unless it
+// joins an in-flight spawn, which publishes on its own.
+//
+// If a spawn is already in flight — an Enable, an EnsureRunning respawn,
+// another Restart, or a crash restart still waiting out its backoff —
+// Restart joins it and returns once it lands rather than spawning
+// alongside it: that spawn already brings up the fresh child a restart
+// asks for, and a second concurrent activate() would overwrite s.current
+// without closing the first child, leaking it. A joined crash restart is
+// waited out, not cut short, and Restart does not spawn again afterwards
+// even if that spawn ended Failed or back in backoff. As in Enable, the
+// state check, the in-flight check and the move to Restarting happen
+// under one hold of s.mu, so nothing can start a spawn in between.
+//
+// No wait on s.terminating is needed: terminate() sets Disabled/Stopped
+// in the same hold that sets s.terminating, and nothing moves the state
+// off it while terminate() runs (Enable waits it out, EnsureRunning
+// refuses), so the first check below already covers a Disable()/Stop()
+// in flight.
 func (s *Supervisor) Restart() {
 	s.mu.Lock()
-	terminating := s.terminating
-	restarting := s.restarting
-	s.mu.Unlock()
-	if terminating != nil {
-		<-terminating
-	}
-	if restarting != nil {
-		<-restarting
-	}
-
-	s.mu.Lock()
 	if s.state == Disabled || s.state == Stopped {
+		state := s.state
 		s.mu.Unlock()
+		s.log.Debug("restart requested but service is disabled/stopped; ignoring", "name", s.name, "state", state)
+		return
+	}
+	if inFlight := s.restarting; inFlight != nil {
+		s.mu.Unlock()
+		s.log.Debug("restart requested while a spawn is in flight; joining it", "name", s.name)
+		<-inFlight
 		return
 	}
 	current := s.current
@@ -456,17 +484,8 @@ func (s *Supervisor) Restart() {
 	done := make(chan struct{})
 	s.restarting = done
 	s.mu.Unlock()
-	s.publish(Restarting)
 
-	_ = current.Close()
-	s.activate()
-
-	s.mu.Lock()
-	if s.restarting == done {
-		s.restarting = nil
-	}
-	s.mu.Unlock()
-	close(done)
+	s.runSpawn(done, current)
 }
 
 func (s *Supervisor) wire(child *bridge.StdioChild) {
@@ -515,13 +534,19 @@ func (s *Supervisor) handleExit(child *bridge.StdioChild, info bridge.ExitInfo) 
 	s.backingOff = true
 	done := make(chan struct{})
 	s.restarting = done
+	// The backoff's cancel channel is registered in this same hold, not
+	// later in restartAfter's goroutine: a Disable()/Stop() landing in
+	// between would otherwise find no sleepCancel to close, wait on
+	// s.restarting, and sit out the whole backoff (up to 30s).
+	cancel := make(chan struct{})
+	s.sleepCancel = cancel
 	s.mu.Unlock()
 	s.publish(Restarting)
 
 	s.log.Info(s.name+": exited, restarting", "name", s.name, "code", info.Code, "signal", info.Signal, "delayMs", delay.Milliseconds())
 
 	go func() {
-		s.restartAfter(delay)
+		s.restartAfter(delay, cancel)
 		s.mu.Lock()
 		if s.restarting == done {
 			s.restarting = nil
@@ -551,13 +576,9 @@ func (s *Supervisor) backoffDelayLocked() time.Duration {
 // restartAfter sleeps delay, then activates a replacement child — unless
 // a concurrent Disable()/Stop() cuts the sleep short via sleepCancel, in
 // which case terminate() is already waiting and must not block for the
-// rest of a backoff that can be up to 30s.
-func (s *Supervisor) restartAfter(delay time.Duration) {
-	cancel := make(chan struct{})
-	s.mu.Lock()
-	s.sleepCancel = cancel
-	s.mu.Unlock()
-
+// rest of a backoff that can be up to 30s. cancel is the s.sleepCancel
+// handleExit registered; terminate() may already have closed it.
+func (s *Supervisor) restartAfter(delay time.Duration, cancel chan struct{}) {
 	sleepDone := make(chan struct{})
 	go func() {
 		s.sleep(delay)

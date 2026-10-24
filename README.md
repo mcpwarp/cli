@@ -96,6 +96,8 @@ mcpwarp dashboard   # opens the mcpwarp dashboard in your browser
 mcpwarp status      # config path, server table, login status
 ```
 
+Point your MCP client at the public URL shown by `mcpwarp up` and in the dashboard. It ends in `/mcp`, and only that exact path is forwarded; a query string is fine. Any other path, such as `/sse`, `/messages`, `/mcp/` or `/MCP`, gets `404 {"error":"not_found"}` and never reaches your server (since v0.3.0; earlier versions forwarded other paths too). For an `http` server, the `url` must be the server's Streamable HTTP endpoint: every request to `/mcp`, GET included, goes to that exact URL. If your server only speaks HTTP+SSE (`/sse` plus `/messages`), switch it to Streamable HTTP, or run it as a `stdio` server if it supports that.
+
 ## Environment variables
 
 | Variable | Purpose | Default |

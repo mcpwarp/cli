@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,7 @@ import (
 	"github.com/mcpwarp/cli/internal/registry"
 	"github.com/mcpwarp/cli/internal/relay"
 	"github.com/mcpwarp/cli/internal/shutdown"
+	"github.com/mcpwarp/ws-mixer-go/mcpwarp"
 	"github.com/mcpwarp/ws-mixer-go/wsmixer"
 )
 
@@ -86,6 +88,11 @@ type Config struct {
 	// sets a short Cap so a redial scheduled at random(0, Cap) doesn't take
 	// up to 30s.
 	Reconnect wsmixer.ReconnectOptions
+
+	// afterFunc runs f once d has passed and returns a func that cancels it
+	// (time.AfterFunc's shape, the default when nil): the clock behind the
+	// OVERLOADED re-send and the transient retry. A test steps it by hand.
+	afterFunc func(d time.Duration, f func()) (stop func() bool)
 }
 
 // withReconnectDefaults fills r's zero Base/Cap/StableAfter with this CLI's
@@ -114,7 +121,6 @@ type Tunnel struct {
 	client    *wsmixer.Client
 	registry  *registry.Registry
 	forwarder *relay.Forwarder
-	overload  *appproto.OverloadQueue
 	disp      *dispatcher
 
 	// unreachableWarn is shared across every relayed stream so relay.go's
@@ -131,18 +137,76 @@ type Tunnel struct {
 	relayCancel context.CancelFunc
 	relayWG     sync.WaitGroup
 
-	// sendWG tracks every in-flight sendApp/Unregister goroutine (each an
-	// OverloadQueue.Send call, which can block for as long as an
-	// OVERLOADED pause plus its place in the queue takes) so Close can wait
-	// for them, bounded by appSendTimeout.
+	// sendWG tracks every in-flight writeFrame goroutine (a SendApp, which
+	// can block on a full control queue) so Close can wait for them, bounded
+	// by appSendTimeout.
 	sendWG sync.WaitGroup
 
-	registerBody   map[string]any
-	unregisterBody map[string]any
 	// kindByName is derived from cfg.Services once in Start (each
 	// RegisterService already names its own kind, so there's nothing for a
 	// caller to supply separately).
 	kindByName map[string]string
+
+	// The fields from frames to idleWaiters are ws-mixer-spec MCPWARP.md
+	// §2.6's frames in flight and §3.2's transient retry. Only the
+	// dispatcher goroutine touches them, so they need no lock.
+	//
+	// frames holds every register/unregister not yet answered, at most one
+	// of them outstanding (plus the closing unregister, FrameQueue.Close) on
+	// framesConn, the connection onConnect last started them on (nil once it
+	// ended).
+	frames     *appproto.FrameQueue
+	framesConn *wsmixer.Conn
+	// resendStop cancels the outstanding frame's scheduled OVERLOADED
+	// re-send, nil when none is.
+	resendStop func() bool
+	// overloadedReported: an OVERLOADED AppError has been published for the
+	// outstanding frame, so its repeats only log at Debug until the frame is
+	// settled or dropped (stopResend, frameWriteFailed).
+	overloadedReported bool
+	// retries are the scheduled per-name transient re-sends (§3.2 Transient
+	// per name); a disconnect cancels them, the next welcome registers
+	// anyway.
+	retries map[*transientRetry]bool
+	// transientFailures is §3.2's transient counter: consecutive
+	// all-transient "registered" replies, carried across reconnects.
+	transientFailures int
+	// retrying marks each name in a transient retry series, until a final
+	// answer or a local `d`/`e` ends the series, so only the first transient
+	// error of a series is reported. It survives reconnects, as the
+	// transient counter does.
+	retrying map[string]retryMark
+	// notes holds, per name and per ServiceChanged code, the edge's text for
+	// it (a register error's message, a disable's or conflict's reason) —
+	// what serviceState puts in Message.
+	notes map[string]map[string]string
+	// published is the last eventbus.ServiceChanged published per configured
+	// name, seeded pending, so publishServiceChanges reports each change
+	// once.
+	published map[string]eventbus.ServiceChanged
+	// held is ws-mixer-spec MCPWARP.md §3.3's "holds" for the connection
+	// frames last started on: the names a "registered" on it carried a
+	// services[] entry for (a taken-over one's doesn't count), less those
+	// an unregister on it settled or a conflict took. A conflict for any
+	// other name is ignored (§2.7). Reset
+	// by startFrames, not by a disconnect: a conflict the ended connection
+	// still delivers is applied (§2.7 Ended connection).
+	held map[string]bool
+	// endedConn is the connection a connected-phase disconnect last ended:
+	// a registered/unregistered/disable/enable it still delivers after that
+	// is ignored (§2.7 Ended connection), as is one delivered once the
+	// connection's Done was closed (onApp).
+	endedConn *wsmixer.Conn
+	// closing is set by Unregister: no register goes out after it (§3.2
+	// Unregister).
+	closing bool
+	// idleWaiters are closed once frames is idle or its connection ended
+	// (Unregister's wait for its frame's reply).
+	idleWaiters []chan struct{}
+	// fatalSent: checkFatal already called FatalExit.
+	fatalSent bool
+	// stopped is set by Close (stopFrames): no frame is written after it.
+	stopped bool
 
 	// connLimitReported is set once a CONNECTION_LIMIT AppError has been
 	// published for the current connection attempt, so the app-level error
@@ -182,17 +246,24 @@ type Tunnel struct {
 	// "registered" batch with at least one success — it lives on the
 	// Tunnel, not per-connection, so it stays true across every reconnect
 	// this process makes, same as Node client.ts's sawFirstRegistered. Only
-	// handleApp's dispatcher goroutine touches it, so it needs no lock.
+	// the dispatcher goroutine touches it (handleApp, checkFatal), so it
+	// needs no lock.
 	sawFirstRegistered bool
 
 	// liveConn is the connection onConnect last bound, stored on the SDK's
 	// callback goroutine and read on the dispatcher's (see superseded).
 	liveConn atomic.Pointer[wsmixer.Conn]
+
+	// closeStarted is set as Close begins, before the client's own close,
+	// so onDisconnect knows the end it reports is ours even when Close runs
+	// without Unregister having set closing first.
+	closeStarted atomic.Bool
 }
 
-// Connection state, stream-open/close and app-error events are published
-// as the canonical eventbus.* types (eventbus.ConnStateChanged/
-// StreamOpened/StreamClosed/AppError) rather than local duplicates.
+// Connection state, stream-open/close, app-error and per-service
+// registration events are published as the canonical eventbus.* types
+// (eventbus.ConnStateChanged/StreamOpened/StreamClosed/AppError/
+// ServiceChanged) rather than local duplicates.
 
 const unregisterBudget = 2 * time.Second
 
@@ -206,13 +277,14 @@ func Start(ctx context.Context, cfg Config) (*Tunnel, error) {
 		cfg.FatalExit = shutdown.FatalExit
 	}
 	cfg.Reconnect = withReconnectDefaults(cfg.Reconnect)
+	if cfg.afterFunc == nil {
+		cfg.afterFunc = func(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop }
+	}
 	kindByName := make(map[string]string, len(cfg.Services))
-	regServices := make([]appproto.RegisterService, len(cfg.Services))
-	unregServices := make([]appproto.UnregisterService, len(cfg.Services))
-	for i, s := range cfg.Services {
+	published := make(map[string]eventbus.ServiceChanged, len(cfg.Services))
+	for _, s := range cfg.Services {
 		kindByName[s.Name] = s.Kind
-		regServices[i] = s
-		unregServices[i] = appproto.UnregisterService{Name: s.Name}
+		published[s.Name] = eventbus.ServiceChanged{Name: s.Name, Kind: s.Kind, State: statePending}
 	}
 
 	relayCtx, relayCancel := context.WithCancel(context.Background())
@@ -223,14 +295,17 @@ func Start(ctx context.Context, cfg Config) (*Tunnel, error) {
 		log:               cfg.Log,
 		registry:          reg,
 		forwarder:         relay.NewForwarder(),
-		overload:          appproto.NewOverloadQueue(),
 		disp:              newDispatcher(),
 		unreachableWarn:   relay.NewUnreachableWarnLimiter(),
 		relayCtx:          relayCtx,
 		relayCancel:       relayCancel,
-		registerBody:      appproto.EncodeRegister(regServices),
-		unregisterBody:    appproto.EncodeUnregister(unregServices),
 		kindByName:        kindByName,
+		frames:            appproto.NewFrameQueue(),
+		retries:           make(map[*transientRetry]bool),
+		retrying:          make(map[string]retryMark),
+		notes:             make(map[string]map[string]string),
+		published:         published,
+		held:              make(map[string]bool),
 		localUnregistered: make(map[string]bool),
 		takenOver:         make(map[string]bool),
 	}
@@ -330,11 +405,8 @@ func (t *Tunnel) onConnect(c *wsmixer.Conn, welcome *wsmixer.WelcomeMsg) {
 		}
 		t.log.Info("connected to tunnel", "session", session)
 		t.publish(eventbus.ConnStateChanged{State: "connected", Session: session})
-		if body := t.currentRegisterBody(); body != nil {
-			t.sendApp(c, body, func(err error) {
-				t.log.Warn("failed to send register", "err", err)
-			})
-		}
+		t.startFrames(c)
+		t.publishServiceChanges()
 	})
 }
 
@@ -352,13 +424,45 @@ func (t *Tunnel) onApp(c *wsmixer.Conn, raw json.RawMessage) {
 	if msg == nil {
 		return // no mcpwarp envelope at all, or an unparseable one — nothing worth logging
 	}
+	// OnApp runs on c's own delivery goroutine, unordered against the
+	// disconnect report, so a message flushed after c ended can reach the
+	// dispatcher before onDisconnect's task marks endedConn: c's own Done,
+	// read at delivery like ws-mixer-go's mcpwarp session does, catches that.
+	doneAtDelivery := c != nil && isDone(c.Done())
 	t.disp.enqueue(func() {
 		if t.superseded(c) {
 			t.log.Debug("ignoring an app message from a superseded tunnel connection", "session", c.Session(), "op", msg.Op)
 			return
 		}
+		if ended := c != nil && (c == t.endedConn || doneAtDelivery); ended && !appliesAfterEnd(msg.Op) {
+			t.log.Debug("ignoring an app message from an ended tunnel connection", "session", c.Session(), "op", msg.Op)
+			return
+		}
 		t.handleApp(msg)
 	})
+}
+
+// isDone reports, without blocking, whether done is closed.
+func isDone(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
+// appliesAfterEnd reports whether op still applies when it arrives from a
+// connection that has ended (ws-mixer-spec MCPWARP.md §2.7 Ended
+// connection): a conflict is sticky and an error may be fatal; a
+// registered, unregistered, disable or enable is stale.
+func appliesAfterEnd(op string) bool {
+	switch op {
+	case appproto.OpRegistered, appproto.OpUnregistered, appproto.OpDisable, appproto.OpEnable:
+		return false
+	default:
+		return true
+	}
 }
 
 // superseded reports whether c is no longer the live connection, like
@@ -379,6 +483,8 @@ func (t *Tunnel) superseded(c *wsmixer.Conn) bool {
 }
 
 func (t *Tunnel) handleApp(msg *appproto.Inbound) {
+	// Whatever msg moved a service to is reported once it is fully applied.
+	defer t.publishServiceChanges()
 	switch msg.Op {
 	case appproto.OpUnknown:
 		// DESIGN.md §8's "ignored-with-log": an unrecognized op, or a
@@ -387,94 +493,138 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 		t.log.Warn("ignoring unrecognized mcpwarp app message", "op", msg.UnknownOp, "v", msg.UnknownV)
 
 	case appproto.OpRegistered:
-		// ws-mixer-spec MCPWARP.md §6A.6 G5 (fixture tunnel/
-		// ms_11_first_reply_disabled_and_refused_not_fatal): zero successes
-		// in a batch is only fatal while this process has never registered
-		// anything, and never when any error is SERVER_DISABLED. That name is
-		// disabled, not rejected, and its dashboard "enable" arrives on this
-		// connection, so not every service is refused — however the reply
-		// refused the others. Transient codes (INTERNAL) still count as
-		// refusals here, unlike G5, since the CLI does not retry per name
-		// (ws-mixer-spec §11 row 50). A transient all-error reply to a
-		// sendRegisterFor re-register, or a reconnect whose only server
-		// bounces SERVER_DISABLED, must not kill an otherwise-healthy
-		// process either.
-		zeroSuccesses := len(msg.Services) == 0 && len(msg.Errors) > 0
-		anyServerDisabled := false
-		for _, svcErr := range msg.Errors {
-			if svcErr.Code == "SERVER_DISABLED" {
-				anyServerDisabled = true
-				break
+		listed := make([]string, 0, len(msg.Services)+len(msg.Errors))
+		for _, s := range msg.Services {
+			listed = append(listed, s.Name)
+		}
+		var refused []appproto.ServiceError
+		var retry []string
+		for _, e := range msg.Errors {
+			listed = append(listed, e.Name)
+			if mcpwarp.IsTransientRegisterError(mcpwarp.RegisterErrorCode(e.Code)) {
+				retry = append(retry, e.Name)
+			} else {
+				refused = append(refused, e)
 			}
 		}
-		fatal := zeroSuccesses && !anyServerDisabled && !t.sawFirstRegistered
+		settled := t.frames.Reply(appproto.OpRegister, listed)
+		// ws-mixer-spec MCPWARP.md §6A.7 Correlation: a name of the answered
+		// register that the reply leaves out is a transient failure, and a
+		// reply listing none of its names counts as all-transient (§2.3
+		// Empty reply). One that starts a retry series that way shows
+		// INTERNAL "unlisted in reply" (§6A.7's retry reason) while pending,
+		// so its row says why, until the series' first transient error
+		// replaces it; nothing is logged for it.
+		listsNone := false
+		if settled != nil {
+			t.stopResend()
+			listsNone = true
+			for _, name := range settled.Names {
+				if slices.Contains(listed, name) {
+					listsNone = false
+					continue
+				}
+				retry = append(retry, name)
+				if t.retrying[name].code == "" {
+					t.retrying[name] = retryMark{code: unlistedCode}
+					t.note(name, unlistedCode, unlistedMessage)
+				}
+			}
+		}
 
 		// A "conflict" can land before the reply naming that same name: the
 		// tunnel records this session's hold before replying, so a
 		// concurrent take-over's frame can overtake the reply (an `e` reply
 		// in flight can lose the same race). The take-over is the newer
 		// fact, so neither a success nor an error for a taken-over name may
-		// replace its CONFLICT: a success would flip the row back to active
+		// replace its TAKEN_OVER: a success would flip the row back to active
 		// with a dead URL, a SERVER_DISABLED would read as resumable by a
-		// dashboard enable that OpEnable ignores. The fatal check above and
-		// the per-error log below still read the raw reply, so a first batch
-		// whose only success was taken over isn't mistaken for a fatal
-		// zero-success one.
+		// dashboard enable that OpEnable ignores. The per-error log below
+		// still reads the raw reply.
 		taken := t.takenOverSnapshot()
 
-		// Recorded before any early return below: a rejected name never
-		// reaches ApplyRegistered, so without this the registry has no
-		// record of it at all and the dashboard (cli.pollTunnelForTUI) can't
-		// tell "rejected" apart from "not answered yet".
-		t.registry.ApplyRegisterErrors(withoutTaken(msg.Errors, taken, func(e appproto.ServiceError) string { return e.Name }), t.kindByName)
+		// A refused name never reaches ApplyRegistered, so without this the
+		// registry has no record of it at all and publishServiceChanges
+		// can't tell "rejected" apart from "not answered yet". A transient
+		// code (§2.5) isn't a refusal: its name stays pending and is re-sent
+		// below (§3.2 Transient per name).
+		t.registry.ApplyRegisterErrors(withoutTaken(refused, taken, func(e appproto.ServiceError) string { return e.Name }), t.kindByName)
 		for _, svcErr := range msg.Errors {
+			// A transient error is reported once per retry series; its
+			// repeats until the name gets a final answer only log at Debug.
+			// The first one becomes the series' code (retryMark), replacing
+			// the unlisted placeholder a series that began with the name
+			// left out of a reply carries until then.
+			if mcpwarp.IsTransientRegisterError(mcpwarp.RegisterErrorCode(svcErr.Code)) {
+				m := t.retrying[svcErr.Name]
+				if m.reported {
+					t.log.Debug("register error; still retrying", "name", svcErr.Name, "code", svcErr.Code, "message", svcErr.Message)
+					continue
+				}
+				m.reported = true
+				m.code = svcErr.Code
+				t.note(svcErr.Name, svcErr.Code, svcErr.Message)
+				t.retrying[svcErr.Name] = m
+			} else {
+				t.note(svcErr.Name, serviceCode(svcErr.Code), svcErr.Message)
+			}
 			t.log.Warn("register error", "name", svcErr.Name, "code", svcErr.Code, "message", svcErr.Message)
-			hint := registerErrorHint(svcErr.Code, t.cfg.WebURL)
-			t.publish(eventbus.AppError{Code: svcErr.Code, Message: svcErr.Message, Service: svcErr.Name, Hint: hint})
-			if hint != "" {
+			if hint := registerErrorHint(svcErr.Code, t.cfg.WebURL); hint != "" {
 				t.log.Warn(hint)
 			}
 		}
-		if fatal {
-			// FatalExit runs shutdown.FatalExit -> Tunnel.Close(ctx), which
-			// waits on this same dispatcher goroutine to drain — calling it
-			// synchronously here would self-deadlock. Node's counterpart is
-			// likewise fire-and-forget ("void fatalExit(1)").
-			go t.cfg.FatalExit(1)
-			return
+		for _, e := range refused {
+			delete(t.retrying, e.Name)
 		}
-		if zeroSuccesses || len(msg.Services) == 0 {
-			return
-		}
-		t.sawFirstRegistered = true
-		services := withoutTaken(msg.Services, taken, func(s appproto.RegisteredService) string { return s.Name })
-		if len(services) == 0 {
-			return
-		}
-		result := t.registry.ApplyRegistered(services, t.kindByName)
-		for _, name := range result.Created {
-			t.log.Info("new public URL assigned", "name", name)
-		}
-		for _, r := range result.Resurrected {
-			t.log.Info("server is active again (was disabled before this reconnect)", "name", r.Name)
-			if t.cfg.OnEnable != nil {
-				go t.cfg.OnEnable(r.Name)
+		for _, s := range msg.Services {
+			delete(t.retrying, s.Name)
+			if !taken[s.Name] {
+				t.held[s.Name] = true
 			}
 		}
-		for _, resolved := range t.registry.ResolvePendingDisables() {
-			t.log.Info("resolving a disable that arrived before this service's name was known", "id", resolved.ID, "name", resolved.Name)
-			if t.cfg.OnDisable != nil {
-				go t.cfg.OnDisable(resolved.Name, resolved.ID, resolved.Reason)
-			}
+		if len(msg.Services) > 0 {
+			t.sawFirstRegistered = true
+			t.applyRegisteredServices(withoutTaken(msg.Services, taken, func(s appproto.RegisteredService) string { return s.Name }))
 		}
+
+		// §3.2 Transient retry: a reply with any non-transient entry for the
+		// frame resets the counter, and its transient names wait the n = 1
+		// delay.
+		n := 1
+		if !listsNone && (len(msg.Services) > 0 || len(refused) > 0) {
+			t.transientFailures = 0
+		} else if len(retry) > 0 {
+			t.transientFailures++
+			n = t.transientFailures
+		}
+		t.retryTransient(retry, appproto.ResendDelay(n))
+		t.pump()
+		t.checkFatal()
 
 	case appproto.OpUnregistered:
 		t.log.Debug("unregistered", "services", msg.UnregisteredServices)
+		// §3.2 Transient retry: an "unregistered" is a successful reply.
+		t.transientFailures = 0
+		names := make([]string, len(msg.UnregisteredServices))
+		for i, s := range msg.UnregisteredServices {
+			names[i] = s.Name
+			delete(t.held, s.Name)
+		}
+		// §2.7: the settled unregister's names leave the held set whether
+		// the reply listed them or not.
+		if f := t.frames.Reply(appproto.OpUnregister, names); f != nil {
+			for _, name := range f.Names {
+				delete(t.held, name)
+			}
+			t.stopResend()
+			t.pump()
+		}
 
 	case appproto.OpDisable:
 		name, known := t.registry.ApplyDisable(msg.DisableID, msg.DisableReason)
 		if known {
 			t.log.Warn("server disabled by the tunnel", "name", name, "reason", msg.DisableReason)
+			t.note(name, string(mcpwarp.CodeDisabled), msg.DisableReason)
 			if t.cfg.OnDisable != nil {
 				go t.cfg.OnDisable(name, msg.DisableID, msg.DisableReason)
 			}
@@ -504,10 +654,10 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 		if t.cfg.OnEnable != nil {
 			go t.cfg.OnEnable(msg.EnableName)
 		}
-		// RegisterService, not sendRegisterFor directly: a dashboard enable
-		// for a name the user had also locally `d`-disabled must clear
-		// localUnregistered too, or the child gets respawned/registered now
-		// but dropped again silently on the very next reconnect.
+		// RegisterService clears localUnregistered too: a dashboard enable
+		// for a name the user had also locally `d`-disabled would otherwise
+		// get the child respawned/registered now but dropped again silently
+		// on the very next reconnect.
 		t.RegisterService(msg.EnableName)
 
 	case appproto.OpConflict:
@@ -516,33 +666,46 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 		// every other name on this connection stays live. Keyed on name,
 		// like enable (the frame carries it): the id is only cross-checked,
 		// since ignoring a mismatch would leave the stale `active` row this
-		// op exists to correct. The name reads rejected (CONFLICT), which
-		// drops its URL from the dashboard, and stays out of every register
-		// batch (takenOver) until a local `e` reclaims it. A stdio child is
-		// left running, unlike a dashboard disable: `e` brings the name
-		// back without a respawn.
+		// op exists to correct. The name reads taken_over (recorded in the
+		// registry as a TAKEN_OVER rejection), which drops its URL from the
+		// dashboard, and stays out of every register batch (takenOver) until
+		// a local `e` reclaims it. A stdio child is left running, unlike a
+		// dashboard disable: `e` brings the name back without a respawn.
 		name := msg.ConflictName
 		if !t.hasConfiguredService(name) {
 			t.log.Debug("conflict for a name this connection doesn't hold; ignoring", "name", name, "id", msg.ConflictID)
 			return
 		}
+		// ws-mixer-spec MCPWARP.md §3.3/§2.7: only a name this connection
+		// holds can be taken from it. One only in an outstanding register
+		// gets its outcome from that register's reply.
+		if !t.held[name] {
+			if f := t.frames.Outstanding(); f != nil && f.Op == appproto.OpRegister && slices.Contains(f.Names, name) {
+				t.log.Debug("conflict for a name only in an outstanding register; its reply decides", "name", name, "id", msg.ConflictID)
+			} else {
+				t.log.Debug("conflict for a name this connection doesn't hold; ignoring", "name", name, "id", msg.ConflictID)
+			}
+			return
+		}
+		delete(t.held, name)
 		if entry, ok := t.registry.Get(name); ok && entry.ID != msg.ConflictID {
 			t.log.Warn("conflict id differs from this name's registered id; applying it by name", "name", name, "id", msg.ConflictID, "registeredId", entry.ID)
 		}
 		t.mu.Lock()
 		t.takenOver[name] = true
 		t.mu.Unlock()
-		message := fmt.Sprintf("another mcpwarp session of this account registered this name (%s)", msg.ConflictReason)
-		t.registry.ApplyRegisterErrors([]appproto.ServiceError{{Name: name, Code: "CONFLICT", Message: message}}, t.kindByName)
+		delete(t.retrying, name)
+		code := string(mcpwarp.CodeTakenOver)
+		t.registry.ApplyRegisterErrors([]appproto.ServiceError{{Name: name, Code: code, Message: msg.ConflictReason}}, t.kindByName)
+		t.note(name, code, msg.ConflictReason)
 		t.log.Warn("server taken over by another mcpwarp session", "name", name, "id", msg.ConflictID, "reason", msg.ConflictReason)
 		t.log.Warn(takenOverHint)
-		t.publish(eventbus.AppError{Code: "CONFLICT", Message: message, Service: name, Hint: takenOverHint})
 
 	case appproto.OpError:
 		if msg.ErrorCode == "UNSUPPORTED_VERSION" {
 			t.log.Error("this mcpwarp CLI speaks a protocol version the tunnel no longer supports; upgrade mcpwarp")
-			// See the "registered" fatal path above: must not run
-			// synchronously on this dispatcher goroutine.
+			// See checkFatal: must not run synchronously on this dispatcher
+			// goroutine.
 			go t.cfg.FatalExit(1)
 			return
 		}
@@ -552,42 +715,84 @@ func (t *Tunnel) handleApp(msg *appproto.Inbound) {
 			t.publishConnLimitError(eventbus.AppError{Code: msg.ErrorCode, Message: message, Hint: connectionLimitHint})
 			return
 		}
-		if msg.ErrorCode == "TOO_MANY_SERVICES" {
-			// The tunnel refuses a register naming more services than its
-			// cap as a whole, with no "registered" reply (agentconn.go's
-			// maxServicesPerRegister). Only a welcome batch can be that big
-			// (`e` re-registers one name), so none of its names is
-			// registered on this connection: record each as rejected rather
-			// than leave its row pending on a reply that never comes. A
-			// taken-over name wasn't in the batch and keeps its CONFLICT;
-			// ApplyRegisterErrors skips a locally disabled one likewise.
+		if msg.ErrorCode == "OVERLOADED" {
+			// ws-mixer-spec MCPWARP.md §2.6 OVERLOADED re-send: the
+			// outstanding frame was dropped unprocessed and goes out again
+			// after its own backoff — unless it is a register while closing,
+			// which is abandoned (§3.2 Unregister) and frees the slot. Only
+			// the first OVERLOADED of a frame is reported; the re-sends are
+			// automatic, so its repeats only log at Debug.
+			if t.overloadedReported {
+				t.log.Debug(msg.ErrorMessage, "code", msg.ErrorCode)
+			} else {
+				t.overloadedReported = true
+				t.publish(eventbus.AppError{Code: msg.ErrorCode, Message: msg.ErrorMessage, Hint: overloadedHint})
+				t.log.Warn(msg.ErrorMessage, "code", msg.ErrorCode)
+			}
+			if delay, ok := t.frames.Overloaded(); ok {
+				t.armResend(delay)
+			} else {
+				t.pump()
+			}
+			return
+		}
+		// Any other code answers the outstanding frame (§2.6 One in flight;
+		// §6A.6 G7): a register's names are not registered on this
+		// connection and nothing is re-sent, so each is recorded rejected
+		// with the code rather than left pending on a reply that never
+		// comes, and reported per name (publishServiceChanges) rather than
+		// as an AppError. A taken-over name keeps its TAKEN_OVER;
+		// ApplyRegisterErrors skips a locally disabled one likewise.
+		// TOO_MANY_SERVICES is the tunnel refusing a register naming more
+		// services than its cap as a whole, with no "registered" reply
+		// (agentconn.go's maxServicesPerRegister).
+		hint := registerErrorHint(msg.ErrorCode, t.cfg.WebURL)
+		switch msg.ErrorCode {
+		case "TOO_MANY_SERVICES":
+			hint = tooManyServicesHint
 			t.log.Warn(msg.ErrorMessage, "code", msg.ErrorCode)
-			t.log.Warn(tooManyServicesHint)
-			errs := make([]appproto.ServiceError, 0, len(t.cfg.Services))
-			for _, s := range t.cfg.Services {
-				if !t.isTakenOver(s.Name) {
-					errs = append(errs, appproto.ServiceError{Name: s.Name, Code: msg.ErrorCode, Message: msg.ErrorMessage})
+		case "UNKNOWN_OP", "BAD_REQUEST":
+			t.log.Warn("protocol mismatch — upgrade mcpwarp", "code", msg.ErrorCode)
+		default:
+			t.log.Warn(msg.ErrorMessage, "code", msg.ErrorCode)
+		}
+		if hint != "" {
+			t.log.Warn(hint)
+		}
+		f := t.frames.FrameError()
+		if f != nil {
+			t.stopResend()
+		}
+		switch {
+		case f != nil && f.Op == appproto.OpRegister:
+			errs := make([]appproto.ServiceError, 0, len(f.Names))
+			for _, name := range f.Names {
+				delete(t.retrying, name)
+				if !t.isTakenOver(name) {
+					errs = append(errs, appproto.ServiceError{Name: name, Code: msg.ErrorCode, Message: msg.ErrorMessage})
+					t.note(name, msg.ErrorCode, msg.ErrorMessage)
 				}
 			}
 			t.registry.ApplyRegisterErrors(errs, t.kindByName)
-			t.publish(eventbus.AppError{Code: msg.ErrorCode, Message: msg.ErrorMessage, Hint: tooManyServicesHint})
-			return
+		case f != nil:
+			// §6A.7 Correlation: settled like an "unregistered" would be.
+			t.log.Warn("an error op answered an unregister; treating it as unregistered", "names", f.Names, "code", msg.ErrorCode)
+			for _, name := range f.Names {
+				delete(t.held, name)
+			}
+			t.publish(eventbus.AppError{Code: msg.ErrorCode, Message: msg.ErrorMessage, Hint: hint})
+		default:
+			t.publish(eventbus.AppError{Code: msg.ErrorCode, Message: msg.ErrorMessage, Hint: hint})
 		}
-		t.publish(eventbus.AppError{Code: msg.ErrorCode, Message: msg.ErrorMessage})
-		if msg.ErrorCode == "OVERLOADED" {
-			t.overload.Trigger()
-		}
-		if msg.ErrorCode == "UNKNOWN_OP" || msg.ErrorCode == "BAD_REQUEST" {
-			t.log.Warn("protocol mismatch — upgrade mcpwarp", "code", msg.ErrorCode)
-		} else {
-			t.log.Warn(msg.ErrorMessage, "code", msg.ErrorCode)
-		}
+		t.pump()
+		t.checkFatal()
 	}
 }
 
 // registerErrorHint returns the code-specific next step for a "registered"
 // reply's per-service error, or "" when the code has none — the single
-// source both the log line and the AppError event's Hint are drawn from.
+// source both the log line and the ServiceChanged event's Hint are drawn
+// from.
 func registerErrorHint(code, webURL string) string {
 	switch code {
 	case "QUOTA_EXCEEDED":
@@ -605,39 +810,154 @@ func registerErrorHint(code, webURL string) string {
 	}
 }
 
-// currentRegisterBody builds the "register" payload for this connect or
-// reconnect, omitting any name currently in localUnregistered (a local `d`
-// keypress not yet followed by `e`) or takenOver (a "conflict" not yet
-// followed by `e`) — see those fields' docs. The common case (neither,
-// including every fresh `up`) returns the same precomputed t.registerBody
-// rather than re-encoding it. Returns nil if every configured service is
-// left out: neither this CLI nor Node's ever sends a register with an
-// empty services list, and the server may bounce an empty batch as
-// BAD_REQUEST, which handleApp would then log as a protocol mismatch.
-func (t *Tunnel) currentRegisterBody() map[string]any {
-	t.mu.Lock()
-	skip := make(map[string]bool, len(t.localUnregistered)+len(t.takenOver))
-	for name := range t.localUnregistered {
-		skip[name] = true
+// eventbus.ServiceChanged's State values.
+const (
+	statePending   = "pending"
+	stateActive    = "active"
+	stateRejected  = "rejected"
+	stateDisabled  = "disabled"
+	stateTakenOver = "taken_over"
+)
+
+// serviceCode maps a register error's wire code to the ServiceChanged Code
+// it is reported under: SERVER_DISABLED is the dashboard's disable, DISABLED
+// (ws-mixer-spec MCPWARP.md §6A.4), like a "disable" op; every other code
+// as received.
+func serviceCode(wireCode string) string {
+	if wireCode == "SERVER_DISABLED" {
+		return string(mcpwarp.CodeDisabled)
 	}
-	for name := range t.takenOver {
-		skip[name] = true
+	return wireCode
+}
+
+// serviceHint is the ServiceChanged Hint for code: a register error's own
+// hint, the whole-frame TOO_MANY_SERVICES one, the take-over one, or for a
+// dashboard disable SERVER_DISABLED's.
+func (t *Tunnel) serviceHint(code string) string {
+	switch code {
+	case "TOO_MANY_SERVICES":
+		return tooManyServicesHint
+	case string(mcpwarp.CodeTakenOver):
+		return takenOverHint
+	case string(mcpwarp.CodeDisabled):
+		return registerErrorHint("SERVER_DISABLED", t.cfg.WebURL)
+	default:
+		return registerErrorHint(code, t.cfg.WebURL)
 	}
-	n := len(skip)
-	t.mu.Unlock()
-	if n == 0 {
-		return t.registerBody
+}
+
+// note records message as the edge's text for name's code (see notes).
+func (t *Tunnel) note(name, code, message string) {
+	if t.notes[name] == nil {
+		t.notes[name] = make(map[string]string)
 	}
-	subset := make([]appproto.RegisterService, 0, len(t.cfg.Services))
+	t.notes[name][code] = message
+}
+
+// serviceState is name's registration state as a ServiceChanged, from its
+// registry row and whether it is taken over, first match wins
+// (ws-mixer-spec MCPWARP.md §6A.5): a local `d`; a take-over; a register
+// outstanding, queued or scheduled for a transient retry (pending, carrying
+// the series' first code, see retryMark); SERVER_DISABLED (disabled,
+// DISABLED); any other refusal (rejected with its code); a dashboard
+// disable (disabled, DISABLED); a success (active, with its URL); else
+// pending.
+func (t *Tunnel) serviceState(name, kind string, row registry.Row, takenOver bool) eventbus.ServiceChanged {
+	evt := eventbus.ServiceChanged{Name: name, Kind: kind}
+	switch {
+	case row.LocallyDisabled:
+		evt.State = stateDisabled
+	case takenOver:
+		evt.State, evt.Code = stateTakenOver, string(mcpwarp.CodeTakenOver)
+	case row.Reregistering:
+		evt.State, evt.Code = statePending, t.retrying[name].code
+	case row.Rejected == "SERVER_DISABLED":
+		evt.State, evt.Code = stateDisabled, serviceCode(row.Rejected)
+	case row.Rejected != "":
+		evt.State, evt.Code = stateRejected, row.Rejected
+	case row.Disabled:
+		evt.State, evt.Code = stateDisabled, string(mcpwarp.CodeDisabled)
+	case row.URL != "":
+		evt.State, evt.URL = stateActive, row.URL
+	default:
+		evt.State = statePending
+	}
+	if evt.Code != "" {
+		evt.Message = t.notes[name][evt.Code]
+		evt.Hint = t.serviceHint(evt.Code)
+	}
+	return evt
+}
+
+// publishServiceChanges publishes an eventbus.ServiceChanged for every
+// configured service, in config order, whose serviceState differs from the
+// one last published for it. Called on the dispatcher goroutine after
+// whatever can move a state: a welcome's register, an app message, a local
+// `d`/`e`.
+func (t *Tunnel) publishServiceChanges() {
+	rows := make(map[string]registry.Row, len(t.cfg.Services))
+	for _, r := range t.registry.Rows() {
+		rows[r.Name] = r
+	}
+	taken := t.takenOverSnapshot()
 	for _, s := range t.cfg.Services {
-		if !skip[s.Name] {
-			subset = append(subset, s)
+		evt := t.serviceState(s.Name, s.Kind, rows[s.Name], taken[s.Name])
+		if t.published[s.Name] == evt {
+			continue
+		}
+		t.published[s.Name] = evt
+		t.publish(evt)
+	}
+}
+
+// applyRegisteredServices applies a "registered" reply's successes (taken-
+// over names already left out) and runs what they unblock.
+func (t *Tunnel) applyRegisteredServices(services []appproto.RegisteredService) {
+	if len(services) == 0 {
+		return
+	}
+	result := t.registry.ApplyRegistered(services, t.kindByName)
+	for _, name := range result.Created {
+		t.log.Info("new public URL assigned", "name", name)
+	}
+	for _, r := range result.Resurrected {
+		t.log.Info("server is active again (was disabled before this reconnect)", "name", r.Name)
+		if t.cfg.OnEnable != nil {
+			go t.cfg.OnEnable(r.Name)
 		}
 	}
-	if len(subset) == 0 {
-		return nil
+	for _, resolved := range t.registry.ResolvePendingDisables() {
+		t.log.Info("resolving a disable that arrived before this service's name was known", "id", resolved.ID, "name", resolved.Name)
+		t.note(resolved.Name, string(mcpwarp.CodeDisabled), resolved.Reason)
+		if t.cfg.OnDisable != nil {
+			go t.cfg.OnDisable(resolved.Name, resolved.ID, resolved.Reason)
+		}
 	}
-	return appproto.EncodeRegister(subset)
+}
+
+// currentRegisterNames lists, in config order, the names this connect or
+// reconnect registers: every configured one except those in
+// localUnregistered (a local `d` keypress not yet followed by `e`) or
+// takenOver (a "conflict" not yet followed by `e`) — see those fields'
+// docs. Empty when every one is left out: no frame is built for no names,
+// since neither this CLI nor Node's ever sends a register with an empty
+// services list, and the server may bounce an empty batch as BAD_REQUEST,
+// which handleApp would then log as a protocol mismatch. Each name listed is
+// marked re-registering, so it reads pending until its reply (ws-mixer-spec
+// MCPWARP.md §6A.5: a welcome's re-register moves every name it carries to
+// pending) — under t.mu, like retryTransient, so a concurrent local `d`
+// can't be undone by the mark.
+func (t *Tunnel) currentRegisterNames() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	names := make([]string, 0, len(t.cfg.Services))
+	for _, s := range t.cfg.Services {
+		if !t.localUnregistered[s.Name] && !t.takenOver[s.Name] {
+			t.registry.MarkReregistering(s.Name, s.Kind)
+			names = append(names, s.Name)
+		}
+	}
+	return names
 }
 
 // isTakenOver reports whether name is in takenOver.
@@ -686,41 +1006,17 @@ func (t *Tunnel) hasConfiguredService(name string) bool {
 	return false
 }
 
-// sendRegisterFor re-registers just name after a live "enable" — the
-// tunnel strips its own routing state for a disabled service, so
-// un-disabling locally isn't enough. Best-effort: a failure just logs, the
-// next welcome re-registers everything anyway.
-func (t *Tunnel) sendRegisterFor(name string) {
-	var subset []appproto.RegisterService
-	for _, s := range t.cfg.Services {
-		if s.Name == name {
-			subset = append(subset, s)
-		}
-	}
-	if len(subset) == 0 {
-		return
-	}
-	conn := t.client.Conn()
-	if conn == nil {
-		t.log.Debug("cannot re-register after enable — connection is gone", "name", name)
-		return
-	}
-	body := appproto.EncodeRegister(subset)
-	t.sendApp(conn, body, func(err error) {
-		t.log.Debug("failed to re-register after enable", "name", name, "err", err)
-	})
-}
-
-// RegisterService re-registers a single configured service — the exported
-// counterpart of sendRegisterFor, for a caller-driven "enable" (a local `e`
-// keypress/Controller.Enable, DESIGN.md §9) rather than one arriving off
-// the wire. Always clears name from localUnregistered and takenOver first,
-// even with no live connection (edge case: `e` pressed while disconnected
-// must still make the next welcome's register batch include name again) —
-// the actual re-register send below stays a no-op in that case, same as
-// before. Clearing takenOver is the one way back from a "conflict": OpEnable
-// skips a taken-over name before reaching here, so only a local `e`
-// reclaims it (and takes it from the other session).
+// RegisterService re-registers a single configured service, for a
+// caller-driven "enable" (a local `e` keypress/Controller.Enable, DESIGN.md
+// §9) or a dashboard one (OpEnable) — the tunnel strips its own routing
+// state for a disabled service, so un-disabling locally isn't enough.
+// Always clears name from localUnregistered and takenOver first, even with
+// no live connection (edge case: `e` pressed while disconnected must still
+// make the next welcome's register batch include name again) — the
+// register itself is then left to that welcome. Clearing takenOver is the
+// one way back from a "conflict": OpEnable skips a taken-over name before
+// reaching here, so only a local `e` reclaims it (and takes it from the
+// other session).
 //
 // The registry is told too (MarkReregistering), so the dashboard shows the
 // name pending until the reply rather than still disabled — only for a
@@ -730,10 +1026,12 @@ func (t *Tunnel) RegisterService(name string) {
 	delete(t.localUnregistered, name)
 	delete(t.takenOver, name)
 	t.mu.Unlock()
-	if kind, ok := t.kindByName[name]; ok {
-		t.registry.MarkReregistering(name, kind)
+	kind, ok := t.kindByName[name]
+	if !ok {
+		return
 	}
-	t.sendRegisterFor(name)
+	t.registry.MarkReregistering(name, kind)
+	t.queueFrame(appproto.OpRegister, name)
 }
 
 // UnregisterService sends "unregister" for a single configured service —
@@ -758,43 +1056,322 @@ func (t *Tunnel) UnregisterService(name string) error {
 	if entry, ok := t.registry.Get(name); ok {
 		t.registry.ApplyDisable(entry.ID, "unregistered locally")
 	}
-	conn := t.client.Conn()
-	if conn == nil {
-		return nil
-	}
-	body := appproto.EncodeUnregister([]appproto.UnregisterService{{Name: name}})
-	t.sendApp(conn, body, func(err error) {
-		t.log.Debug("failed to unregister service", "name", name, "err", err)
-	})
+	t.queueFrame(appproto.OpUnregister, name)
 	return nil
 }
 
-// appSendTimeout bounds one overload-queue-guarded SendApp call — long
-// enough to ride out an OverloadPause, short enough that a send on a
-// connection that's silently died doesn't hang the goroutine sendApp starts
-// forever.
+// queueFrame hands op for names, a local `d`/`e` (or a dashboard enable),
+// to frames on the dispatcher goroutine, behind whatever is already
+// outstanding (ws-mixer-spec MCPWARP.md §2.6 One in flight). Either ends
+// the names' transient retry series (retrying), and the state the caller
+// already marked in the registry (pending, disabled) is published. With no
+// live connection nothing is queued: the next welcome registers the current
+// list anyway, and a new connection holds nothing to unregister.
+func (t *Tunnel) queueFrame(op string, names ...string) {
+	live := t.client.Conn() != nil
+	if !live {
+		t.log.Debug("no tunnel connection; leaving it to the next welcome", "op", op, "names", names)
+	}
+	t.disp.enqueue(func() {
+		for _, name := range names {
+			delete(t.retrying, name)
+		}
+		t.publishServiceChanges()
+		if !live || !t.framesLive() || (op == appproto.OpRegister && t.closing) {
+			return
+		}
+		t.frames.Push(op, names...)
+		t.pump()
+	})
+}
+
+// framesLive reports whether frames has a connection to go out on: the one
+// startFrames last began, or a current one whose onConnect hasn't run yet
+// (its startFrames then sends what is queued).
+func (t *Tunnel) framesLive() bool {
+	return t.framesConn != nil || t.client.Conn() != nil
+}
+
+// startFrames begins c's frames on its welcome: whatever was outstanding on
+// the previous connection is dropped, and the current register list goes
+// out first, in batches, ahead of any intent still queued (§3.2 Register on
+// every welcome). A scheduled transient retry is dropped too: this
+// register covers it.
+func (t *Tunnel) startFrames(c *wsmixer.Conn) {
+	if t.stopped {
+		return
+	}
+	t.stopResend()
+	t.cancelRetries()
+	t.framesConn = c
+	t.held = make(map[string]bool)
+	var names []string
+	if !t.closing {
+		names = t.currentRegisterNames()
+	}
+	t.frames.Restart(names)
+	t.pump()
+}
+
+// stopFrames is Close's last word on frames: nothing is outstanding or
+// scheduled afterwards and no frame is written again, not even for an
+// onConnect the SDK had already queued, so writeFrame can no longer add to
+// sendWG.
+func (t *Tunnel) stopFrames() {
+	t.stopped = true
+	t.closing = true
+	t.stopResend()
+	t.cancelRetries()
+	t.frames.Abandon()
+	t.framesConn = nil
+	t.releaseIdleWaiters()
+}
+
+// endFrames drops the outstanding frame and every scheduled re-send once
+// the connection has ended (§3.2 Transient retry: a disconnect cancels a
+// pending retry), and ends Unregister's wait.
+func (t *Tunnel) endFrames() {
+	t.stopResend()
+	t.cancelRetries()
+	t.frames.Abandon()
+	t.framesConn = nil
+	t.releaseIdleWaiters()
+}
+
+// pump writes the next queued frame once the slot is free, and ends
+// Unregister's wait once nothing is left.
+func (t *Tunnel) pump() {
+	if t.stopped || t.framesConn == nil {
+		return
+	}
+	if f := t.frames.Next(); f != nil {
+		t.writeFrame(f)
+		return
+	}
+	if t.frames.Idle() {
+		t.releaseIdleWaiters()
+	}
+}
+
+// appSendTimeout bounds one frame's SendApp — short enough that a send on
+// a connection that's silently died doesn't hang the goroutine writeFrame
+// starts forever.
 const appSendTimeout = 10 * time.Second
 
-// sendApp runs an OverloadQueue-guarded SendApp(body) on conn in its own
-// goroutine: OverloadQueue.Send blocks its caller for as long as an
-// OVERLOADED pause (and this send's place in its queue) takes, which must
-// never happen on this package's single dispatcher goroutine — Node
-// client.ts's sendAppOrQueue is fired the same way ("void
-// sendAppOrQueue(...).catch(...)"), never awaited inline. onErr, if
-// non-nil, is called with the eventual error (nil on success).
-func (t *Tunnel) sendApp(conn *wsmixer.Conn, body map[string]any, onErr func(err error)) {
+// writeFrame sends f (the outstanding frame, or the closing unregister
+// beside it) on framesConn from its own goroutine: SendApp can block on a
+// full control queue, which must never happen on this package's single
+// dispatcher goroutine. f is encoded here first, since Push may change a
+// paused frame's names later. A failed write frees f's slot, as no reply
+// can follow.
+func (t *Tunnel) writeFrame(f *appproto.Frame) {
+	if t.stopped || t.framesConn == nil {
+		return
+	}
+	conn := t.framesConn
+	body := t.encodeFrame(f)
 	t.sendWG.Add(1)
 	go func() {
 		defer t.sendWG.Done()
-		err := t.overload.Send(func() error {
-			ctx, cancel := context.WithTimeout(context.Background(), appSendTimeout)
-			defer cancel()
-			return conn.SendApp(ctx, body)
-		})
-		if err != nil && onErr != nil {
-			onErr(err)
+		ctx, cancel := context.WithTimeout(context.Background(), appSendTimeout)
+		defer cancel()
+		if err := conn.SendApp(ctx, body); err != nil {
+			t.disp.enqueue(func() { t.frameWriteFailed(conn, f, err) })
 		}
 	}()
+}
+
+func (t *Tunnel) frameWriteFailed(conn *wsmixer.Conn, f *appproto.Frame, err error) {
+	if f.Op == appproto.OpRegister {
+		t.log.Warn("failed to send register", "names", f.Names, "err", err)
+	} else {
+		t.log.Debug("failed to send unregister", "names", f.Names, "err", err)
+	}
+	if conn != t.framesConn || !t.frames.Fail(f) {
+		return
+	}
+	t.overloadedReported = false
+	t.pump()
+}
+
+func (t *Tunnel) encodeFrame(f *appproto.Frame) map[string]any {
+	if f.Op == appproto.OpUnregister {
+		services := make([]appproto.UnregisterService, len(f.Names))
+		for i, name := range f.Names {
+			services[i] = appproto.UnregisterService{Name: name}
+		}
+		return appproto.EncodeUnregister(services)
+	}
+	services := make([]appproto.RegisterService, len(f.Names))
+	for i, name := range f.Names {
+		services[i] = appproto.RegisterService{Name: name, Kind: t.kindByName[name]}
+	}
+	return appproto.EncodeRegister(services)
+}
+
+// armResend schedules the outstanding frame's OVERLOADED re-send (§2.6).
+func (t *Tunnel) armResend(delay time.Duration) {
+	f := t.frames.Outstanding()
+	t.log.Info("tunnel overloaded; re-sending after a pause", "op", f.Op, "names", f.Names, "delay", delay)
+	t.resendStop = t.cfg.afterFunc(delay, func() {
+		t.disp.enqueue(func() { t.resendDue(f) })
+	})
+}
+
+// resendDue re-sends f once its pause is over, unless a reply settled it
+// meanwhile (a stale timer sends nothing).
+func (t *Tunnel) resendDue(f *appproto.Frame) {
+	if t.frames.Outstanding() != f || !t.frames.Paused() {
+		return
+	}
+	t.resendStop = nil
+	if next := t.frames.Resend(); next != nil {
+		t.writeFrame(next)
+		return
+	}
+	t.pump()
+}
+
+// stopResend cancels a scheduled OVERLOADED re-send. It runs whenever the
+// outstanding frame is settled or dropped, which also ends the OVERLOADED
+// series overloadedReported tracks.
+func (t *Tunnel) stopResend() {
+	t.overloadedReported = false
+	if t.resendStop != nil {
+		t.resendStop()
+		t.resendStop = nil
+	}
+}
+
+// retryMark is one name's place in a transient retry series (retrying).
+type retryMark struct {
+	// code is what the series' pending ServiceChanged carries: its first
+	// transient error's code, or unlistedCode while a name a reply left out
+	// has had no transient error yet.
+	code string
+	// reported: the series' first transient error has been logged.
+	reported bool
+}
+
+// unlistedCode and unlistedMessage are what a name left out of the reply
+// to its register shows while pending (ws-mixer-spec MCPWARP.md §6A.7's
+// "register failed: INTERNAL: unlisted in reply").
+const (
+	unlistedCode    = string(mcpwarp.CodeInternal)
+	unlistedMessage = "unlisted in reply"
+)
+
+// transientRetry is one scheduled re-send of a reply's transient names.
+type transientRetry struct {
+	names []string
+	stop  func() bool
+}
+
+// retryTransient schedules a register for the names a reply failed
+// transiently (§3.2 Transient per name) after delay. Each stays pending
+// meanwhile (§6A.4: transient codes never reach a service), unless it is
+// unconfigured, taken over or locally disabled, which drops it.
+func (t *Tunnel) retryTransient(names []string, delay time.Duration) {
+	if t.closing || len(names) == 0 {
+		return
+	}
+	kept := make([]string, 0, len(names))
+	t.mu.Lock()
+	for _, name := range names {
+		kind, ok := t.kindByName[name]
+		if !ok || t.takenOver[name] || t.localUnregistered[name] || slices.Contains(kept, name) {
+			continue
+		}
+		t.registry.MarkReregistering(name, kind)
+		kept = append(kept, name)
+	}
+	t.mu.Unlock()
+	if len(kept) == 0 {
+		return
+	}
+	t.log.Debug("re-sending register after a transient error", "names", kept, "delay", delay)
+	r := &transientRetry{names: kept}
+	r.stop = t.cfg.afterFunc(delay, func() {
+		t.disp.enqueue(func() { t.retryDue(r) })
+	})
+	t.retries[r] = true
+}
+
+func (t *Tunnel) retryDue(r *transientRetry) {
+	if !t.retries[r] {
+		return
+	}
+	delete(t.retries, r)
+	if t.closing || t.framesConn == nil {
+		return
+	}
+	t.mu.Lock()
+	names := slices.DeleteFunc(slices.Clone(r.names), func(name string) bool {
+		return t.takenOver[name] || t.localUnregistered[name]
+	})
+	t.mu.Unlock()
+	if len(names) > 0 {
+		t.frames.Push(appproto.OpRegister, names...)
+	}
+	t.pump()
+	t.checkFatal()
+}
+
+func (t *Tunnel) cancelRetries() {
+	for r := range t.retries {
+		r.stop()
+		delete(t.retries, r)
+	}
+}
+
+func (t *Tunnel) releaseIdleWaiters() {
+	for _, w := range t.idleWaiters {
+		close(w)
+	}
+	t.idleWaiters = nil
+}
+
+// checkFatal is ws-mixer-spec MCPWARP.md §6A.6 G5, judged on the overall
+// service state rather than one reply: exit 1 only when this process has
+// never registered anything, nothing is outstanding, queued or scheduled
+// for a re-send, and every configured service not taken over or locally
+// disabled ended refused. A SERVER_DISABLED service keeps the process up,
+// since its dashboard "enable" arrives on this connection, and a transient
+// code never counts (§3.2 Transient per name). Never while closing: a
+// refusal arriving during shutdown must not turn it into an exit 1.
+func (t *Tunnel) checkFatal() {
+	if t.closing || t.sawFirstRegistered || t.fatalSent || !t.frames.Idle() || len(t.retries) > 0 {
+		return
+	}
+	rows := make(map[string]registry.Row)
+	for _, r := range t.registry.Rows() {
+		rows[r.Name] = r
+	}
+	t.mu.Lock()
+	refused := 0
+	settledAll := true
+	for _, s := range t.cfg.Services {
+		if t.takenOver[s.Name] || t.localUnregistered[s.Name] {
+			continue
+		}
+		r := rows[s.Name]
+		if r.Rejected == "" || r.Rejected == "SERVER_DISABLED" || r.Reregistering {
+			settledAll = false
+			break
+		}
+		refused++
+	}
+	t.mu.Unlock()
+	if !settledAll || refused == 0 {
+		return
+	}
+	t.fatalSent = true
+	t.log.Error("No service could be registered.", "code", "INTERNAL")
+	// FatalExit runs shutdown.FatalExit -> Tunnel.Close(ctx), which waits on
+	// this same dispatcher goroutine to drain — calling it synchronously
+	// here would self-deadlock. Node's counterpart is likewise
+	// fire-and-forget ("void fatalExit(1)").
+	go t.cfg.FatalExit(1)
 }
 
 func (t *Tunnel) onStream(s *wsmixer.Stream) {
@@ -819,6 +1396,14 @@ func (t *Tunnel) onStream(s *wsmixer.Stream) {
 			Targets:         t.cfg.Targets,
 			Log:             t.log,
 			UnreachableWarn: t.unreachableWarn,
+			OnPathRefused: func(service, path, publicURL string) {
+				t.publish(eventbus.AppError{
+					Code:    "PATH_REFUSED",
+					Service: service,
+					Message: fmt.Sprintf("request for %s refused: only /mcp is forwarded", path),
+					Hint:    "point the MCP client at " + publicURL,
+				})
+			},
 		})
 	}()
 }
@@ -831,6 +1416,15 @@ func (t *Tunnel) onDrain(d *wsmixer.DrainMsg) {
 }
 
 func (t *Tunnel) onDisconnect(reason wsmixer.DisconnectReason) {
+	// A connected-phase end is the connection onConnect last bound: both
+	// run in order on the SDK's callback goroutine, so liveConn is read here
+	// rather than on the dispatcher, where a later onConnect may already
+	// have moved it. An end in the dial or handshake phase never reached
+	// onConnect and says nothing about liveConn.
+	var ended *wsmixer.Conn
+	if reason.Phase == wsmixer.PhaseConnected && !reason.Superseded {
+		ended = t.liveConn.Load()
+	}
 	t.disp.enqueue(func() {
 		// ws-mixer-go v0.9.0's drain hand-over (its DECISIONS.md
 		// D-2026-10-14-03): a drained connection keeps serving its in-flight
@@ -843,7 +1437,17 @@ func (t *Tunnel) onDisconnect(reason wsmixer.DisconnectReason) {
 			t.log.Debug("drained tunnel connection retired; its replacement is live", "message", reason.Message)
 			return
 		}
-		t.publish(eventbus.ConnStateChanged{State: "disconnected"})
+		if ended != nil {
+			t.endedConn = ended
+		}
+		t.endFrames()
+		// Our own shutdown (Unregister, then Close) ends the connection with
+		// a NO_ERROR close: nothing went wrong, so no Reason.
+		why := ""
+		if !t.closing && !t.closeStarted.Load() {
+			why = disconnectReasonText(reason)
+		}
+		t.publish(eventbus.ConnStateChanged{State: "disconnected", Reason: why})
 		if !reason.Fatal {
 			text := reason.CloseReason
 			if text == "" {
@@ -871,11 +1475,62 @@ func (t *Tunnel) onDisconnect(reason wsmixer.DisconnectReason) {
 		// client and never retries it, so exit.
 		message := classifyFatalMessage(t.cfg.URL, reason)
 		t.log.Error(message, "wsCode", reason.WSCode, "httpStatus", reason.HTTPStatus)
-		// See handleApp's fatal path: FatalExit -> Tunnel.Close(ctx) waits
-		// on this dispatcher goroutine, so it must not run synchronously here.
+		// See checkFatal: FatalExit -> Tunnel.Close(ctx) waits on this
+		// dispatcher goroutine, so it must not run synchronously here.
 		go t.cfg.FatalExit(1)
 	})
 }
+
+// disconnectReasonText is the short Reason a "disconnected"
+// ConnStateChanged carries for the TUI header ("DISCONNECTED (…)",
+// DESIGN.md §9), drawn from the same DisconnectReason fields onDisconnect
+// and classifyFatalMessage classify it by: a fatal end by its auth/HTTP
+// facts (the full classifyFatalMessage text goes to the log); a
+// CONNECTION_LIMIT close; a retryable token refresh failure; an HTTP
+// upgrade status; a clean close (NO_ERROR, or a bare 1000) as closed by the
+// tunnel; any other ws-mixer error code by its name; any other close frame
+// as closed by the tunnel; no close frame at all (or an abnormal 1006) as
+// a network error. onDisconnect skips it for this process's own shutdown.
+func disconnectReasonText(r wsmixer.DisconnectReason) string {
+	text := r.CloseReason
+	if text == "" {
+		text = r.Message
+	}
+	var notLoggedIn *auth.NotLoggedInError
+	var sessionExpired *auth.SessionExpiredError
+	switch {
+	case r.Fatal && errors.As(r.Cause, &notLoggedIn):
+		return "not logged in"
+	case r.Fatal && (errors.As(r.Cause, &sessionExpired) || r.HTTPStatus == 401 || r.HTTPStatus == 403 ||
+		r.ErrorName == "UNAUTHORIZED" || r.WSCode == unauthorizedWSCode):
+		return "session expired"
+	case r.Fatal && r.HTTPStatus == 404:
+		return "tunnel URL not found"
+	case r.Fatal:
+		return "connection failed"
+	case r.WSCode == connectionLimitWSCode && strings.HasPrefix(text, connectionLimitPrefix):
+		return "connection limit"
+	case r.Phase == wsmixer.PhaseDial && errors.Is(r.Cause, wsmixer.ErrTokenUnavailable):
+		return "token refresh failed"
+	case r.HTTPStatus != 0:
+		return fmt.Sprintf("HTTP %d", r.HTTPStatus)
+	case r.HasErrorCode && r.ErrorCode == wsmixer.NoError, !r.HasErrorCode && r.WSCode == normalClosureWSCode:
+		return "closed by the tunnel"
+	case r.HasErrorCode:
+		return strings.ToLower(strings.ReplaceAll(r.ErrorName, "_", " "))
+	case r.WSCode != 0 && r.WSCode != abnormalClosureWSCode:
+		return "closed by the tunnel"
+	default:
+		return "network error"
+	}
+}
+
+// normalClosureWSCode and abnormalClosureWSCode are RFC 6455's 1000 (a
+// clean close) and 1006 (the connection dropped without a close frame).
+const (
+	normalClosureWSCode   = 1000
+	abnormalClosureWSCode = 1006
+)
 
 // unauthorizedWSCode is the wsmixer close code for wsmixer.UnauthorizedCode
 // (4000 + 0x0b), used the same way Node client.ts's UNAUTHORIZED_WS_CODE is.
@@ -903,6 +1558,10 @@ const connectionLimitPrefix = "CONNECTION_LIMIT:"
 // scheduleReconnectAtCap. Recovery just needs one fewer live mcpwarp agent
 // for this account.
 const connectionLimitHint = "close another `mcpwarp up` and this one will reconnect"
+
+// overloadedHint is the AppError Hint for the first OVERLOADED of a frame:
+// nothing for the user to do, the frame goes out again on its own.
+const overloadedHint = "tunnel busy; re-sending automatically"
 
 // tooManyServicesHint is the guidance for a TOO_MANY_SERVICES app error.
 // config.Validate already caps a config at config.MaxServers, so this only
@@ -976,36 +1635,53 @@ func isRetryableTokenFailure(cause error) bool {
 	return errors.As(cause, &retryable) && retryable.Retryable()
 }
 
-// Unregister best-effort sends "unregister" for every configured service,
-// budgeted to unregisterBudget (DESIGN.md §3's shutdown sequence step 1).
-// Routed through t.overload (like every other app send, Node client.ts's
-// sendAppOrQueue) rather than sent directly, so an unregister made while
-// the tunnel is OVERLOADED queues in order instead of overtaking a pending
-// register. The send itself keeps running in the background past
-// unregisterBudget (bounded by appSendTimeout, tracked by sendWG so Close
-// still waits for it) — Unregister only stops waiting on it here.
+// Unregister best-effort sends "unregister" for every configured service
+// not taken over (§3.3 Per name: never for a taken-over name) and waits for
+// its reply, budgeted to unregisterBudget (DESIGN.md §3's shutdown sequence
+// step 1; ws-mixer-spec MCPWARP.md §3.2 Unregister). It goes through frames
+// (FrameQueue.Close): a register not yet on the wire, queued or paused by
+// OVERLOADED, is abandoned, no register goes out after this, and the
+// unregister is written at once even beside a register still on the wire
+// (§2.6 One in flight: only close() may), or behind an outstanding
+// unregister. The wait also ends when the connection does. The write itself
+// may outlive the budget (bounded by appSendTimeout, tracked by sendWG so
+// Close still waits for it) — Unregister only stops waiting on it here.
 func (t *Tunnel) Unregister(ctx context.Context) error {
-	conn := t.client.Conn()
-	if conn == nil {
+	if t.client.Conn() == nil {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, unregisterBudget)
 	defer cancel()
 
-	done := make(chan error, 1)
-	t.sendWG.Add(1)
-	go func() {
-		defer t.sendWG.Done()
-		done <- t.overload.Send(func() error {
-			sendCtx, sendCancel := context.WithTimeout(context.Background(), appSendTimeout)
-			defer sendCancel()
-			return conn.SendApp(sendCtx, t.unregisterBody)
-		})
-	}()
+	done := make(chan struct{})
+	t.disp.enqueue(func() {
+		t.closing = true
+		t.cancelRetries()
+		if t.frames.DropRegisters() {
+			t.stopResend()
+		}
+		t.idleWaiters = append(t.idleWaiters, done)
+		if !t.framesLive() {
+			t.releaseIdleWaiters()
+			return
+		}
+		t.mu.Lock()
+		names := make([]string, 0, len(t.cfg.Services))
+		for _, s := range t.cfg.Services {
+			if !t.takenOver[s.Name] {
+				names = append(names, s.Name)
+			}
+		}
+		t.mu.Unlock()
+		if f := t.frames.Close(names...); f != nil {
+			t.writeFrame(f)
+		}
+		t.pump()
+	})
 
 	select {
-	case err := <-done:
-		return err
+	case <-done:
+		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -1021,6 +1697,7 @@ const relayShutdownBudget = 5 * time.Second
 // relay stream's Forward call and waits (boundedly) for its goroutine to
 // exit, then stops this package's own dispatcher and forwarder.
 func (t *Tunnel) Close(ctx context.Context) error {
+	t.closeStarted.Store(true)
 	err := t.client.Close(ctx)
 
 	t.relayCancel()
@@ -1037,15 +1714,27 @@ func (t *Tunnel) Close(ctx context.Context) error {
 		t.log.Warn("shutdown deadline hit waiting for in-flight relay streams to finish")
 	}
 
-	sendsDone := make(chan struct{})
-	go func() {
-		t.sendWG.Wait()
-		close(sendsDone)
-	}()
+	// Stop frames first, on the dispatcher: once this has run nothing can
+	// call writeFrame, so no sendWG.Add races the Wait below.
+	framesStopped := make(chan struct{})
+	t.disp.enqueue(func() {
+		t.stopFrames()
+		close(framesStopped)
+	})
 	select {
-	case <-sendsDone:
-	case <-time.After(appSendTimeout):
-		t.log.Warn("timed out waiting for in-flight app sends to finish")
+	case <-framesStopped:
+		sendsDone := make(chan struct{})
+		go func() {
+			t.sendWG.Wait()
+			close(sendsDone)
+		}()
+		select {
+		case <-sendsDone:
+		case <-time.After(appSendTimeout):
+			t.log.Warn("timed out waiting for in-flight app sends to finish")
+		case <-ctx.Done():
+			t.log.Warn("shutdown deadline hit waiting for in-flight app sends to finish")
+		}
 	case <-ctx.Done():
 		t.log.Warn("shutdown deadline hit waiting for in-flight app sends to finish")
 	}

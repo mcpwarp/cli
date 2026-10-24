@@ -10,9 +10,9 @@ import (
 
 // busMetrics is a wsmixer.Metrics implementation that feeds the
 // connection's ping latency and send-window stalls onto the eventbus (
-// DESIGN.md §3: drop-oldest, same policy as the OVERLOADED queue — a slow
-// TUI must never backpressure the connection's read/write loops, which is
-// exactly what calls these methods synchronously).
+// DESIGN.md §3: drop-oldest — a slow TUI must never backpressure the
+// connection's read/write loops, which is exactly what calls these methods
+// synchronously).
 //
 // BytesTransferred fires once per DATA frame — on a busy stream that's far
 // too hot a path to afford formatting and publishing a value per call, so

@@ -367,6 +367,13 @@ func TestHeaderShowsConnReasonWhileNotConnected(t *testing.T) {
 		t.Fatalf("expected the reason in the state's style; got %q", raw)
 	}
 
+	// The tunnel's own reason for a CONNECTION_LIMIT close.
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ConnStateChanged{State: "disconnected", Reason: "connection limit"}})
+	m = next.(Model)
+	if got, want := header(m), "mcpwarp up  DISCONNECTED (connection limit)  streams=0"; got != want {
+		t.Fatalf("header with the connection-limit reason = %q, want %q", got, want)
+	}
+
 	next, _ = m.Update(controlEventMsg{evt: eventbus.ConnStateChanged{State: "connected", Session: "sess-1", Reason: "connection lost"}})
 	m = next.(Model)
 	if got, want := header(m), "mcpwarp up  CONNECTED  session=sess-1  streams=0"; got != want {

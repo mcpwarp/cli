@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,20 +41,37 @@ var errRequestHeadTimeout = errors.New("relay: request head did not arrive withi
 // open many streams a second, and warning on every one of them is noise.
 const unreachableWarnInterval = 60 * time.Second
 
+// pathRefusedWarn is the first refused non-/mcp request's warn per service.
+const pathRefusedWarn = "request refused: only /mcp is forwarded since mcpwarp v0.3.0; point the MCP client at the service's /mcp URL"
+
 // UnreachableWarnLimiter rate-limits the "local server unreachable" warn to
-// once per unreachableWarnInterval per service name. One instance is shared
-// across every RelayStream call on the same tunnel connection (the caller
-// owns it, via Options.UnreachableWarn); a nil Options.UnreachableWarn
+// once per unreachableWarnInterval per service name, and the path-rule warn
+// to the first refused non-/mcp request per service name. One instance is
+// shared across every RelayStream call on the same tunnel connection (the
+// caller owns it, via Options.UnreachableWarn); a nil Options.UnreachableWarn
 // disables rate limiting (every call warns), which is what tests get by
 // default.
 type UnreachableWarnLimiter struct {
-	mu   sync.Mutex
-	last map[string]time.Time
+	mu          sync.Mutex
+	last        map[string]time.Time
+	pathRefused map[string]bool
 }
 
 // NewUnreachableWarnLimiter builds an empty UnreachableWarnLimiter.
 func NewUnreachableWarnLimiter() *UnreachableWarnLimiter {
-	return &UnreachableWarnLimiter{last: make(map[string]time.Time)}
+	return &UnreachableWarnLimiter{last: make(map[string]time.Time), pathRefused: make(map[string]bool)}
+}
+
+// FirstPathRefusal reports whether this is name's first refused non-/mcp
+// request, recording it if so.
+func (l *UnreachableWarnLimiter) FirstPathRefusal(name string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.pathRefused[name] {
+		return false
+	}
+	l.pathRefused[name] = true
+	return true
 }
 
 // Allow reports whether name's warn should fire right now, recording now as
@@ -94,10 +112,17 @@ type Options struct {
 	// tests that don't need cancellation.
 	Ctx context.Context
 	// UnreachableWarn rate-limits the "local server unreachable" warn below
-	// (once per service per unreachableWarnInterval) — shared by the caller
+	// (once per service per unreachableWarnInterval) and the path-rule warn
+	// (first refused non-/mcp request per service) — shared by the caller
 	// across every RelayStream call on the same tunnel connection. nil (the
 	// zero value, e.g. in tests) disables rate limiting.
 	UnreachableWarn *UnreachableWarnLimiter
+	// OnPathRefused, when set, is called with a known service's name, the
+	// refused path and the service's public URL alongside the path-rule warn
+	// (so under UnreachableWarn, once per service), after the 404 is
+	// written — the caller (internal/tunnel) surfaces it on the bus, which
+	// may block.
+	OnPathRefused func(service, path, publicURL string)
 }
 
 func (o Options) log() *slog.Logger {
@@ -122,10 +147,11 @@ func safeReset(stream Stream, code wsmixer.ErrorCode, msg string) {
 }
 
 // RelayStream handles exactly one stream end to end: parses the HTTP
-// request off it, resolves the target service by the request's Host header,
-// forwards, and streams the response back. Never throws: every failure path
-// ends in either a best-effort HTTP-shaped error response or, if the stream
-// itself is unusable, stream.Reset — RelayStream itself always returns.
+// request off it, refuses any path but /mcp (MCPWARP.md §4.3), resolves the
+// target service by the request's Host header, forwards, and streams the
+// response back. Never throws: every failure path ends in either a
+// best-effort HTTP-shaped error response or, if the stream itself is
+// unusable, stream.Reset — RelayStream itself always returns.
 func RelayStream(stream Stream, opts Options) {
 	log := opts.log()
 
@@ -163,6 +189,13 @@ func RelayStream(stream Stream, opts Options) {
 		return
 	}
 
+	if !supportedTargetForm(req.RequestURI) {
+		if err := writeErrorResponse(stream, 400, map[string]string{"error": "unsupported request target form"}, req.Method); err != nil {
+			safeReset(stream, wsmixer.InternalErrorCode, "unsupported request target form")
+		}
+		return
+	}
+
 	hostHeader := req.Host
 	if hostHeader == "" {
 		if err := writeErrorResponse(stream, 400, map[string]string{"error": "bad request"}, req.Method); err != nil {
@@ -171,17 +204,45 @@ func RelayStream(stream Stream, opts Options) {
 		return
 	}
 
+	// The refusals before Forward leave the request body unread; refusal
+	// drains it before CLOSE (MCPWARP.md §4.4 "Ending a refused stream").
+	refusal := drainBeforeClose{Stream: stream, body: req.Body}
+
+	// MCPWARP.md §4.4 row 2: the path check precedes every service check, so
+	// a non-/mcp path answers 404 even for an unknown or disabled service.
+	if path := requestPath(req.RequestURI); path != "/mcp" {
+		// Warn (and call OnPathRefused) once per known service, so a client
+		// on a path other than /mcp is visible without --verbose; unknown
+		// hosts stay at Debug. The lookup is for the log and hook only; the
+		// 404 still precedes every service check.
+		name, entry, known := opts.Registry.ResolveByHost(hostHeader)
+		first := known && (opts.UnreachableWarn == nil || opts.UnreachableWarn.FirstPathRefusal(name))
+		if first {
+			log.Warn(pathRefusedWarn, "service", name, "path", path, "url", entry.URL)
+		} else {
+			log.Debug("request for a path other than /mcp", "host", hostHeader, "target", req.RequestURI)
+		}
+		if err := writeErrorResponse(refusal, 404, map[string]string{"error": "not_found"}, req.Method); err != nil {
+			safeReset(stream, wsmixer.InternalErrorCode, "not found")
+		}
+		if first && opts.OnPathRefused != nil {
+			opts.OnPathRefused(name, path, entry.URL)
+		}
+		return
+	}
+
 	name, entry, ok := opts.Registry.ResolveByHost(hostHeader)
 	if !ok {
+		// MCPWARP.md §4.8 row 3b: no service selected.
 		log.Warn("request for an unknown service", "host", hostHeader)
-		if err := writeErrorResponse(stream, 404, map[string]string{"error": "unknown service"}, req.Method); err != nil {
+		if err := writeErrorResponse(refusal, 503, map[string]string{"error": "service unavailable"}, req.Method); err != nil {
 			safeReset(stream, wsmixer.InternalErrorCode, "unknown service")
 		}
 		return
 	}
 	if opts.Registry.IsDisabled(entry.ID) {
 		log.Warn("request for a disabled service", "host", hostHeader)
-		if err := writeErrorResponse(stream, 503, map[string]string{"error": "service disabled"}, req.Method); err != nil {
+		if err := writeErrorResponse(refusal, 503, map[string]string{"error": "service disabled"}, req.Method); err != nil {
 			safeReset(stream, wsmixer.InternalErrorCode, "service disabled")
 		}
 		return
@@ -190,18 +251,13 @@ func RelayStream(stream Stream, opts Options) {
 	target := opts.Targets[name]
 	if target == nil {
 		log.Error("registered service has no configured forward target", "name", name)
-		if err := writeErrorResponse(stream, 502, map[string]string{"error": "local server not configured"}, req.Method); err != nil {
+		if err := writeErrorResponse(refusal, 502, map[string]string{"error": "local server not configured"}, req.Method); err != nil {
 			safeReset(stream, wsmixer.InternalErrorCode, "local server not configured")
 		}
 		return
 	}
 
-	var pathOpts *PathOptions
-	if publicURL, err := url.Parse(entry.URL); err == nil {
-		pathOpts = &PathOptions{PublicPathname: publicURL.Path}
-	}
-
-	resp, err := opts.Forwarder.Forward(opts.ctx(), req, target, pathOpts)
+	resp, err := opts.Forwarder.Forward(opts.ctx(), req, target)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrTargetUnreachable):
@@ -272,6 +328,52 @@ func readRequest(stream Stream) (*http.Request, int64, error) {
 	// head's own budget.
 	lr.N = 1<<63 - 1
 	return req, lr.N, nil
+}
+
+// supportedTargetForm reports whether target is origin-form (starts with
+// "/") or absolute-form http(s)://… — MCPWARP.md §4.2's Target row; `*` and
+// authority-form (which http.ReadRequest accepts, for OPTIONS and CONNECT)
+// are refused with 400 before the §4.3 path check.
+func supportedTargetForm(target string) bool {
+	if strings.HasPrefix(target, "/") {
+		return true
+	}
+	scheme, _, ok := strings.Cut(target, "://")
+	return ok && (strings.EqualFold(scheme, "http") || strings.EqualFold(scheme, "https"))
+}
+
+// requestPath is MCPWARP.md §4.3's requestPath(target): the raw request-line
+// target with any scheme://authority stripped, cut at the first '?' or '#'.
+// Compared as received — never decoded or cleaned — so "/%6Dcp" and
+// "/a/../mcp" are not "/mcp".
+func requestPath(target string) string {
+	if !strings.HasPrefix(target, "/") {
+		if _, rest, ok := strings.Cut(target, "://"); ok {
+			if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+				target = rest[i:]
+			} else {
+				target = ""
+			}
+		}
+	}
+	if i := strings.IndexAny(target, "?#"); i >= 0 {
+		target = target[:i]
+	}
+	return target
+}
+
+// drainBeforeClose holds back a refusal's CLOSE until the request body still
+// unread has been read and dropped — MCPWARP.md §4.4 "Ending a refused
+// stream": the agent drains rather than RESETs, the edge's own body cap
+// bounding how much.
+type drainBeforeClose struct {
+	Stream
+	body io.Reader
+}
+
+func (d drainBeforeClose) CloseWrite() error {
+	_, _ = io.Copy(io.Discard, d.body)
+	return d.Stream.CloseWrite()
 }
 
 func writeErrorResponse(stream Stream, status int, payload map[string]string, method string) error {

@@ -4,8 +4,9 @@ package cli
 // today's user-visible behaviour at the level that has to survive replacing
 // internal/tunnel/registry/relay/appproto with ws-mixer-go's
 // mcpwarp.ServiceGroup: what the edge sees on the wire, the eventbus events
-// a renderer consumes (DESIGN.md §3), the rows the TUI is handed (tuiRunFunc's
-// seeded servers and SnapshotMsg updates, §9), the plain renderer's lines for
+// a renderer consumes (DESIGN.md §3), the rows the TUI shows (tuiRunFunc's
+// seeded servers with the bus's ServiceChanged/ServerStateChanged events
+// applied as tui.Model applies them, §9), the plain renderer's lines for
 // that same event stream, relayed responses, and the process exit code.
 // Nothing here reads the tunnel's registry or other internals. The seams
 // used are runUp's own: upDeps.FatalExit (which up.go hands to the tunnel,
@@ -34,6 +35,7 @@ import (
 	"github.com/mcpwarp/cli/internal/fakeedge"
 	"github.com/mcpwarp/cli/internal/output"
 	"github.com/mcpwarp/cli/internal/shutdown"
+	"github.com/mcpwarp/cli/internal/supervisor"
 	"github.com/mcpwarp/cli/internal/tui"
 	"github.com/mcpwarp/ws-mixer-go/wsmixer"
 )
@@ -42,9 +44,7 @@ const (
 	charToken  = "mcpwarp_pat_characterization"
 	charWebURL = "https://web.example.test"
 
-	// charWait bounds every wait on a bus event or TUI row. Rows reach the
-	// TUI through a once-a-second registry poll (DESIGN.md §9), so a row
-	// change can lag its cause by up to a second.
+	// charWait bounds every wait on a bus event or TUI row.
 	charWait = 5 * time.Second
 	// charReconnectWait covers one reconnect under charReconnect.
 	charReconnectWait = 5 * time.Second
@@ -101,6 +101,8 @@ type charSetup struct {
 	plainMode bool
 	// onBridgeStarted is upDeps.OnBridgeStarted.
 	onBridgeStarted func(name string, br *bridge.Bridge)
+	// newSupervisor is upDeps.NewSupervisor.
+	newSupervisor func(supervisor.Options, supervisor.Deps) *supervisor.Supervisor
 }
 
 // charHarness runs one in-process `mcpwarp up` against a fake edge and
@@ -121,9 +123,10 @@ type charHarness struct {
 	seeded    []tui.Server
 	ctrl      tui.Controller
 	uiStarted bool
-	snapSeq   int
-	rows      map[string]tui.Server
-	fatal     []int
+	// gotUpdates records whether the TUI was handed a SnapshotMsg channel.
+	gotUpdates bool
+	rows       map[string]tui.Server
+	fatal      []int
 
 	plain  *charBuffer // RunPlain's lines for the recorded Control stream
 	stdout *charBuffer
@@ -190,6 +193,7 @@ func startCharacterization(t *testing.T, setup charSetup) *charHarness {
 			FatalExit:       h.fatalExit,
 			Reconnect:       charReconnect,
 			OnBridgeStarted: setup.onBridgeStarted,
+			NewSupervisor:   setup.newSupervisor,
 		})
 		h.notify()
 	}()
@@ -218,22 +222,30 @@ func startCharacterization(t *testing.T, setup charSetup) *charHarness {
 }
 
 // charReplyAll is charSetup's default edge: every register is accepted
-// whole (fakeedge.Accepted) while autoReply is set.
+// whole (fakeedge.Accepted) while autoReply is set, and every unregister is
+// answered, as the tunnel always does (ws-mixer-spec MCPWARP.md §2.2).
 func charReplyAll(h *charHarness, c *fakeedge.Conn, f fakeedge.Frame) {
-	if f.Op == "register" && h.autoReply.Load() {
+	switch {
+	case f.Op == "register" && h.autoReply.Load():
 		_ = c.Registered(fakeedge.Accepted(f.Names...), nil)
+	case f.Op == "unregister":
+		_ = c.Unregistered(f.Names...)
 	}
 }
 
 // runTUI stands in for tui.Run: it records the seeded rows, the
-// Controller, every SnapshotMsg and every bus event, and feeds the same
-// Control/Telemetry stream to output.RunPlain so a test can read the plain
-// renderer's lines for it. Like the real renderer it drains Control until
-// the bus closes (runUIFunc's contract).
+// Controller and every bus event, applies the events to the rows, and feeds
+// the same Control/Telemetry stream to output.RunPlain so a test can read
+// the plain renderer's lines for it. Like the real renderer it drains
+// Control until the bus closes (runUIFunc's contract).
 func (h *charHarness) runTUI(_ context.Context, bus *eventbus.Bus, servers []tui.Server, ctrl tui.Controller, updates <-chan tui.SnapshotMsg) (bool, error) {
 	h.record(func() {
 		h.seeded = append([]tui.Server(nil), servers...)
+		for _, s := range servers {
+			h.rows[s.Name] = s
+		}
 		h.ctrl = ctrl
+		h.gotUpdates = updates != nil
 		h.uiStarted = true
 	})
 
@@ -256,7 +268,10 @@ func (h *charHarness) runTUI(_ context.Context, bus *eventbus.Bus, servers []tui
 				control = nil
 				continue
 			}
-			h.record(func() { h.control = append(h.control, evt) })
+			h.record(func() {
+				h.control = append(h.control, evt)
+				h.applyRow(evt)
+			})
 			plainBus.Publish(evt)
 		case line, ok := <-telemetry:
 			if !ok {
@@ -271,21 +286,47 @@ func (h *charHarness) runTUI(_ context.Context, bus *eventbus.Bus, servers []tui
 				continue
 			}
 			h.record(func() { h.metrics = append(h.metrics, m) })
-		case snap, ok := <-updates:
+		case _, ok := <-updates:
 			if !ok {
 				updates = nil
-				continue
 			}
-			h.record(func() {
-				h.snapSeq++
-				h.rows = make(map[string]tui.Server, len(snap.Servers))
-				for _, s := range snap.Servers {
-					h.rows[s.Name] = s
-				}
-			})
 		}
 	}
 	return false, nil
+}
+
+// applyRow applies one Control event to the rows the way tui.Model does
+// (upsertServerState, applyServiceChanged): a ServerStateChanged sets a
+// row's State and restarts; a ServiceChanged sets Registration, State too
+// unless the row is stdio, and the URL — a new one replaces it,
+// rejected/taken_over clear it, anything else keeps it. Called with h.mu
+// held.
+func (h *charHarness) applyRow(evt any) {
+	switch e := evt.(type) {
+	case eventbus.ServerStateChanged:
+		r := h.rows[e.Name]
+		r.Name, r.State, r.Restarts = e.Name, e.State, e.Restarts
+		h.rows[e.Name] = r
+	case eventbus.ServiceChanged:
+		r, ok := h.rows[e.Name]
+		if !ok {
+			r = tui.Server{Name: e.Name, State: e.State}
+		}
+		if e.Kind != "" {
+			r.Kind = e.Kind
+		}
+		r.Registration = e.State
+		if r.Kind != "stdio" && r.Kind != "" {
+			r.State = e.State
+		}
+		switch {
+		case e.URL != "":
+			r.URL = e.URL
+		case e.State == tui.RegistrationRejected || e.State == tui.RegistrationTakenOver:
+			r.URL = ""
+		}
+		h.rows[e.Name] = r
+	}
 }
 
 func (h *charHarness) fatalExit(code int) {
@@ -349,19 +390,24 @@ func (h *charHarness) describe() string {
 	for _, e := range h.control {
 		fmt.Fprintf(&b, "\n  %#v", e)
 	}
-	fmt.Fprintf(&b, "\nseeded rows: %+v\nlatest rows (snapshot %d): %+v\nfatal exits: %v", h.seeded, h.snapSeq, h.rows, h.fatal)
+	fmt.Fprintf(&b, "\nseeded rows: %+v\nlatest rows: %+v\nfatal exits: %v", h.seeded, h.rows, h.fatal)
 	fmt.Fprintf(&b, "\nplain:\n%s\nstdout:\n%s\nstderr:\n%s\nlogs:\n%s", h.plain.String(), h.stdout.String(), h.stderr.String(), h.logs.String())
 	return b.String()
 }
 
-// row is the TUI's view of name: the latest SnapshotMsg's row, or the
-// seeded one until a snapshot carries it.
+// row is the TUI's view of name: its seeded row with every event so far
+// applied (applyRow).
 func (h *charHarness) row(name string) (tui.Server, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if r, ok := h.rows[name]; ok {
-		return r, true
-	}
+	r, ok := h.rows[name]
+	return r, ok
+}
+
+// seededRow is name's row as tuiRunFunc was handed it, before any event.
+func (h *charHarness) seededRow(name string) (tui.Server, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	for _, r := range h.seeded {
 		if r.Name == name {
 			return r, true
@@ -370,27 +416,11 @@ func (h *charHarness) row(name string) (tui.Server, bool) {
 	return tui.Server{}, false
 }
 
-func (h *charHarness) snapshotSeq() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.snapSeq
-}
-
 // waitRow waits until name's row satisfies ok.
 func (h *charHarness) waitRow(name, what string, ok func(tui.Server) bool) tui.Server {
 	h.t.Helper()
-	return h.waitRowAfter(-1, name, what, ok)
-}
-
-// waitRowAfter is waitRow counting only snapshots newer than seq — for a
-// row that must still read the same after something happened.
-func (h *charHarness) waitRowAfter(seq int, name, what string, ok func(tui.Server) bool) tui.Server {
-	h.t.Helper()
 	var got tui.Server
 	h.waitFor(what, func() bool {
-		if h.snapshotSeq() <= seq {
-			return false
-		}
 		r, found := h.row(name)
 		got = r
 		return found && ok(r)
@@ -400,6 +430,37 @@ func (h *charHarness) waitRowAfter(seq int, name, what string, ok func(tui.Serve
 
 func charActive(r tui.Server) bool {
 	return r.Registration == tui.RegistrationActive && r.URL == "https://"+r.Name+".example/mcp"
+}
+
+// serviceChanges is every ServiceChanged published for name, in order.
+func (h *charHarness) serviceChanges(name string) []eventbus.ServiceChanged {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []eventbus.ServiceChanged
+	for _, e := range h.control {
+		if sc, ok := e.(eventbus.ServiceChanged); ok && sc.Name == name {
+			out = append(out, sc)
+		}
+	}
+	return out
+}
+
+// waitService waits for a ServiceChanged moving name to state, counting
+// only those after the first `after` of name's events, and returns it.
+func (h *charHarness) waitService(name, state string, after int) eventbus.ServiceChanged {
+	h.t.Helper()
+	var got eventbus.ServiceChanged
+	h.waitFor(fmt.Sprintf("a ServiceChanged %s %s after its #%d", name, state, after), func() bool {
+		changes := h.serviceChanges(name)
+		for i := after; i < len(changes); i++ {
+			if changes[i].State == state {
+				got = changes[i]
+				return true
+			}
+		}
+		return false
+	})
+	return got
 }
 
 func (h *charHarness) appErrors(code string) []eventbus.AppError {
@@ -539,10 +600,16 @@ func TestUpCharacterization_RegisterSuccessActiveWithURL(t *testing.T) {
 	h := startCharacterization(t, charSetup{servers: charHTTPServers})
 
 	for _, name := range []string{"notes", "docs"} {
-		r, ok := h.row(name)
+		r, ok := h.seededRow(name)
 		if !ok || r.Registration != tui.RegistrationPending || r.State != tui.RegistrationPending || r.Kind != "http" || r.URL != "" {
 			t.Fatalf("seeded %s row = %+v (found %v), want an http row pending with no URL", name, r, ok)
 		}
+	}
+	h.mu.Lock()
+	gotUpdates := h.gotUpdates
+	h.mu.Unlock()
+	if gotUpdates {
+		t.Fatal("the TUI was handed a SnapshotMsg channel; rows come only from ServiceChanged events")
 	}
 	if got := h.edge.WaitRegister(t, 1); strings.Join(got, ",") != "notes,docs" {
 		t.Fatalf("first register = %v, want every configured server in config order", got)
@@ -557,6 +624,13 @@ func TestUpCharacterization_RegisterSuccessActiveWithURL(t *testing.T) {
 		if r.State != tui.RegistrationActive || r.Kind != "http" {
 			t.Fatalf("%s row = %+v, want an http row whose State is its registration", name, r)
 		}
+		// The seeded pending isn't published again: active is the only
+		// transition a clean registration makes.
+		want := eventbus.ServiceChanged{Name: name, Kind: "http", State: "active", URL: "https://" + name + ".example/mcp"}
+		if got := h.serviceChanges(name); len(got) != 1 || got[0] != want {
+			t.Fatalf("%s ServiceChanged = %+v, want just %+v", name, got, want)
+		}
+		h.waitPlain("✓ " + name + ": active https://" + name + ".example/mcp\n")
 	}
 	h.waitPlain("✓ connection connected session=" + connected.Session)
 	h.waitFor("a bytes_total metric", func() bool {
@@ -580,6 +654,8 @@ func TestUpCharacterization_PlainModeRegisterSuccess(t *testing.T) {
 
 	h.edge.WaitRegister(t, 1)
 	h.waitStdout("✓ connection connected session=")
+	h.waitStdout("✓ notes: active https://notes.example/mcp\n")
+	h.waitStdout("✓ docs: active https://docs.example/mcp\n")
 	out := h.stdout.String()
 	for _, want := range []string{"NAME", "notes", "http://127.0.0.1:1/mcp", "docs", "http://127.0.0.1:2/mcp", "✓ connected as personal access token"} {
 		if !strings.Contains(out, want) {
@@ -603,16 +679,19 @@ func TestUpCharacterization_RegisterQuotaExceededRejected(t *testing.T) {
 		},
 	})
 
-	ae := h.waitAppError("QUOTA_EXCEEDED", "docs")
 	wantHint := "upgrade your plan at " + charWebURL + "/settings to add more servers"
-	if ae.Message != "server limit reached" || ae.Hint != wantHint {
-		t.Fatalf("AppError = %+v, want the edge's message and hint %q", ae, wantHint)
+	want := eventbus.ServiceChanged{Name: "docs", Kind: "http", State: "rejected", Code: "QUOTA_EXCEEDED", Message: "server limit reached", Hint: wantHint}
+	if sc := h.waitService("docs", "rejected", 0); sc != want {
+		t.Fatalf("ServiceChanged = %+v, want %+v", sc, want)
 	}
 	h.waitRow("docs", "docs rejected", func(r tui.Server) bool {
 		return r.Registration == tui.RegistrationRejected && r.State == tui.RegistrationRejected && r.URL == "" && r.Kind == "http"
 	})
 	h.waitRow("notes", "notes active", charActive)
-	h.waitPlain("✗ QUOTA_EXCEEDED: server limit reached service=docs · " + wantHint)
+	h.waitPlain("✗ docs: rejected (QUOTA_EXCEEDED): server limit reached · " + wantHint + "\n")
+	if errs := h.appErrors(""); len(errs) != 0 {
+		t.Fatalf("a per-service refusal also published AppErrors %+v", errs)
+	}
 	h.expectNoFatal("a per-service refusal alongside a success")
 }
 
@@ -628,16 +707,19 @@ func TestUpCharacterization_RegisterConflictRejected(t *testing.T) {
 		},
 	})
 
-	ae := h.waitAppError("CONFLICT", "docs")
 	const wantHint = "a server with this name is already registered — rename it, or check its kind"
-	if ae.Message != "name in use" || ae.Hint != wantHint {
-		t.Fatalf("AppError = %+v, want the edge's message and hint %q", ae, wantHint)
+	want := eventbus.ServiceChanged{Name: "docs", Kind: "http", State: "rejected", Code: "CONFLICT", Message: "name in use", Hint: wantHint}
+	if sc := h.waitService("docs", "rejected", 0); sc != want {
+		t.Fatalf("ServiceChanged = %+v, want %+v", sc, want)
 	}
 	h.waitRow("docs", "docs rejected", func(r tui.Server) bool {
 		return r.Registration == tui.RegistrationRejected && r.URL == ""
 	})
 	h.waitRow("notes", "notes active", charActive)
-	h.waitPlain("✗ CONFLICT: name in use service=docs · " + wantHint)
+	h.waitPlain("✗ docs: rejected (CONFLICT): name in use · " + wantHint + "\n")
+	if errs := h.appErrors(""); len(errs) != 0 {
+		t.Fatalf("a per-service refusal also published AppErrors %+v", errs)
+	}
 	h.expectNoFatal("a per-service refusal alongside a success")
 }
 
@@ -650,6 +732,12 @@ func TestUpCharacterization_DashboardEnablePendingThenActive(t *testing.T) {
 	h.waitRow("notes", "notes disabled", func(r tui.Server) bool {
 		return r.Registration == tui.RegistrationDisabled && r.State == tui.RegistrationDisabled
 	})
+	const disabledHint = "this server was disabled in the dashboard — waiting, toggle it on to resume"
+	want := eventbus.ServiceChanged{Name: "notes", Kind: "http", State: "disabled", Code: "DISABLED", Message: "paused in the dashboard", Hint: disabledHint}
+	if sc := h.waitService("notes", "disabled", 0); sc != want {
+		t.Fatalf("ServiceChanged = %+v, want %+v", sc, want)
+	}
+	h.waitPlain("· notes: disabled (DISABLED): paused in the dashboard · " + disabledHint + "\n")
 
 	h.autoReply.Store(false)
 	_ = c.Enable("id-notes", "notes")
@@ -678,7 +766,14 @@ func TestUpCharacterization_LocalDisableEnableViaController(t *testing.T) {
 	h.waitRow("docs", "docs disabled", func(r tui.Server) bool {
 		return r.Registration == tui.RegistrationDisabled && r.State == tui.RegistrationDisabled
 	})
+	// A local `d` carries no code, so it leaves the last-error line alone.
+	if sc := h.waitService("docs", "disabled", 0); sc != (eventbus.ServiceChanged{Name: "docs", Kind: "http", State: "disabled"}) {
+		t.Fatalf("ServiceChanged = %+v, want disabled with no code", sc)
+	}
+	h.waitPlain("· docs: disabled\n")
 
+	docsBefore := len(h.serviceChanges("docs"))
+	notesBefore := len(h.serviceChanges("notes"))
 	h.forceReconnect()
 	h.edge.WaitUntilFor(t, "the reconnect's register", charReconnectWait, func() bool {
 		return len(h.edge.RegisterBatches()) >= 2
@@ -686,11 +781,17 @@ func TestUpCharacterization_LocalDisableEnableViaController(t *testing.T) {
 	if got := h.edge.RegisterBatches()[1]; strings.Join(got, ",") != "notes" {
 		t.Fatalf("register after the reconnect = %v, want docs left out: [notes]", got)
 	}
-	seq := h.snapshotSeq()
 	h.waitConnState("connected", 2)
-	h.waitRowAfter(seq, "docs", "docs still disabled after the reconnect", func(r tui.Server) bool {
-		return r.Registration == tui.RegistrationDisabled
-	})
+	// The reconnect's register moves notes to pending and its reply back to
+	// active; docs, left out, publishes nothing in between.
+	h.waitService("notes", "pending", notesBefore)
+	h.waitService("notes", "active", notesBefore)
+	if got := h.serviceChanges("docs")[docsBefore:]; len(got) != 0 {
+		t.Fatalf("docs ServiceChanged across the reconnect = %+v, want none", got)
+	}
+	if r, _ := h.row("docs"); r.Registration != tui.RegistrationDisabled {
+		t.Fatalf("docs row after the reconnect = %+v, want still disabled", r)
+	}
 
 	h.autoReply.Store(false)
 	h.controller().Enable("docs")
@@ -711,18 +812,23 @@ func TestUpCharacterization_ConflictOpStickyUntilLocalEnable(t *testing.T) {
 	c := h.edge.Latest()
 
 	_ = c.Conflict("id-docs", "docs", "taken_over")
-	ae := h.waitAppError("CONFLICT", "docs")
-	if !strings.Contains(ae.Message, "taken_over") || ae.Hint != takenOverHint {
-		t.Fatalf("AppError = %+v, want the reason in its message and the take-over hint", ae)
+	want := eventbus.ServiceChanged{Name: "docs", Kind: "http", State: "taken_over", Code: "TAKEN_OVER", Message: "taken_over", Hint: takenOverHint}
+	if sc := h.waitService("docs", "taken_over", 0); sc != want {
+		t.Fatalf("ServiceChanged = %+v, want %+v", sc, want)
 	}
-	h.waitRow("docs", "docs rejected", func(r tui.Server) bool {
-		return r.Registration == tui.RegistrationRejected && r.URL == ""
+	h.waitRow("docs", "docs taken over", func(r tui.Server) bool {
+		return r.Registration == tui.RegistrationTakenOver && r.State == tui.RegistrationTakenOver && r.URL == ""
 	})
-	h.waitPlain("✗ CONFLICT: " + ae.Message + " service=docs · " + takenOverHint)
+	h.waitPlain("✗ docs: taken_over (TAKEN_OVER): taken_over · " + takenOverHint + "\n")
+	if errs := h.appErrors(""); len(errs) != 0 {
+		t.Fatalf("a take-over also published AppErrors %+v", errs)
+	}
 
 	// A dashboard enable for a taken-over name is ignored: the sentinel
 	// behind it is logged only once the enable has been handled, and no
 	// register went out for it.
+	docsBefore := len(h.serviceChanges("docs"))
+	notesBefore := len(h.serviceChanges("notes"))
 	_ = c.Enable("id-docs", "docs")
 	_ = c.Sentinel()
 	h.waitLog(charSentinelLog)
@@ -738,15 +844,23 @@ func TestUpCharacterization_ConflictOpStickyUntilLocalEnable(t *testing.T) {
 		t.Fatalf("register after the reconnect = %v, want the taken-over docs left out: [notes]", got)
 	}
 	h.waitConnState("connected", 2)
-	seq := h.snapshotSeq()
-	h.waitRowAfter(seq, "docs", "docs still rejected after the reconnect", func(r tui.Server) bool {
-		return r.Registration == tui.RegistrationRejected && r.URL == ""
-	})
+	// notes' reconnect round trip (pending, then active) is published after
+	// anything the ignored enable or the reconnect did to docs: none of it
+	// may move docs off taken_over.
+	h.waitService("notes", "pending", notesBefore)
+	h.waitService("notes", "active", notesBefore)
+	if got := h.serviceChanges("docs")[docsBefore:]; len(got) != 0 {
+		t.Fatalf("docs ServiceChanged after the ignored enable and the reconnect = %+v, want none", got)
+	}
+	if r, _ := h.row("docs"); r.Registration != tui.RegistrationTakenOver || r.URL != "" {
+		t.Fatalf("docs row after the reconnect = %+v, want still taken over with no URL", r)
+	}
 
 	h.controller().Enable("docs")
 	if got := h.edge.WaitRegister(t, 3); strings.Join(got, ",") != "docs" {
 		t.Fatalf("register after e = %v, want [docs]", got)
 	}
+	h.waitService("docs", "pending", docsBefore)
 	h.waitRow("docs", "docs claimed back by e", charActive)
 	h.expectNoFatal("a take-over")
 }
@@ -806,19 +920,26 @@ func TestUpCharacterization_TooManyServicesRejectsEveryRow(t *testing.T) {
 	})
 
 	const wantHint = "the tunnel refused this many servers in one register; remove some from the config"
-	ae := h.waitAppError("TOO_MANY_SERVICES", "")
-	if ae.Message != message || ae.Hint != wantHint {
-		t.Fatalf("AppError = %+v, want the edge's message and hint %q", ae, wantHint)
-	}
 	for _, name := range []string{"notes", "docs"} {
+		want := eventbus.ServiceChanged{Name: name, Kind: "http", State: "rejected", Code: "TOO_MANY_SERVICES", Message: message, Hint: wantHint}
+		if sc := h.waitService(name, "rejected", 0); sc != want {
+			t.Fatalf("ServiceChanged = %+v, want %+v", sc, want)
+		}
 		h.waitRow(name, name+" rejected", func(r tui.Server) bool {
 			return r.Registration == tui.RegistrationRejected && r.URL == "" && r.Kind == "http"
 		})
+		h.waitPlain("✗ " + name + ": rejected (TOO_MANY_SERVICES): " + message + " · " + wantHint + "\n")
 	}
-	h.waitPlain("✗ TOO_MANY_SERVICES: " + message + " · " + wantHint)
-	h.expectNoFatal("TOO_MANY_SERVICES, even on the first connection")
-	if n := len(h.appErrors("")); n != 1 {
-		t.Fatalf("got %d AppErrors, want one for the whole batch: %+v", n, h.appErrors(""))
+	// The refused frame carried every service and nothing was ever
+	// registered, so every service is refused (MCPWARP.md §6A.6 G5 after G7).
+	if code := h.waitFatal(); code != 1 {
+		t.Fatalf("fatal exit code = %d, want 1", code)
+	}
+	h.waitLog("No service could be registered.")
+	// The whole-frame error answered a register, so it is reported per name
+	// above and not again as an AppError.
+	if errs := h.appErrors(""); len(errs) != 0 {
+		t.Fatalf("got AppErrors %+v beside the per-service rejections, want none", errs)
 	}
 }
 
@@ -838,8 +959,12 @@ func TestUpCharacterization_FirstReplyAllRefusedIsFatal(t *testing.T) {
 	if code := h.waitFatal(); code != 1 {
 		t.Fatalf("fatal exit code = %d, want 1", code)
 	}
-	h.waitAppError("QUOTA_EXCEEDED", "notes")
-	h.waitAppError("CONFLICT", "docs")
+	if sc := h.waitService("notes", "rejected", 0); sc.Code != "QUOTA_EXCEEDED" {
+		t.Fatalf("notes ServiceChanged = %+v, want rejected QUOTA_EXCEEDED", sc)
+	}
+	if sc := h.waitService("docs", "rejected", 0); sc.Code != "CONFLICT" {
+		t.Fatalf("docs ServiceChanged = %+v, want rejected CONFLICT", sc)
+	}
 	for _, name := range []string{"notes", "docs"} {
 		h.waitRow(name, name+" rejected", func(r tui.Server) bool {
 			return r.Registration == tui.RegistrationRejected && r.URL == ""
@@ -860,11 +985,15 @@ func TestUpCharacterization_FirstReplyDisabledAndQuotaNotFatal(t *testing.T) {
 		},
 	})
 
-	disabled := h.waitAppError("SERVER_DISABLED", "notes")
-	if disabled.Hint != "this server was disabled in the dashboard — waiting, toggle it on to resume" {
-		t.Fatalf("SERVER_DISABLED AppError = %+v", disabled)
+	// SERVER_DISABLED is the dashboard's disable (DISABLED), not a refusal.
+	want := eventbus.ServiceChanged{Name: "notes", Kind: "http", State: "disabled", Code: "DISABLED", Message: "disabled in dashboard",
+		Hint: "this server was disabled in the dashboard — waiting, toggle it on to resume"}
+	if sc := h.waitService("notes", "disabled", 0); sc != want {
+		t.Fatalf("notes ServiceChanged = %+v, want %+v", sc, want)
 	}
-	h.waitAppError("QUOTA_EXCEEDED", "docs")
+	if sc := h.waitService("docs", "rejected", 0); sc.Code != "QUOTA_EXCEEDED" {
+		t.Fatalf("docs ServiceChanged = %+v, want rejected QUOTA_EXCEEDED", sc)
+	}
 	h.expectNoFatal("a first reply mixing SERVER_DISABLED with QUOTA_EXCEEDED")
 	h.waitRow("notes", "notes disabled", func(r tui.Server) bool {
 		return r.Registration == tui.RegistrationDisabled && r.URL == ""
@@ -931,6 +1060,12 @@ func TestUpCharacterization_UnsupportedVersionIsFatal(t *testing.T) {
 // carries no metadata, routed by Host), and returns the response.
 func (h *charHarness) relay(host string) (status int, body string) {
 	h.t.Helper()
+	return h.relayPath(host, "/mcp")
+}
+
+// relayPath is relay for an arbitrary request target.
+func (h *charHarness) relayPath(host, target string) (status int, body string) {
+	h.t.Helper()
 	c := h.edge.Latest()
 	if c == nil {
 		h.t.Fatal("no connection to open a stream on")
@@ -941,7 +1076,7 @@ func (h *charHarness) relay(host string) (status int, body string) {
 	if err != nil {
 		h.t.Fatalf("OpenStream: %v", err)
 	}
-	fmt.Fprintf(stream, "GET /mcp HTTP/1.1\r\nHost: %s\r\n\r\n", host)
+	fmt.Fprintf(stream, "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, host)
 	_ = stream.CloseWrite()
 	resp, err := http.ReadResponse(bufio.NewReader(stream), nil)
 	if err != nil {
@@ -975,7 +1110,7 @@ func TestUpCharacterization_RelayStatuses(t *testing.T) {
 		wantBody   string
 	}{
 		{"api.example", http.StatusOK, "backend saw /mcp"},
-		{"nobody.example", http.StatusNotFound, `{"error":"unknown service"}`},
+		{"nobody.example", http.StatusServiceUnavailable, `{"error":"service unavailable"}`},
 		{"docs.example", http.StatusServiceUnavailable, `{"error":"service disabled"}`},
 		{"notes.example", http.StatusBadGateway, `{"error":"local server unreachable"}`},
 	}
@@ -984,6 +1119,36 @@ func TestUpCharacterization_RelayStatuses(t *testing.T) {
 			t.Errorf("GET %s/mcp = %d %q, want %d %q", tc.host, status, body, tc.wantStatus, tc.wantBody)
 		}
 	}
+
+	// Only /mcp is forwarded (MCPWARP.md §4.3): a refused path surfaces once
+	// per service as a PATH_REFUSED AppError, however often it is hit.
+	for i := 0; i < 2; i++ {
+		if status, body := h.relayPath("api.example", "/sse"); status != http.StatusNotFound || body != `{"error":"not_found"}` {
+			t.Errorf("GET api.example/sse = %d %q, want 404 not_found", status, body)
+		}
+	}
+	// StreamClosed follows RelayStream's return, so once every stream so far
+	// has closed no PATH_REFUSED can still be in flight.
+	streams := len(cases) + 2
+	h.waitFor("every relayed stream closed", func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		closed := 0
+		for _, e := range h.control {
+			if _, ok := e.(eventbus.StreamClosed); ok {
+				closed++
+			}
+		}
+		return closed >= streams
+	})
+	const (
+		refusedMsg  = "request for /sse refused: only /mcp is forwarded"
+		refusedHint = "point the MCP client at https://api.example/mcp"
+	)
+	if errs := h.appErrors("PATH_REFUSED"); len(errs) != 1 || errs[0] != (eventbus.AppError{Code: "PATH_REFUSED", Service: "api", Message: refusedMsg, Hint: refusedHint}) {
+		t.Errorf("PATH_REFUSED AppErrors = %+v, want exactly one for api", errs)
+	}
+	h.waitPlain("✗ PATH_REFUSED: " + refusedMsg + " service=api · " + refusedHint)
 }
 
 func TestUpCharacterization_InvalidNameAndUsernameRequiredHints(t *testing.T) {
@@ -1007,14 +1172,17 @@ func TestUpCharacterization_InvalidNameAndUsernameRequiredHints(t *testing.T) {
 		invalidHint  = "fix the name in your config — it is the public URL slug and must match [a-z0-9]([a-z0-9-]*[a-z0-9])? (max 30 chars)"
 		usernameHint = "sign in once at " + charWebURL + " to choose a username, then run `mcpwarp up` again"
 	)
-	if ae := h.waitAppError("INVALID_NAME", "docs"); ae.Message != invalidMsg || ae.Hint != invalidHint {
-		t.Fatalf("INVALID_NAME AppError = %+v, want hint %q", ae, invalidHint)
+	if sc := h.waitService("docs", "rejected", 0); sc.Code != "INVALID_NAME" || sc.Message != invalidMsg || sc.Hint != invalidHint {
+		t.Fatalf("docs ServiceChanged = %+v, want INVALID_NAME with hint %q", sc, invalidHint)
 	}
-	if ae := h.waitAppError("USERNAME_REQUIRED", "extra"); ae.Message != usernameMsg || ae.Hint != usernameHint {
-		t.Fatalf("USERNAME_REQUIRED AppError = %+v, want hint %q", ae, usernameHint)
+	if sc := h.waitService("extra", "rejected", 0); sc.Code != "USERNAME_REQUIRED" || sc.Message != usernameMsg || sc.Hint != usernameHint {
+		t.Fatalf("extra ServiceChanged = %+v, want USERNAME_REQUIRED with hint %q", sc, usernameHint)
 	}
-	h.waitPlain("✗ INVALID_NAME: " + invalidMsg + " service=docs · " + invalidHint)
-	h.waitPlain("✗ USERNAME_REQUIRED: " + usernameMsg + " service=extra · " + usernameHint)
+	h.waitPlain("✗ docs: rejected (INVALID_NAME): " + invalidMsg + " · " + invalidHint + "\n")
+	h.waitPlain("✗ extra: rejected (USERNAME_REQUIRED): " + usernameMsg + " · " + usernameHint + "\n")
+	if errs := h.appErrors(""); len(errs) != 0 {
+		t.Fatalf("per-service refusals also published AppErrors %+v", errs)
+	}
 	for _, name := range []string{"docs", "extra"} {
 		h.waitRow(name, name+" rejected", func(r tui.Server) bool {
 			return r.Registration == tui.RegistrationRejected && r.URL == ""

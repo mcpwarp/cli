@@ -178,6 +178,62 @@ func TestRunPlainPrintsServiceTransitions(t *testing.T) {
 	}
 }
 
+// TestRunPlainSkipsReconnectFlicker: a code-less pending right after active
+// (a reconnect's re-register) prints nothing, and neither does the same
+// active line coming back; a pending with a code, or after any state but
+// active, still prints, as does an active with a new URL.
+func TestRunPlainSkipsReconnectFlicker(t *testing.T) {
+	bus := eventbus.New(16)
+	buf := &syncBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- RunPlain(ctx, bus, buf) }()
+
+	active := eventbus.ServiceChanged{Name: "a", Kind: "http", State: "active", URL: "https://a.example/mcp"}
+	pending := eventbus.ServiceChanged{Name: "a", Kind: "http", State: "pending"}
+	for _, e := range []eventbus.ServiceChanged{
+		active,
+		pending,
+		active,
+		{Name: "a", Kind: "http", State: "pending", Code: "INTERNAL", Message: "resolve deadline"},
+		{Name: "a", Kind: "http", State: "rejected", Code: "QUOTA_EXCEEDED"},
+		pending,
+		active,
+		pending,
+		{Name: "a", Kind: "http", State: "active", URL: "https://a2.example/mcp"},
+		{Name: "b", Kind: "http", State: "disabled"},
+		{Name: "b", Kind: "http", State: "pending"},
+		{Name: "fence", Kind: "http", State: "disabled"},
+	} {
+		bus.Publish(e)
+	}
+
+	want := "✓ a: active https://a.example/mcp\n" +
+		"· a: pending (INTERNAL): resolve deadline\n" +
+		"✗ a: rejected (QUOTA_EXCEEDED)\n" +
+		"· a: pending\n" +
+		"✓ a: active https://a.example/mcp\n" +
+		"✓ a: active https://a2.example/mcp\n" +
+		"· b: disabled\n" +
+		"· b: pending\n" +
+		"· fence: disabled\n"
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(buf.String(), "fence: disabled") {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for the fence line; got:\n%s", buf.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if got := buf.String(); got != want {
+		t.Fatalf("plain output =\n%s\nwant\n%s", got, want)
+	}
+}
+
 // TestServiceLineOptionalPartsAndColor: the code, message and hint parts
 // appear only when present (a hint without a code, a code without a hint,
 // a message without a code), a hint's own em dash stays intact behind the

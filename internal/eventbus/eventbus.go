@@ -68,7 +68,11 @@ type ConnStateChanged struct {
 //     rejection the wire code as received (QUOTA_EXCEEDED, CONFLICT,
 //     TOO_MANY_SERVICES, INVALID_NAME, USERNAME_REQUIRED, ...), so not
 //     always a mcpwarp.StatusCode; "" when there is none (a plain
-//     pending/active, or a local disable).
+//     pending/active, or a local disable). Unlike ws-mixer-spec MCPWARP.md
+//     §6A.4, which gives pending no code, a pending that starts a transient
+//     retry series carries that series' first code (the transient code,
+//     or INTERNAL for a name the reply left out), its only user-visible
+//     trace.
 //   - Message is the edge's or SDK's own text for Code (the SDK's
 //     LastError, a conflict's reason) or "" when it has none.
 //   - Hint is the user-facing next step for Code (where to upgrade, how to
@@ -109,8 +113,7 @@ type AppError struct {
 }
 
 // Control events are lossless (backpressure the producer); Telemetry and
-// Metrics events are drop-oldest, matching the OVERLOADED queue policy
-// (DESIGN.md §3, §8).
+// Metrics events are drop-oldest (DESIGN.md §3).
 
 // Bus is the two-channel shape DESIGN.md §3 calls for (a lossless control
 // channel and a drop-oldest telemetry channel), plus a third drop-oldest
@@ -135,7 +138,7 @@ type Bus struct {
 }
 
 // TelemetryCap bounds the telemetry channel; once full, sends drop the
-// oldest queued item to make room, mirroring the OVERLOADED queue.
+// oldest queued item to make room.
 const TelemetryCap = 64
 
 // New creates a Bus with a lossless control channel (capacity controlCap;

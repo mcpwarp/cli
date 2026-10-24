@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mcpwarp/cli/internal/appproto"
@@ -30,6 +31,7 @@ import (
 	"github.com/mcpwarp/cli/internal/supervisor"
 	"github.com/mcpwarp/cli/internal/tui"
 	"github.com/mcpwarp/cli/internal/tunnel"
+	"github.com/mcpwarp/ws-mixer-go/mcpwarp"
 	"github.com/mcpwarp/ws-mixer-go/wsmixer"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -99,8 +101,8 @@ type tunnelHandle interface {
 	// §8 already defines, rather than driving only the local supervisor.
 	RegisterService(name string)
 	UnregisterService(name string) error
-	// Registry/Stats feed the TUI's dashboard (DESIGN.md §9): public URLs
-	// once "registered" lands, and a bytes-transferred figure.
+	// Registry backs the lazy-respawn guard (lazyRespawnRefusal); Stats
+	// feeds the TUI's bytes-transferred figure (DESIGN.md §9).
 	Registry() *registry.Registry
 	Stats() wsmixer.Stats
 }
@@ -176,17 +178,23 @@ func (c *Controller) Restart(name string) error {
 // Disable stops name's child (supervisor.Disable) and unregisters it from
 // the tunnel (tunnelHandle.UnregisterService) — the local counterpart of a
 // remote disable. An http server has no child to stop, so only the
-// unregister half applies.
+// unregister half applies. The unregister goes first: it marks the name
+// locally disabled in the registry, which must already hold by the time
+// the supervisor reads Disabled, or a request in between could lazily
+// respawn the child the user just stopped (ensureChildFor).
 func (c *Controller) Disable(name string) error {
-	if s := c.get(name); s != nil {
-		s.Disable()
-	} else if !c.isHTTP(name) {
+	s := c.get(name)
+	if s == nil && !c.isHTTP(name) {
 		return fmt.Errorf("unknown server %q", name)
 	}
+	var err error
 	if c.t != nil {
-		return c.t.UnregisterService(name)
+		err = c.t.UnregisterService(name)
 	}
-	return nil
+	if s != nil {
+		s.Disable()
+	}
+	return err
 }
 
 // Enable respawns name's child (supervisor.Enable) and re-registers it with
@@ -214,12 +222,7 @@ type upUIDeps struct {
 	Log        *slog.Logger
 	Controller *Controller
 	Services   []output.TableRow
-	// Registry is the tunnel's live name/id/url table — the TUI wiring
-	// polls it for the public URL a service is assigned once "registered"
-	// lands (Services/rows above are only the caller's initial, pre-tunnel
-	// snapshot). Nil in a plain-mode upUIDeps, which has no use for it.
-	Registry  *registry.Registry
-	PlainMode bool
+	PlainMode  bool
 
 	// SetLogWriter, if non-nil, redirects ctx.Log's underlying writer —
 	// the TUI's TTY path swaps it to tui.OpenLogFile's file for as long as
@@ -275,13 +278,14 @@ func (a tuiControllerAdapter) run(name, action string, fn func(string) error) {
 
 // newTUIRenderer builds the runUIFunc used on a TTY without --no-tui
 // (DESIGN.md §9): redirects logging to tui.OpenLogFile's file for as long
-// as the dashboard owns the terminal, polls the tunnel's registry/Stats
-// once a second for the public-URL snapshot and bytes-transferred figure
-// the bus can't otherwise produce (simplest option; ConnStateChanged/
-// AppError alone can't tell the model a service's public URL — carried
-// only on "registered" — has appeared), and reports tuiRunFunc's quit flag
-// back to runUp (on `q`) rather than acting on it itself — see runUIFunc's
-// doc comment (B-1).
+// as the dashboard owns the terminal, seeds every configured server's row
+// pending, polls the tunnel's Stats once a second for the
+// bytes-transferred figure the bus can't otherwise produce, and reports
+// tuiRunFunc's quit flag back to runUp (on `q`) rather than acting on it
+// itself — see runUIFunc's doc comment (B-1). Rows change only through the
+// bus: the tunnel publishes every registration transition, URL included,
+// as an eventbus.ServiceChanged, so no SnapshotMsg is ever sent
+// (tui.SnapshotMsg's doc).
 func newTUIRenderer(home string, t tunnelHandle) runUIFunc {
 	return func(ctx context.Context, deps upUIDeps) (bool, error) {
 		if deps.SetLogWriter != nil {
@@ -298,9 +302,10 @@ func newTUIRenderer(home string, t tunnelHandle) runUIFunc {
 
 		// Seed each row's initial STATE: every row starts pending
 		// registration, since nothing is active until the tunnel's first
-		// "registered" reply says so (pollTunnelForTUI takes over from
-		// there); an http row has no supervisor, so that is its State too,
-		// while stdio reads its supervisor's.
+		// "registered" reply says so (its ServiceChanged events take over
+		// from there, starting from this same pending); an http row has no
+		// supervisor, so that is its State too, while stdio reads its
+		// supervisor's.
 		servers := make([]tui.Server, len(deps.Services))
 		for i, r := range deps.Services {
 			s := tui.Server{Name: r.Name, Kind: r.Kind, Registration: tui.RegistrationPending}
@@ -316,19 +321,16 @@ func newTUIRenderer(home string, t tunnelHandle) runUIFunc {
 
 		pollCtx, stopPoll := context.WithCancel(ctx)
 		defer stopPoll()
-		updates := make(chan tui.SnapshotMsg, 1)
-		go pollTunnelForTUI(pollCtx, t, deps.Bus, updates, time.Second)
+		go pollTunnelForTUI(pollCtx, t, deps.Bus, time.Second)
 
-		return tuiRunFunc(ctx, deps.Bus, servers, tuiControllerAdapter{c: deps.Controller, log: deps.Log}, updates)
+		return tuiRunFunc(ctx, deps.Bus, servers, tuiControllerAdapter{c: deps.Controller, log: deps.Log}, nil)
 	}
 }
 
-// pollTunnelForTUI feeds the running dashboard what the bus alone can't:
-// the registry's public URLs (pushed as a tui.SnapshotMsg once per
-// interval) and a bytes-transferred metric derived from Stats() (DESIGN.md
-// §9). Stops, closing updates, once ctx is done.
-func pollTunnelForTUI(ctx context.Context, t tunnelHandle, bus *eventbus.Bus, updates chan<- tui.SnapshotMsg, interval time.Duration) {
-	defer close(updates)
+// pollTunnelForTUI feeds the running dashboard the one thing the bus alone
+// can't: a bytes-transferred metric derived from Stats() once per interval
+// (DESIGN.md §9). Stops once ctx is done.
+func pollTunnelForTUI(ctx context.Context, t tunnelHandle, bus *eventbus.Bus, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -336,34 +338,6 @@ func pollTunnelForTUI(ctx context.Context, t tunnelHandle, bus *eventbus.Bus, up
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if reg := t.Registry(); reg != nil {
-				rows := reg.Rows()
-				snap := make([]tui.Server, len(rows))
-				for i, r := range rows {
-					s := tui.Server{Name: r.Name, Kind: r.Kind, URL: r.URL, Registration: registrationOf(r)}
-					// The tunnel won't route a public request to a rejected
-					// name (our registry may still hold its old entry, but
-					// nothing reaches it), so an old URL from an earlier
-					// success this run is a dead link to show or to `c`.
-					if s.Registration == tui.RegistrationRejected {
-						s.URL = ""
-					}
-					// stdio's state is owned by eventbus.ServerStateChanged
-					// (applySnapshot leaves an empty State untouched); only
-					// http, with no supervisor, takes its State from the
-					// registration itself.
-					if r.Kind == config.KindHTTP {
-						s.State = s.Registration
-					}
-					snap[i] = s
-				}
-				select {
-				case updates <- tui.SnapshotMsg{Servers: snap}:
-				default:
-					// A previous snapshot is still waiting to be sent —
-					// the next tick's snapshot supersedes it anyway.
-				}
-			}
 			stats := t.Stats()
 			bus.PublishMetric(eventbus.MetricSample{
 				Kind:  "bytes_total",
@@ -374,30 +348,65 @@ func pollTunnelForTUI(ctx context.Context, t tunnelHandle, bus *eventbus.Bus, up
 	}
 }
 
-// registrationOf maps one registry row to the dashboard's registration
-// state (tui.Registration*), newest fact first. A local `d` beats
-// everything, since the user took the name out of play whatever the tunnel
-// said before; an `e` awaiting its reply is pending. A rejection then wins
-// over a plain Disabled: the registry keeps a `d`-disabled entry's status
-// until the next successful "registered", so once `e` re-registers it and
-// the tunnel rejects that, the rejection is the newer fact. SERVER_DISABLED
-// is shown as disabled rather than rejected — it's the dashboard's own
-// toggle and resumes on a later "enable" (DESIGN.md §8), not a problem the
-// user has to fix here.
-func registrationOf(r registry.Row) string {
+// lazyRespawnRefusal is the guard in front of a stdio service's
+// supervisor.EnsureRunning (bridge.StartBridgeOptions.EnsureChild,
+// DESIGN.md §7): a request must never bring back a child the user stopped
+// with `d` (§9), one the dashboard disabled (a "disable" op, or a
+// SERVER_DISABLED reply), or one whose name another session took over
+// (§8). It returns why the respawn is refused, or "" to let it go ahead.
+// Unlike the dashboard's state it deliberately ignores Reregistering: a
+// name a welcome's register re-sends is pending there, but a dashboard
+// disable still in force for it must not let a request respawn the child.
+// A disabled entry whose register is out (a `d` then `e`, or a dashboard-
+// disabled name re-sent on reconnect; the row can't tell which) gets a
+// message that blames neither.
+func lazyRespawnRefusal(r registry.Row) string {
 	switch {
 	case r.LocallyDisabled:
-		return tui.RegistrationDisabled
-	case r.Reregistering:
-		return tui.RegistrationPending
-	case r.Rejected == "SERVER_DISABLED":
-		return tui.RegistrationDisabled
-	case r.Rejected != "":
-		return tui.RegistrationRejected
-	case r.Disabled:
-		return tui.RegistrationDisabled
+		return "disabled locally"
+	case r.Disabled && r.Reregistering:
+		return "disabled until its register is answered"
+	case r.Disabled, r.Rejected == "SERVER_DISABLED":
+		return "disabled in the dashboard"
+	case r.Rejected == string(mcpwarp.CodeTakenOver):
+		return "taken over by another mcpwarp session"
 	default:
-		return tui.RegistrationActive
+		return ""
+	}
+}
+
+// ensureChildFor is name's bridge.StartBridgeOptions.EnsureChild:
+// lazyRespawnRefusal against the tunnel registry's row for name, checked
+// once up front and again inside sv's EnsureRunning (its allow) under the
+// supervisor's lock right before a spawn from disabled — `up` marks the
+// registry before every Disable() (Controller.Disable, the tunnel's
+// OnDisable after ApplyDisable), so a `d` or dashboard disable racing the
+// request is always seen there. EnsureRunning is the only call that may
+// block. reg and sv are stored once StartTunnel and NewSupervisor have
+// returned, after the bridge is already listening; a request before then
+// can't have come through the tunnel, and is refused.
+func ensureChildFor(name string, reg *atomic.Pointer[registry.Registry], sv *atomic.Pointer[supervisor.Supervisor]) func(context.Context) error {
+	return func(ctx context.Context) error {
+		r, s := reg.Load(), sv.Load()
+		if r == nil || s == nil {
+			return fmt.Errorf("%s: not started yet; not respawning", name)
+		}
+		allow := func() error {
+			for _, row := range r.Rows() {
+				if row.Name != name {
+					continue
+				}
+				if why := lazyRespawnRefusal(row); why != "" {
+					return fmt.Errorf("%s: %s; not respawning", name, why)
+				}
+				break
+			}
+			return nil
+		}
+		if err := allow(); err != nil {
+			return err
+		}
+		return s.EnsureRunning(ctx, allow)
 	}
 }
 
@@ -660,16 +669,23 @@ func runUp(ctx *Context, noTUI bool, deps upDeps) error {
 		}
 	}
 
+	// tunnelReg is the tunnel's registry for every stdio bridge's
+	// EnsureChild (ensureChildFor), stored once StartTunnel returns.
+	var tunnelReg atomic.Pointer[registry.Registry]
+
 	for _, s := range cfg.Servers {
 		if s.Kind != config.KindStdio {
 			continue
 		}
+		name := s.Name
+		var svRef atomic.Pointer[supervisor.Supervisor]
 		spawnSpec := bridge.SpawnSpec{Command: s.Command, Args: s.Args, Env: s.Env, Cwd: s.Cwd}
 		br, err := deps.StartBridge(bridge.StartBridgeOptions{
-			Name:      s.Name,
-			SpawnSpec: spawnSpec,
-			Log:       ctx.Log,
-			Bus:       bus,
+			Name:        s.Name,
+			SpawnSpec:   spawnSpec,
+			Log:         ctx.Log,
+			Bus:         bus,
+			EnsureChild: ensureChildFor(name, &tunnelReg, &svRef),
 		})
 		if err != nil {
 			// Node's up.ts:90-121: whatever already started must not leak
@@ -699,11 +715,11 @@ func runUp(ctx *Context, noTUI bool, deps upDeps) error {
 			// bridge's own initial child's does (StartBridgeOptions.Bus
 			// above) — otherwise a service's telemetry goes dark the
 			// moment its first child is replaced.
-			Spawn: func(spec bridge.SpawnSpec, log *slog.Logger, name string) (*bridge.StdioChild, error) {
-				return bridge.NewStdioChildWithBus(spec, log, name, bus)
+			Spawn: func(spec bridge.SpawnSpec, log *slog.Logger, svcName string) (*bridge.StdioChild, error) {
+				return bridge.NewStdioChildWithBus(spec, log, svcName, bus)
 			},
 		})
-		name := s.Name
+		svRef.Store(sv)
 		sv.OnFailed(func(reason string) {
 			if plainMode {
 				output.Error(reason)
@@ -756,6 +772,7 @@ func runUp(ctx *Context, noTUI bool, deps upDeps) error {
 		output.Error(msg)
 		return RuntimeError()
 	}
+	tunnelReg.Store(t.Registry())
 
 	// uiDone is created before the shutdown handlers below are registered,
 	// not merely before BlockForever, so the "servers" handler can wait on
@@ -870,7 +887,6 @@ func runUp(ctx *Context, noTUI bool, deps upDeps) error {
 			Log:          ctx.Log,
 			Controller:   controller,
 			Services:     rows,
-			Registry:     t.Registry(),
 			PlainMode:    plainMode,
 			SetLogWriter: setLogWriter,
 		})

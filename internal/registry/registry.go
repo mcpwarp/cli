@@ -102,7 +102,7 @@ type Registry struct {
 	// carried a per-service error for it (DESIGN.md §8's register errors:
 	// QUOTA_EXCEEDED, CONFLICT, SERVER_DISABLED, ...), keyed by name — or
 	// that the tunnel since took away (a "conflict" op, recorded as
-	// CONFLICT; a whole-batch TOO_MANY_SERVICES error). Kept apart from
+	// TAKEN_OVER; a whole-batch TOO_MANY_SERVICES error). Kept apart from
 	// entries because a name rejected on its very first register never gets
 	// an id or URL at all; cleared per name by the next ApplyRegistered that
 	// reports that name registered. Raising the quota alone doesn't do that
@@ -114,10 +114,11 @@ type Registry struct {
 	// by MarkReregistering. Kept by name rather than id because a name can
 	// be disabled before it ever had an id (still pending, or rejected).
 	locallyDisabled map[string]string
-	// reregistering holds names (-> kind) a local or dashboard enable just
-	// sent a register for (MarkReregistering), until the reply for that
-	// name lands — so the dashboard shows pending there, not the stale
-	// disabled/rejected state from before.
+	// reregistering holds names (-> kind) a local or dashboard enable or a
+	// welcome's register just sent a register for, or whose transient
+	// failure has a retry scheduled (MarkReregistering), until a final reply
+	// for that name lands — so the dashboard shows pending there, not the
+	// stale disabled/rejected/active state from before.
 	reregistering map[string]string
 }
 
@@ -152,8 +153,9 @@ func (r *Registry) MarkLocallyDisabled(name, kind string) {
 }
 
 // MarkReregistering undoes MarkLocallyDisabled for a local `e` (or a
-// dashboard enable) that just sent a register for name: it reads as
-// pending until the reply for it lands, whichever way that goes.
+// dashboard enable) that just sent a register for name, or marks a name a
+// welcome's register carries or whose transient failure is being retried:
+// it reads as pending until a success or refusal for it lands.
 func (r *Registry) MarkReregistering(name, kind string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -426,7 +428,8 @@ type Row struct {
 	// LocallyDisabled reports a local `d` not yet undone by `e`
 	// (MarkLocallyDisabled); Disabled is always true alongside it.
 	LocallyDisabled bool
-	// Reregistering reports an `e` whose register hasn't been answered yet
+	// Reregistering reports an `e` or a welcome's register whose reply
+	// hasn't landed yet, or a transient failure whose retry is still running
 	// (MarkReregistering).
 	Reregistering bool
 }

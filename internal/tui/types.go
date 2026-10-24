@@ -10,10 +10,12 @@ package tui
 // Server is a snapshot of one configured server for the dashboard table
 // (NAME | KIND | STATE | RESTARTS | URL, with aggregate streams/bytes in the
 // header — StreamOpened/StreamClosed carry a stream ID but no server name,
-// so a per-server streams column isn't derivable from the bus). Name/Kind/
-// URL come from the caller's initial snapshot (and any later SnapshotMsg);
-// State/Restarts are normally kept current by eventbus.ServerStateChanged,
-// falling back to the snapshot's own values until the first one arrives.
+// so a per-server streams column isn't derivable from the bus). Name/Kind
+// come from the caller's initial snapshot; Registration and URL are kept
+// current by eventbus.ServiceChanged (or a SnapshotMsg, for a caller that
+// sends one); State/Restarts are normally kept current by
+// eventbus.ServerStateChanged, falling back to the snapshot's own values
+// until the first one arrives.
 //
 // Registration is the tunnel's side of the row (one of the Registration*
 // values below), kept apart from State because a stdio row has two
@@ -85,11 +87,11 @@ type Controller interface {
 //
 // eventbus.ServiceChanged is the push-per-transition counterpart for a
 // row's registration (Model.applyServiceChanged). The two never both carry
-// rows into one running Program: once the tunnel adapter publishes
-// ServiceChanged, the once-a-second poll stops sending server rows and only
-// publishes the bytes_total metric, and the startup rows come from the
-// servers handed to tuiRunFunc. Until then the poll's SnapshotMsg is the
-// only registration source.
+// rows into one running Program: the tunnel publishes ServiceChanged for
+// every registration transition, so `up`'s once-a-second poll sends no
+// server rows, only the bytes_total metric, and hands Run no SnapshotMsg
+// channel at all; its startup rows are the servers handed to tuiRunFunc,
+// seeded pending.
 type SnapshotMsg struct {
 	Servers []Server
 }

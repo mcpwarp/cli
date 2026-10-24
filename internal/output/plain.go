@@ -12,6 +12,8 @@ import (
 // per Control event, Node-style ✓/!/✗ prefixes where they fit, written to
 // w. LogLines pass through to Stderr as they arrive; MetricSamples are
 // dropped (DESIGN.md §9 — no bandwidth/latency display outside the TUI).
+// A ServiceChanged that would only show a reconnect's pending-then-active
+// round trip again is skipped (reconnectFlicker).
 //
 // RunPlain keeps draining bus.Control until ctx is done, even once w stops
 // being interesting to anyone, because Control is the bus's lossless
@@ -25,6 +27,7 @@ import (
 func RunPlain(ctx context.Context, bus *eventbus.Bus, w io.Writer) error {
 	color := streamColorEnabled(w)
 	telemetry := bus.Telemetry
+	printed := make(map[string]eventbus.ServiceChanged)
 	for {
 		select {
 		case <-ctx.Done():
@@ -32,6 +35,12 @@ func RunPlain(ctx context.Context, bus *eventbus.Bus, w io.Writer) error {
 		case evt, ok := <-bus.Control:
 			if !ok {
 				return nil
+			}
+			if sc, ok := evt.(eventbus.ServiceChanged); ok {
+				if reconnectFlicker(printed[sc.Name], sc) {
+					continue
+				}
+				printed[sc.Name] = sc
 			}
 			writeControlLine(w, color, evt)
 		case line, ok := <-telemetry:
@@ -98,7 +107,7 @@ func writeControlLine(w io.Writer, color bool, evt any) {
 //
 //	✓ anki: active https://anki-x.tunnel.mcpwarp.io/mcp
 //	✗ deepwiki: rejected (QUOTA_EXCEEDED): server limit reached · upgrade your plan at ...
-//	✗ notes: taken_over (TAKEN_OVER) · press e to reclaim it
+//	✗ notes: taken_over (TAKEN_OVER): taken_over · another `mcpwarp up` on this account now serves it; stop that one or rename this server, then press e (or restart this `mcpwarp up`)
 //	· fs: disabled
 //	· fs: pending
 //
@@ -130,6 +139,20 @@ func writeServiceLine(w io.Writer, color bool, e eventbus.ServiceChanged) {
 		line += " · " + e.Hint
 	}
 	fmt.Fprintln(w, line)
+}
+
+// reconnectFlicker reports whether a ServiceChanged would only repeat what
+// plain mode last printed for that service: a code-less pending right
+// after active (every reconnect re-registers each name, and its reply
+// usually brings back the same active), or a line identical to the last
+// one printed, which only follows such a skipped pending. A pending
+// carrying a code (a transient retry series starting) or following any
+// other state still prints.
+func reconnectFlicker(last, next eventbus.ServiceChanged) bool {
+	if next.State == "pending" && next.Code == "" && last.State == "active" {
+		return true
+	}
+	return next == last
 }
 
 // writeLogLine writes a forwarded LogLine to w. Callers pass the package's

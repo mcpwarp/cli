@@ -291,9 +291,8 @@ func serversJSON(n int) string {
 	return `{"servers":[` + strings.Join(entries, ",") + `]}`
 }
 
-// TestValidateConfigServerCap: the tunnel refuses a register of more than
-// MaxServers services as a whole (TOO_MANY_SERVICES), so the config is
-// capped at exactly that.
+// TestValidateConfigServerCap: the config is capped at exactly MaxServers,
+// the tunnel's per-message cap, kept as a config limit.
 func TestValidateConfigServerCap(t *testing.T) {
 	t.Run("MaxServers servers pass", func(t *testing.T) {
 		if cfg := mustValidate(t, serversJSON(MaxServers)); len(cfg.Servers) != MaxServers {
@@ -307,7 +306,7 @@ func TestValidateConfigServerCap(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected an issue at servers, got %v", issues)
 		}
-		want := "too many servers (101): the tunnel accepts at most 100 in one register message, which carries them all"
+		want := "config has 101 servers; the limit is 100, remove some"
 		if got.message != want {
 			t.Errorf("got message %q, want %q", got.message, want)
 		}

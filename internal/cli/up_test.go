@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mcpwarp/cli/internal/appproto"
 	"github.com/mcpwarp/cli/internal/bridge"
 	"github.com/mcpwarp/cli/internal/eventbus"
 	"github.com/mcpwarp/cli/internal/output"
@@ -271,10 +270,6 @@ type fakeTunnelHandle struct {
 
 	registeredNames   []string
 	unregisteredNames []string
-
-	// reg, if set, is returned by Registry() instead of a fresh empty one —
-	// lets a test seed rows for pollTunnelForTUI to poll.
-	reg *registry.Registry
 }
 
 func (f *fakeTunnelHandle) Unregister(context.Context) error {
@@ -299,7 +294,7 @@ func (f *fakeTunnelHandle) Close(context.Context) error {
 
 // RegisterService/UnregisterService record the name they were called with
 // (for TestControllerDisableEnableReachTunnel) in addition to being no-ops
-// otherwise; Registry/Stats are zero values unless reg is set.
+// otherwise; Registry/Stats are zero values.
 func (f *fakeTunnelHandle) RegisterService(name string) {
 	f.mu.Lock()
 	f.registeredNames = append(f.registeredNames, name)
@@ -312,13 +307,8 @@ func (f *fakeTunnelHandle) UnregisterService(name string) error {
 	f.mu.Unlock()
 	return nil
 }
-func (f *fakeTunnelHandle) Registry() *registry.Registry {
-	if f.reg != nil {
-		return f.reg
-	}
-	return registry.New()
-}
-func (f *fakeTunnelHandle) Stats() wsmixer.Stats { return wsmixer.Stats{} }
+func (f *fakeTunnelHandle) Registry() *registry.Registry { return registry.New() }
+func (f *fakeTunnelHandle) Stats() wsmixer.Stats         { return wsmixer.Stats{} }
 
 // TestControllerDisableEnableReachTunnel is S-6: Controller.Disable/Enable
 // (the `d`/`e` keybindings' backing logic) must reach both the local
@@ -723,7 +713,7 @@ func TestNewTUIRenderer_SetsAndRestoresLogWriter(t *testing.T) {
 // supervisor's current GetState() rather than an empty string, and before
 // the tunnel's first "registered" reply an http row must be pending, never
 // "active" (the QUOTA_EXCEEDED-shown-as-active bug) — with both rows'
-// Registration pending too.
+// Registration pending too, and no SnapshotMsg channel beside them.
 func TestNewTUIRenderer_SeedsInitialState(t *testing.T) {
 	t.Cleanup(bridge.KillAllLiveChildren)
 
@@ -751,8 +741,10 @@ func TestNewTUIRenderer_SeedsInitialState(t *testing.T) {
 	origTUIRun := tuiRunFunc
 	t.Cleanup(func() { tuiRunFunc = origTUIRun })
 	var gotServers []tui.Server
-	tuiRunFunc = func(ctx context.Context, _ *eventbus.Bus, servers []tui.Server, _ tui.Controller, _ <-chan tui.SnapshotMsg) (bool, error) {
+	gotUpdates := make(<-chan tui.SnapshotMsg)
+	tuiRunFunc = func(ctx context.Context, _ *eventbus.Bus, servers []tui.Server, _ tui.Controller, updates <-chan tui.SnapshotMsg) (bool, error) {
 		gotServers = servers
+		gotUpdates = updates
 		return false, nil
 	}
 
@@ -783,146 +775,63 @@ func TestNewTUIRenderer_SeedsInitialState(t *testing.T) {
 	if got := byName["notes"]; got != tui.RegistrationPending {
 		t.Fatalf("http row State = %q, want %q", got, tui.RegistrationPending)
 	}
+	if gotUpdates != nil {
+		t.Fatal("newTUIRenderer handed the TUI a SnapshotMsg channel; rows come only from the tunnel's ServiceChanged events")
+	}
 }
 
-// TestPollTunnelForTUISetsHTTPStateOnly is the poll-side half of the
-// STATE-column fix: an active http row reports registry.StatusActive, a
-// disabled one reports registry.StatusDisabled, and a stdio row's State
-// stays empty (its state is owned by eventbus.ServerStateChanged, and
-// applySnapshot leaves an empty State untouched).
-func TestPollTunnelForTUISetsHTTPStateOnly(t *testing.T) {
-	reg := registry.New()
-	reg.ApplyRegistered([]appproto.RegisteredService{
-		{Name: "active-http", ID: "id1", URL: "https://a.example/mcp"},
-		{Name: "disabled-http", ID: "id2", URL: "https://d.example/mcp"},
-		{Name: "the-stdio", ID: "id3", URL: "https://s.example/mcp"},
-	}, map[string]string{"active-http": "http", "disabled-http": "http", "the-stdio": "stdio"})
-	reg.ApplyDisable("id2", "test")
-
+// TestPollTunnelForTUIPublishesBytesOnly: the TUI poll publishes the
+// bytes_total metric and nothing on Control — rows reach the TUI only as the
+// tunnel's ServiceChanged events (tui.SnapshotMsg's doc).
+func TestPollTunnelForTUIPublishesBytesOnly(t *testing.T) {
+	bus := eventbus.New(1)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	updates := make(chan tui.SnapshotMsg, 1)
-	go pollTunnelForTUI(ctx, &fakeTunnelHandle{reg: reg}, eventbus.New(1), updates, time.Millisecond)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		pollTunnelForTUI(ctx, &fakeTunnelHandle{}, bus, time.Millisecond)
+	}()
 
-	var snap tui.SnapshotMsg
 	select {
-	case snap = <-updates:
+	case m := <-bus.Metrics:
+		if m.Kind != "bytes_total" {
+			t.Fatalf("metric = %+v, want bytes_total", m)
+		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for a SnapshotMsg")
+		t.Fatal("timed out waiting for a bytes_total metric")
 	}
 	cancel()
-
-	byName := make(map[string]string, len(snap.Servers))
-	urlByName := make(map[string]string, len(snap.Servers))
-	for _, s := range snap.Servers {
-		byName[s.Name] = s.State
-		urlByName[s.Name] = s.URL
-	}
-	if got := byName["active-http"]; got != string(registry.StatusActive) {
-		t.Fatalf("active-http State = %q, want %q", got, registry.StatusActive)
-	}
-	if got := byName["disabled-http"]; got != string(registry.StatusDisabled) {
-		t.Fatalf("disabled-http State = %q, want %q", got, registry.StatusDisabled)
-	}
-	if got, ok := byName["the-stdio"]; !ok || got != "" {
-		t.Fatalf("the-stdio State = %q, want empty", got)
-	}
-	// Rows() returns a bare URL; the TUI shows disabled via STATE.
-	if got := urlByName["disabled-http"]; got != "https://d.example/mcp" {
-		t.Fatalf("disabled-http URL = %q, want bare URL", got)
+	<-done
+	select {
+	case evt := <-bus.Control:
+		t.Fatalf("the poll published %#v on Control", evt)
+	default:
 	}
 }
 
-// TestPollTunnelForTUIRejectedThenActive is the QUOTA_EXCEEDED-shown-as-
-// active fix, poll side: an http service the "registered" reply rejected
-// must reach the TUI as rejected with no URL (not left at a seeded
-// "active"); a stdio service's rejection rides on Registration only, its
-// State still owned by the supervisor; SERVER_DISABLED reads as disabled; a
-// name rejected on re-register loses its stale URL; and a later successful
-// registration flips the http row to active with its URL.
-func TestPollTunnelForTUIRejectedThenActive(t *testing.T) {
-	kinds := map[string]string{"deepwiki": "http", "conflicted": "http", "paused": "http", "fs": "stdio"}
-	reg := registry.New()
-	reg.ApplyRegistered([]appproto.RegisteredService{
-		{Name: "conflicted", ID: "id-c", URL: "https://c.example/mcp"},
-	}, kinds)
-	reg.ApplyRegisterErrors([]appproto.ServiceError{
-		{Name: "deepwiki", Code: "QUOTA_EXCEEDED"},
-		{Name: "conflicted", Code: "CONFLICT"},
-		{Name: "paused", Code: "SERVER_DISABLED"},
-		{Name: "fs", Code: "QUOTA_EXCEEDED"},
-	}, kinds)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	updates := make(chan tui.SnapshotMsg, 1)
-	go pollTunnelForTUI(ctx, &fakeTunnelHandle{reg: reg}, eventbus.New(1), updates, time.Millisecond)
-
-	next := func(until func(map[string]tui.Server) bool) map[string]tui.Server {
-		t.Helper()
-		deadline := time.After(2 * time.Second)
-		for {
-			select {
-			case snap := <-updates:
-				byName := make(map[string]tui.Server, len(snap.Servers))
-				for _, s := range snap.Servers {
-					byName[s.Name] = s
-				}
-				if until(byName) {
-					return byName
-				}
-			case <-deadline:
-				t.Fatal("timed out waiting for the expected SnapshotMsg")
-			}
-		}
-	}
-
-	byName := next(func(map[string]tui.Server) bool { return true })
-	if got := byName["deepwiki"]; got.State != tui.RegistrationRejected || got.Registration != tui.RegistrationRejected || got.URL != "" || got.Kind != "http" {
-		t.Fatalf("deepwiki = %+v, want an http row rejected with no URL", got)
-	}
-	if got := byName["conflicted"]; got.State != tui.RegistrationRejected || got.URL != "" {
-		t.Fatalf("conflicted = %+v, want rejected with its stale URL dropped", got)
-	}
-	if got := byName["paused"]; got.State != tui.RegistrationDisabled {
-		t.Fatalf("paused = %+v, want SERVER_DISABLED shown as disabled", got)
-	}
-	if got := byName["fs"]; got.State != "" || got.Registration != tui.RegistrationRejected {
-		t.Fatalf("fs = %+v, want empty State (supervisor-owned) and Registration rejected", got)
-	}
-
-	reg.ApplyRegistered([]appproto.RegisteredService{
-		{Name: "deepwiki", ID: "id-dw", URL: "https://dw.example/mcp"},
-	}, kinds)
-	byName = next(func(m map[string]tui.Server) bool { return m["deepwiki"].State == tui.RegistrationActive })
-	if got := byName["deepwiki"]; got.Registration != tui.RegistrationActive || got.URL != "https://dw.example/mcp" {
-		t.Fatalf("deepwiki after a successful register = %+v, want active with its URL", got)
-	}
-}
-
-// TestRegistrationOfPrecedence pins registrationOf's newest-fact-first
-// order, covering the three `d`-on-a-not-active-row cases (rejected and
-// never registered, rejected after an earlier success, pending with a late
-// reply) and the `e` that follows.
-func TestRegistrationOfPrecedence(t *testing.T) {
+// TestLazyRespawnRefusal pins which registry rows refuse a lazy respawn:
+// a local `d` (whatever else the row says), a dashboard disable or
+// SERVER_DISABLED, and a take-over; anything else — active, pending, an
+// enable whose reply is still out, any other rejection — lets it go ahead.
+func TestLazyRespawnRefusal(t *testing.T) {
 	cases := []struct {
-		name string
-		row  registry.Row
-		want string
+		name   string
+		row    registry.Row
+		refuse bool
 	}{
-		{"active", registry.Row{}, tui.RegistrationActive},
-		{"dashboard disable", registry.Row{Disabled: true}, tui.RegistrationDisabled},
-		{"rejected", registry.Row{Rejected: "QUOTA_EXCEEDED"}, tui.RegistrationRejected},
-		{"SERVER_DISABLED", registry.Row{Rejected: "SERVER_DISABLED"}, tui.RegistrationDisabled},
-		{"rejected after d then e", registry.Row{Disabled: true, Rejected: "CONFLICT"}, tui.RegistrationRejected},
-		{"d on a never-registered name", registry.Row{LocallyDisabled: true, Disabled: true}, tui.RegistrationDisabled},
-		{"d, late reply landed", registry.Row{LocallyDisabled: true, Disabled: true, URL: "https://n.example/mcp"}, tui.RegistrationDisabled},
-		{"d over a leftover rejection", registry.Row{LocallyDisabled: true, Disabled: true, Rejected: "CONFLICT"}, tui.RegistrationDisabled},
-		{"e awaiting its reply", registry.Row{Reregistering: true, Disabled: true}, tui.RegistrationPending},
+		{"active", registry.Row{URL: "https://n.example/mcp"}, false},
+		{"pending", registry.Row{Reregistering: true}, false},
+		{"rejected", registry.Row{Rejected: "QUOTA_EXCEEDED"}, false},
+		{"dashboard disable", registry.Row{Disabled: true}, true},
+		{"SERVER_DISABLED", registry.Row{Rejected: "SERVER_DISABLED"}, true},
+		{"taken over", registry.Row{Rejected: "TAKEN_OVER"}, true},
+		{"d on a never-registered name", registry.Row{LocallyDisabled: true, Disabled: true}, true},
+		{"d over a pending e", registry.Row{LocallyDisabled: true, Disabled: true, Reregistering: true}, true},
 	}
 	for _, tc := range cases {
-		if got := registrationOf(tc.row); got != tc.want {
-			t.Errorf("%s: registrationOf(%+v) = %q, want %q", tc.name, tc.row, got, tc.want)
+		if got := lazyRespawnRefusal(tc.row); (got != "") != tc.refuse {
+			t.Errorf("%s: lazyRespawnRefusal(%+v) = %q, want refused=%v", tc.name, tc.row, got, tc.refuse)
 		}
 	}
 }

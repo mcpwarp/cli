@@ -71,14 +71,6 @@ func (f *Forwarder) Close() {
 	f.transport.CloseIdleConnections()
 }
 
-// PathOptions carries the registry entry's public URL pathname for this
-// service — when the inbound request's path equals this, target's own
-// pathname is forwarded instead of the inbound one (DESIGN.md §3's "merging
-// the inbound query onto the target's query").
-type PathOptions struct {
-	PublicPathname string
-}
-
 // mergeQueries merges inbound onto base, inbound values winning on a key
 // conflict — ports undici-forwarder.ts's mergeQueries.
 func mergeQueries(base, inbound string) string {
@@ -119,20 +111,13 @@ func stripHopByHop(h http.Header) http.Header {
 	return out
 }
 
-// Forward sends req to target over a pooled connection, honoring
-// PathOptions the way undici-forwarder.ts does: the inbound path is
-// forwarded verbatim unless it equals the service's public pathname, in
-// which case target's own pathname is used and the queries are merged.
-func (f *Forwarder) Forward(ctx context.Context, req *http.Request, target *url.URL, opts *PathOptions) (*http.Response, error) {
+// Forward sends req to target over a pooled connection. RelayStream only
+// forwards the public /mcp path (MCPWARP.md §4.3), so target's own pathname
+// always replaces it and the inbound query is merged onto target's, as
+// undici-forwarder.ts does for the public pathname.
+func (f *Forwarder) Forward(ctx context.Context, req *http.Request, target *url.URL) (*http.Response, error) {
 	outURL := *target
-	isPublicPath := opts != nil && req.URL.Path == opts.PublicPathname
-	if isPublicPath {
-		outURL.Path = target.Path
-		outURL.RawQuery = mergeQueries(target.RawQuery, req.URL.RawQuery)
-	} else {
-		outURL.Path = req.URL.Path
-		outURL.RawQuery = req.URL.RawQuery
-	}
+	outURL.RawQuery = mergeQueries(target.RawQuery, req.URL.RawQuery)
 
 	var body = req.Body
 	if req.Method == http.MethodGet || req.Method == http.MethodHead {

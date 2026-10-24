@@ -337,7 +337,15 @@ func (s *Supervisor) Enable() {
 // ctx only bounds the wait: a spawn EnsureRunning started keeps going after
 // ctx is done, and the child still comes up Healthy (or crashes into the
 // usual backoff) for the next request.
-func (s *Supervisor) EnsureRunning(ctx context.Context) error {
+//
+// allow, if non-nil, is the caller's last word on a spawn from Disabled:
+// it runs under s.mu right before the move to Restarting, and an error
+// from it is returned as the refusal, nothing spawned. A caller that marks
+// its own state before calling Disable() (`up`'s registry, for a local `d`
+// or a dashboard disable) is therefore always seen by it, since Disabled
+// is only set after that mark. allow must not block or call back into the
+// Supervisor.
+func (s *Supervisor) EnsureRunning(ctx context.Context, allow func() error) error {
 	s.mu.Lock()
 	var wait chan struct{}
 	spawn := false
@@ -349,6 +357,12 @@ func (s *Supervisor) EnsureRunning(ctx context.Context) error {
 		if s.terminating != nil {
 			s.mu.Unlock()
 			return fmt.Errorf("%s: %w", s.name, ErrDisabled)
+		}
+		if allow != nil {
+			if err := allow(); err != nil {
+				s.mu.Unlock()
+				return err
+			}
 		}
 		wait = s.beginEnableLocked()
 		spawn = true

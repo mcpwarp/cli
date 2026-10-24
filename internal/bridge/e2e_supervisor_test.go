@@ -116,7 +116,7 @@ func TestBridgeSupervisor_EnsureRunningLazilyRespawnsDisabledChild(t *testing.T)
 		SpawnSpec: spec,
 		Log:       log,
 		EnsureChild: func(ctx context.Context) error {
-			return sup.Load().EnsureRunning(ctx)
+			return sup.Load().EnsureRunning(ctx, nil)
 		},
 	})
 	if err != nil {

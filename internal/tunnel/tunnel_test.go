@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/mcpwarp/cli/internal/appproto"
+	"github.com/mcpwarp/cli/internal/auth"
 	"github.com/mcpwarp/cli/internal/eventbus"
 	"github.com/mcpwarp/cli/internal/fakeedge"
 	"github.com/mcpwarp/cli/internal/registry"
@@ -107,8 +109,12 @@ func TestRegisterOnConnect(t *testing.T) {
 	}
 }
 
+// TestUnregisterOnClose: the shutdown unregister goes out and Unregister
+// returns once its "unregistered" reply lands (ws-mixer-spec MCPWARP.md
+// §3.2 Unregister), not before: the edge holds the reply until the test
+// has seen Unregister still waiting.
 func TestUnregisterOnClose(t *testing.T) {
-	unregisterCh := make(chan struct{}, 1)
+	unregisterCh := make(chan *fakeedge.Conn, 1)
 	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
 			var wrapper struct {
@@ -126,7 +132,7 @@ func TestUnregisterOnClose(t *testing.T) {
 					})
 				case "unregister":
 					select {
-					case unregisterCh <- struct{}{}:
+					case unregisterCh <- c:
 					default:
 					}
 				}
@@ -134,11 +140,31 @@ func TestUnregisterOnClose(t *testing.T) {
 		})
 	})
 
+	// The connection states are recorded: this process's own shutdown must
+	// end with a "disconnected" carrying no Reason, then "closed".
+	bus := eventbus.New(64)
+	var statesMu sync.Mutex
+	var states []eventbus.ConnStateChanged
+	go func() {
+		for range bus.Telemetry {
+		}
+	}()
+	go func() {
+		for evt := range bus.Control {
+			if cs, ok := evt.(eventbus.ConnStateChanged); ok {
+				statesMu.Lock()
+				states = append(states, cs)
+				statesMu.Unlock()
+			}
+		}
+	}()
+	t.Cleanup(bus.Close)
+
 	tun, err := Start(context.Background(), Config{
 		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc", Kind: "http"}},
-		Bus:         newTestBus(t),
+		Bus:         bus,
 		Log:         slog.New(slog.DiscardHandler),
 		FatalExit:   func(int) {},
 	})
@@ -146,20 +172,65 @@ func TestUnregisterOnClose(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	if err := tun.Unregister(context.Background()); err != nil {
-		t.Fatalf("Unregister: %v", err)
-	}
+	// Once the register went out on this connection, so the unregister is
+	// owed (§3.2 Unregister: none when no register went out).
+	waitForRow(t, tun, "svc active", "svc", func(r registry.Row, ok bool) bool { return ok && r.URL != "" })
+	unregistered := make(chan error, 1)
+	go func() { unregistered <- tun.Unregister(context.Background()) }()
 
+	var c *fakeedge.Conn
 	select {
-	case <-unregisterCh:
+	case c = <-unregisterCh:
 	case <-time.After(2 * time.Second):
 		t.Fatal("server never received unregister")
+	}
+	select {
+	case err := <-unregistered:
+		t.Fatalf("Unregister returned %v before the unregister was answered", err)
+	default:
+	}
+	if err := c.Unregistered("svc"); err != nil {
+		t.Fatalf("Unregistered: %v", err)
+	}
+	select {
+	case err := <-unregistered:
+		if err != nil {
+			t.Fatalf("Unregister: %v", err)
+		}
+	case <-time.After(unregisterBudget):
+		t.Fatal("Unregister did not return once its unregister was answered")
 	}
 
 	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := tun.Close(closeCtx); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+
+	// Close publishes "closed" last, after its dispatcher has stopped; the
+	// client's own disconnect report lands before that, or is dropped by the
+	// stopped dispatcher when it comes later, so "disconnected" is optional
+	// here — but never with a Reason.
+	var got []eventbus.ConnStateChanged
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		statesMu.Lock()
+		got = append(got[:0], states...)
+		statesMu.Unlock()
+		if n := len(got); n > 0 && got[n-1].State == "closed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ConnStateChanged = %+v, want it to end with closed", got)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	want := []eventbus.ConnStateChanged{{State: "connected", Session: got[0].Session}, {State: "disconnected"}, {State: "closed"}}
+	if len(got) == 2 {
+		want = []eventbus.ConnStateChanged{want[0], want[2]}
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ConnStateChanged = %+v, want %+v (no Reason on our own shutdown)", got, want)
 	}
 }
 
@@ -311,10 +382,10 @@ func TestUnsupportedVersionIsFatal(t *testing.T) {
 }
 
 // TestRegisteredZeroSuccessesFirstConnectQuotaExceededIsFatal covers
-// blocker B3: a "registered" reply with zero services and a non-
+// blocker B3: a "registered" reply refusing the only service with a non-
 // SERVER_DISABLED error, on a connection that has never registered
-// anything successfully, must exit — Node client.ts's
-// "!sawFirstRegistered" fatal path.
+// anything successfully, must exit — checkFatal's G5 (Node client.ts's
+// "!sawFirstRegistered" fatal path).
 func TestRegisteredZeroSuccessesFirstConnectQuotaExceededIsFatal(t *testing.T) {
 	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
@@ -360,8 +431,8 @@ func TestRegisteredZeroSuccessesFirstConnectQuotaExceededIsFatal(t *testing.T) {
 }
 
 // TestRegisteredZeroSuccessesFirstConnectInvalidNameIsFatal pins that
-// INVALID_NAME is not folded into the anyServerDisabled loop alongside
-// SERVER_DISABLED: a "registered" reply with zero services and only an
+// INVALID_NAME is a refusal, not treated like SERVER_DISABLED: a
+// "registered" reply with zero services and only an
 // INVALID_NAME error, on a connection that has never registered anything
 // successfully, must still exit — same fatal path as
 // TestRegisteredZeroSuccessesFirstConnectQuotaExceededIsFatal above.
@@ -431,9 +502,9 @@ func TestRegisteredAllServerDisabledIsNotFatal(t *testing.T) {
 
 	// Bus.Control is read directly below (not drained in the background by
 	// newTestBus) so the test can wait for the deterministic signal that
-	// handleApp has actually finished processing the reply — the
-	// SERVER_DISABLED error's own AppError publish — rather than a fixed
-	// sleep and a hope that it was long enough.
+	// handleApp has actually finished processing the reply — svc's
+	// ServiceChanged to disabled — rather than a fixed sleep and a hope that
+	// it was long enough.
 	bus := eventbus.New(64)
 	go func() {
 		for range bus.Telemetry {
@@ -460,14 +531,19 @@ func TestRegisteredAllServerDisabledIsNotFatal(t *testing.T) {
 	for {
 		select {
 		case evt := <-bus.Control:
-			if ae, ok := evt.(eventbus.AppError); ok && ae.Code == "SERVER_DISABLED" {
-				if ae.Hint == "" {
-					t.Fatal("expected a non-empty Hint on the SERVER_DISABLED AppError event")
+			if sc, ok := evt.(eventbus.ServiceChanged); ok && sc.State == "disabled" {
+				want := eventbus.ServiceChanged{Name: "svc", Kind: "http", State: "disabled", Code: "DISABLED",
+					Message: "disabled in dashboard", Hint: registerErrorHint("SERVER_DISABLED", "")}
+				if sc != want || sc.Hint == "" {
+					t.Fatalf("ServiceChanged = %+v, want %+v", sc, want)
 				}
 				goto processed
 			}
+			if ae, ok := evt.(eventbus.AppError); ok {
+				t.Fatalf("unexpected AppError %+v for a per-service register error", ae)
+			}
 		case <-deadline:
-			t.Fatal("expected an AppError for the SERVER_DISABLED registered error, got none")
+			t.Fatal("expected a ServiceChanged to disabled for the SERVER_DISABLED registered error, got none")
 		}
 	}
 processed:
@@ -634,10 +710,11 @@ func TestRegisteredFirstReplyAllRefusedIsFatal(t *testing.T) {
 
 // TestRegisteredInvalidNameAndUsernameRequiredHints covers the two per-
 // service codes for the name-as-URL-slug rollout: INVALID_NAME and
-// USERNAME_REQUIRED. Paired with a successful "good" service so
-// zeroSuccesses is false, neither is fatal — this asserts the connection
-// stays up and each error's AppError event is published with its code,
-// mirroring TestRegisteredAllServerDisabledIsNotFatal's approach.
+// USERNAME_REQUIRED. Paired with a successful "good" service, neither is
+// fatal — this asserts the connection stays up and each error's
+// ServiceChanged event is published with its code (and no AppError),
+// mirroring TestRegisteredAllServerDisabledIsNotFatal's approach; a
+// transient INTERNAL leaves its name pending with the code.
 func TestRegisteredInvalidNameAndUsernameRequiredHints(t *testing.T) {
 	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
@@ -671,38 +748,44 @@ func TestRegisteredInvalidNameAndUsernameRequiredHints(t *testing.T) {
 	tun, err := Start(context.Background(), Config{
 		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
-		Services:    []appproto.RegisterService{{Name: "good", Kind: "http"}},
-		Bus:         bus,
-		Log:         slog.New(slog.DiscardHandler),
-		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+		Services: []appproto.RegisterService{
+			{Name: "good", Kind: "http"}, {Name: "bad-name", Kind: "http"},
+			{Name: "no-username", Kind: "http"}, {Name: "oops", Kind: "http"},
+		},
+		Bus:       bus,
+		Log:       slog.New(slog.DiscardHandler),
+		FatalExit: func(code int) { exitCode.Store(int32(code)) },
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	defer tun.Close(context.Background())
 
-	seen := map[string]bool{}
-	hints := map[string]string{}
+	seen := map[string]eventbus.ServiceChanged{}
 	deadline := time.After(2 * time.Second)
-	for len(seen) < 3 {
+	for len(seen) < 4 {
 		select {
 		case evt := <-bus.Control:
-			if ae, ok := evt.(eventbus.AppError); ok {
-				seen[ae.Code] = true
-				hints[ae.Code] = ae.Hint
+			switch e := evt.(type) {
+			case eventbus.ServiceChanged:
+				seen[e.Name] = e
+			case eventbus.AppError:
+				t.Fatalf("unexpected AppError %+v for a per-service register error", e)
 			}
 		case <-deadline:
-			t.Fatalf("expected AppError events for INVALID_NAME, USERNAME_REQUIRED and INTERNAL, got %v", seen)
+			t.Fatalf("expected a ServiceChanged for each of the four services, got %+v", seen)
 		}
 	}
-	if !seen["INVALID_NAME"] || !seen["USERNAME_REQUIRED"] || !seen["INTERNAL"] {
-		t.Fatalf("expected INVALID_NAME, USERNAME_REQUIRED and INTERNAL AppError events, got %v", seen)
+	if e := seen["good"]; e.State != "active" || e.URL != "https://good.example/mcp" || e.Code != "" {
+		t.Fatalf("good = %+v, want active with its URL", e)
 	}
-	if hints["INVALID_NAME"] == "" || hints["USERNAME_REQUIRED"] == "" {
-		t.Fatalf("expected non-empty hints for INVALID_NAME and USERNAME_REQUIRED, got %v", hints)
+	for name, code := range map[string]string{"bad-name": "INVALID_NAME", "no-username": "USERNAME_REQUIRED"} {
+		if e := seen[name]; e.State != "rejected" || e.Code != code || e.Message == "" || e.Hint == "" {
+			t.Fatalf("%s = %+v, want rejected %s with the edge's message and a hint", name, e, code)
+		}
 	}
-	if hints["INTERNAL"] != "" {
-		t.Fatalf("expected no hint for INTERNAL, got %q", hints["INTERNAL"])
+	if e := seen["oops"]; e.State != "pending" || e.Code != "INTERNAL" || e.Message != "unexpected error" || e.Hint != "" {
+		t.Fatalf("oops = %+v, want pending with the transient INTERNAL code and no hint", e)
 	}
 	if got := exitCode.Load(); got != -1 {
 		t.Fatalf("expected no FatalExit alongside a successful registration, got exit code %d", got)
@@ -736,6 +819,10 @@ func TestRegisteredQuotaExceededRecordedThenClearedByReRegister(t *testing.T) {
 				Mcpwarp struct{ Op string } `json:"mcpwarp"`
 			}
 			_ = json.Unmarshal(raw, &wrapper)
+			if wrapper.Mcpwarp.Op == "unregister" {
+				_ = c.Unregistered(fakeedge.ParseFrame(raw).Names...)
+				return
+			}
 			if wrapper.Mcpwarp.Op != "register" {
 				return
 			}
@@ -824,10 +911,10 @@ func TestRegisteredQuotaExceededRecordedThenClearedByReRegister(t *testing.T) {
 
 // TestReconnectAllServicesRejectedIsNotFatal: after a first successful
 // registration, a reconnect whose "registered" reply rejects every service
-// (handleApp's zeroSuccesses-after-sawFirstRegistered early return) must
-// still record each rejection — that return comes after
-// ApplyRegisterErrors — and must not exit. The old entries keep their URL
-// in the registry; cli.pollTunnelForTUI drops it for a rejected row.
+// must still record each rejection and must not exit (checkFatal skips
+// once sawFirstRegistered is set). The old entries keep their URL in the
+// registry; the rejected ServiceChanged carries none, so the dashboard
+// drops it.
 func TestReconnectAllServicesRejectedIsNotFatal(t *testing.T) {
 	var conns atomic.Int32
 	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
@@ -1077,6 +1164,41 @@ func TestUnauthorizedCloseIsFatalWithSessionExpiredMessage(t *testing.T) {
 	}
 }
 
+// TestDisconnectReasonText pins the short ConnStateChanged Reason for each
+// kind of disconnect.
+func TestDisconnectReasonText(t *testing.T) {
+	cases := []struct {
+		name string
+		r    wsmixer.DisconnectReason
+		want string
+	}{
+		{"not logged in", wsmixer.DisconnectReason{Fatal: true, Cause: &auth.NotLoggedInError{}}, "not logged in"},
+		{"session expired cause", wsmixer.DisconnectReason{Fatal: true, Cause: &auth.SessionExpiredError{}}, "session expired"},
+		{"401", wsmixer.DisconnectReason{Fatal: true, HTTPStatus: 401}, "session expired"},
+		{"4011", wsmixer.DisconnectReason{Fatal: true, WSCode: unauthorizedWSCode}, "session expired"},
+		{"404", wsmixer.DisconnectReason{Fatal: true, HTTPStatus: 404}, "tunnel URL not found"},
+		{"other fatal", wsmixer.DisconnectReason{Fatal: true, Message: "boom"}, "connection failed"},
+		{"connection limit close", wsmixer.DisconnectReason{WSCode: connectionLimitWSCode, HasErrorCode: true, ErrorName: "APPLICATION_CLOSE",
+			CloseReason: "CONNECTION_LIMIT: too many agent connections (limit 10)"}, "connection limit"},
+		{"token refresh", wsmixer.DisconnectReason{Phase: wsmixer.PhaseDial, Cause: fmt.Errorf("%w: refresh", wsmixer.ErrTokenUnavailable)}, "token refresh failed"},
+		{"http status", wsmixer.DisconnectReason{Phase: wsmixer.PhaseDial, HTTPStatus: 503}, "HTTP 503"},
+		{"ws-mixer code", wsmixer.DisconnectReason{WSCode: wsmixer.InternalErrorCode.CloseCode(), HasErrorCode: true,
+			ErrorCode: wsmixer.InternalErrorCode, ErrorName: "INTERNAL_ERROR"}, "internal error"},
+		{"NO_ERROR", wsmixer.DisconnectReason{WSCode: 1000, HasErrorCode: true, ErrorCode: wsmixer.NoError, ErrorName: "NO_ERROR"}, "closed by the tunnel"},
+		{"bare 1000", wsmixer.DisconnectReason{WSCode: 1000}, "closed by the tunnel"},
+		{"bare 4014 without the prefix", wsmixer.DisconnectReason{WSCode: connectionLimitWSCode, HasErrorCode: true,
+			ErrorCode: wsmixer.ApplicationCloseCode, ErrorName: "APPLICATION_CLOSE", CloseReason: "something else"}, "application close"},
+		{"plain close", wsmixer.DisconnectReason{WSCode: 1001}, "closed by the tunnel"},
+		{"abnormal closure", wsmixer.DisconnectReason{WSCode: 1006}, "network error"},
+		{"no close frame", wsmixer.DisconnectReason{Phase: wsmixer.PhaseDial, Message: "dial tcp: refused"}, "network error"},
+	}
+	for _, tc := range cases {
+		if got := disconnectReasonText(tc.r); got != tc.want {
+			t.Errorf("%s: disconnectReasonText = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 // TestConnectionLimitCloseIsNonFatalWithHintAndReconnects covers onDisconnect's
 // CONNECTION_LIMIT branch: a 4014 (ws-mixer's application-level close, error
 // code 0x0e) close whose reason carries the connectionLimitPrefix must not be
@@ -1125,11 +1247,15 @@ func TestConnectionLimitCloseIsNonFatalWithHintAndReconnects(t *testing.T) {
 		"CONNECTION_LIMIT: too many agent connections for this account (limit 10)")
 
 	var appErr eventbus.AppError
+	var states []eventbus.ConnStateChanged
 	found := false
 	deadline = time.Now().Add(2 * time.Second)
 	for !found {
 		select {
 		case evt := <-bus.Control:
+			if cs, ok := evt.(eventbus.ConnStateChanged); ok {
+				states = append(states, cs)
+			}
 			if ae, ok := evt.(eventbus.AppError); ok && ae.Code == "CONNECTION_LIMIT" {
 				appErr = ae
 				found = true
@@ -1137,6 +1263,12 @@ func TestConnectionLimitCloseIsNonFatalWithHintAndReconnects(t *testing.T) {
 		case <-time.After(time.Until(deadline)):
 			t.Fatal("expected a CONNECTION_LIMIT AppError, got none")
 		}
+	}
+	// The TUI header shows a disconnect's Reason ("DISCONNECTED (connection
+	// limit)"); a connect carries none.
+	if len(states) != 2 || states[0].State != "connected" || states[0].Reason != "" ||
+		states[1].State != "disconnected" || states[1].Reason != "connection limit" {
+		t.Fatalf("ConnStateChanged before the AppError = %+v, want connected with no Reason, then disconnected (connection limit)", states)
 	}
 	if appErr.Hint == "" {
 		t.Fatal("expected a non-empty Hint on the CONNECTION_LIMIT AppError")
@@ -1446,12 +1578,14 @@ func TestOnStreamNeverBlocksOnApp(t *testing.T) {
 		})
 	})
 
-	// A custom bus, not newTestBus: Control's capacity (1) covers exactly
-	// the one legitimate dispatcher-goroutine publish this test produces
-	// before the assertion below (onConnect's ConnStateChanged{"connected"})
-	// and no more, and — unlike newTestBus — nothing drains it until
-	// openControl is closed at the very end of this test. Publish blocks
-	// until either a consumer reads or the bus closes, so if
+	// A custom bus, not newTestBus: Control's capacity (2) covers exactly
+	// the legitimate dispatcher-goroutine publishes this test produces
+	// before the disable below arrives (onConnect's
+	// ConnStateChanged{"connected"}, then svc's ServiceChanged active) and
+	// no more (the disable's own ServiceChanged blocks, but only once
+	// OnDisable has been launched), and — unlike newTestBus — nothing drains
+	// it until openControl is closed at the very end of this test. Publish
+	// blocks until either a consumer reads or the bus closes, so if
 	// StreamOpened/StreamClosed were ever regressed back onto this
 	// package's single dispatcher goroutine (instead of onStream's own
 	// per-stream goroutine, which is unaffected by Control being full),
@@ -1459,7 +1593,7 @@ func TestOnStreamNeverBlocksOnApp(t *testing.T) {
 	// dispatcher solid for the rest of the test — the disable below would
 	// then never arrive. newTestBus's always-on background drain would
 	// silently absorb that same bug, which is why it isn't used here.
-	bus := eventbus.New(1)
+	bus := eventbus.New(2)
 	openControl := make(chan struct{})
 	go func() {
 		<-openControl
@@ -1489,13 +1623,16 @@ func TestOnStreamNeverBlocksOnApp(t *testing.T) {
 	}
 	defer tun.Close(context.Background())
 
+	// Both buffered publishes (connected, then svc active, which follows
+	// the registry update) must be in before the stream opens, or the
+	// active one could land after a regressed StreamOpened.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, ok := tun.Registry().Get("svc"); ok {
+		if _, ok := tun.Registry().Get("svc"); ok && len(bus.Control) == 2 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("registry never populated")
+			t.Fatal("registry never populated, or svc's ServiceChanged never published")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -1832,13 +1969,14 @@ func TestLocalDisablePersistsAcrossReconnect(t *testing.T) {
 	var mu sync.Mutex
 	var batches [][]string
 
+	// The edge answers every frame: one register/unregister is outstanding
+	// at a time (ws-mixer-spec MCPWARP.md §2.6), so the `e` below waits for
+	// the reconnect's register to be answered.
 	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
-		c.OnApp(func(raw json.RawMessage) {
-			if names := fakeedge.RegisterNames(raw); names != nil {
-				mu.Lock()
-				batches = append(batches, names)
-				mu.Unlock()
-			}
+		c.ReplyRegisteredAll(func(names []string) {
+			mu.Lock()
+			batches = append(batches, names)
+			mu.Unlock()
 		})
 	})
 
@@ -1916,10 +2054,10 @@ func TestLocalDisablePersistsAcrossReconnect(t *testing.T) {
 		t.Fatalf("register batch after local disable = %v, want [svc-b]", got)
 	}
 
-	// A local `e` on svc-a: RegisterService itself immediately re-sends just
-	// svc-a over the still-live connection (sendRegisterFor, batch 3) before
-	// the forced reconnect below produces the batch this test actually
-	// wants to inspect (batch 4, once localUnregistered is empty again).
+	// A local `e` on svc-a: RegisterService itself re-sends just svc-a over
+	// the still-live connection (batch 3) before the forced reconnect below
+	// produces the batch this test actually wants to inspect (batch 4, once
+	// localUnregistered is empty again).
 	tun.RegisterService("svc-a")
 	waitForBatch(3)
 	_ = waitForConn(2).Close(uint32(wsmixer.InternalErrorCode), "forcing a second reconnect for test")
@@ -1932,7 +2070,7 @@ func TestLocalDisablePersistsAcrossReconnect(t *testing.T) {
 }
 
 // TestLocalDisableOfOnlyServiceSendsNoRegisterOnReconnect covers
-// currentRegisterBody's empty-subset case: with a single configured
+// currentRegisterNames' empty case: with a single configured
 // service, a local `d` followed by a forced reconnect must produce no
 // "register" op at all on the new connection — neither this CLI nor Node's
 // ever sends a register with an empty services list, and the fake tunnel
@@ -2097,9 +2235,9 @@ func TestServerDisablePersistsAcrossReconnect(t *testing.T) {
 
 // TestServerEnableClearsLocalDisable covers item 2: a dashboard-driven
 // OpEnable for a name the user had also locally `d`-disabled must clear
-// localUnregistered (handleApp's OpEnable now goes through RegisterService,
-// not sendRegisterFor directly), or the very next reconnect would silently
-// drop the service again despite the dashboard having just re-enabled it.
+// localUnregistered (handleApp's OpEnable goes through RegisterService), or
+// the very next reconnect would silently drop the service again despite the
+// dashboard having just re-enabled it.
 func TestServerEnableClearsLocalDisable(t *testing.T) {
 	var mu sync.Mutex
 	var batches [][]string
@@ -2108,6 +2246,9 @@ func TestServerEnableClearsLocalDisable(t *testing.T) {
 	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		conn.Store(c)
 		c.OnApp(func(raw json.RawMessage) {
+			if f := fakeedge.ParseFrame(raw); f.Op == "unregister" {
+				_ = c.Unregistered(f.Names...)
+			}
 			if names := fakeedge.RegisterNames(raw); names != nil {
 				mu.Lock()
 				batches = append(batches, names)
@@ -2178,9 +2319,10 @@ func TestServerEnableClearsLocalDisable(t *testing.T) {
 		"mcpwarp": map[string]any{"v": 1, "op": "enable", "id": "id1", "name": "svc"},
 	})
 
-	// The enable's own RegisterService call re-sends svc immediately over
-	// the still-live connection (batch 2) before the forced reconnect below
-	// produces the batch this test actually wants to inspect (batch 3).
+	// The enable's own RegisterService call re-sends svc over the still-live
+	// connection once the `d`'s unregister is answered (batch 2), before the
+	// forced reconnect below produces the batch this test actually wants to
+	// inspect (batch 3).
 	waitForBatch(2)
 	_ = c.Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
 
@@ -2198,33 +2340,37 @@ func TestServerEnableClearsLocalDisable(t *testing.T) {
 // as a genuinely dropped connection).
 func TestRegisterServiceWhileDisconnectedClearsLocalFlag(t *testing.T) {
 	services := []appproto.RegisterService{{Name: "svc", Kind: "http"}}
-	// Only the fields UnregisterService/RegisterService/currentRegisterBody
-	// touch: cfg (Services), log, registry, client (for Conn()), registerBody,
-	// localUnregistered. disp is deliberately left nil — nothing here goes
-	// through the dispatcher.
+	// Only the fields UnregisterService/RegisterService/currentRegisterNames
+	// touch: cfg (Services), log, registry, client (for Conn()), kindByName,
+	// localUnregistered, and disp/retrying/published for the dispatcher step
+	// that ends a retry series and publishes the new state (with no
+	// connection it queues no frame).
+	disp := newDispatcher()
+	t.Cleanup(disp.close)
 	tun := &Tunnel{
 		cfg:               Config{Services: services},
 		log:               slog.New(slog.DiscardHandler),
 		registry:          registry.New(),
 		client:            wsmixer.NewClient("ws://unused.invalid", wsmixer.StaticToken("t"), wsmixer.ClientConfig{}),
-		registerBody:      appproto.EncodeRegister(services),
+		disp:              disp,
+		kindByName:        map[string]string{"svc": "http"},
 		localUnregistered: make(map[string]bool),
+		retrying:          make(map[string]retryMark),
+		published:         make(map[string]eventbus.ServiceChanged),
 	}
 
 	if err := tun.UnregisterService("svc"); err != nil {
 		t.Fatalf("UnregisterService: %v", err)
 	}
-	if got := tun.currentRegisterBody(); got != nil {
-		t.Fatalf("register body after local disable = %v, want nil (svc was the only configured service)", got)
+	if got := tun.currentRegisterNames(); len(got) != 0 {
+		t.Fatalf("register names after local disable = %v, want none (svc was the only configured service)", got)
 	}
 
 	// `e` while still disconnected (tun.client.Conn() is nil — never dialed).
 	tun.RegisterService("svc")
 
-	got := tun.currentRegisterBody()
-	svcs := got["mcpwarp"].(map[string]any)["services"].([]map[string]any)
-	if len(svcs) != 1 || svcs[0]["name"] != "svc" {
-		t.Fatalf("register body after RegisterService while disconnected = %v, want [svc] restored", got)
+	if got := tun.currentRegisterNames(); len(got) != 1 || got[0] != "svc" {
+		t.Fatalf("register names after RegisterService while disconnected = %v, want [svc] restored", got)
 	}
 }
 
@@ -2481,7 +2627,7 @@ func waitForRow(t *testing.T, tun *Tunnel, what, name string, ok func(registry.R
 
 // TestConflictTakesOverOnlyThatName covers the tunnel's per-name "conflict"
 // op (mcpwarp-saas agentconn.go's sendConflict): only that name turns
-// rejected (CONFLICT) with the take-over hint while the other name keeps
+// taken_over (TAKEN_OVER) with the take-over hint while the other name keeps
 // serving, and a later successful "registered" for it (here `e`,
 // RegisterService) makes it active and routable again.
 func TestConflictTakesOverOnlyThatName(t *testing.T) {
@@ -2534,31 +2680,34 @@ func TestConflictTakesOverOnlyThatName(t *testing.T) {
 		"mcpwarp": map[string]any{"v": 1, "op": "conflict", "id": "id-svc-a", "name": "svc-a", "reason": "taken_over"},
 	})
 
-	var appErr eventbus.AppError
+	var takenOver eventbus.ServiceChanged
 	deadline := time.After(2 * time.Second)
-	for appErr.Code == "" {
+	for takenOver.State == "" {
 		select {
 		case evt := <-bus.Control:
-			if ae, ok := evt.(eventbus.AppError); ok {
-				appErr = ae
+			switch e := evt.(type) {
+			case eventbus.ServiceChanged:
+				if e.State == "taken_over" {
+					takenOver = e
+				}
+			case eventbus.AppError:
+				t.Fatalf("unexpected AppError %+v for a take-over", e)
 			}
 		case <-deadline:
-			t.Fatal("expected a CONFLICT AppError, got none")
+			t.Fatal("expected a ServiceChanged to taken_over, got none")
 		}
 	}
 	go func() {
 		for range bus.Control {
 		}
 	}()
-	if appErr.Code != "CONFLICT" || appErr.Service != "svc-a" || !strings.Contains(appErr.Message, "taken_over") {
-		t.Fatalf("AppError = %+v, want CONFLICT for svc-a carrying the reason", appErr)
-	}
-	if appErr.Hint != takenOverHint {
-		t.Fatalf("AppError hint = %q, want the take-over hint %q", appErr.Hint, takenOverHint)
+	want := eventbus.ServiceChanged{Name: "svc-a", Kind: "http", State: "taken_over", Code: "TAKEN_OVER", Message: "taken_over", Hint: takenOverHint}
+	if takenOver != want {
+		t.Fatalf("ServiceChanged = %+v, want %+v", takenOver, want)
 	}
 
-	waitForRow(t, tun, "svc-a rejected", "svc-a", func(r registry.Row, ok bool) bool {
-		return ok && r.Rejected == "CONFLICT"
+	waitForRow(t, tun, "svc-a taken over", "svc-a", func(r registry.Row, ok bool) bool {
+		return ok && r.Rejected == "TAKEN_OVER"
 	})
 	waitForRow(t, tun, "svc-b untouched", "svc-b", func(r registry.Row, ok bool) bool {
 		return ok && r.Rejected == "" && !r.Disabled
@@ -2613,8 +2762,8 @@ func TestConflictIDMismatchWarnsAndApplies(t *testing.T) {
 		"mcpwarp": map[string]any{"v": 1, "op": "conflict", "id": "id-other", "name": "svc", "reason": "taken_over"},
 	})
 
-	waitForRow(t, tun, "svc rejected despite the id mismatch", "svc", func(r registry.Row, ok bool) bool {
-		return ok && r.Rejected == "CONFLICT"
+	waitForRow(t, tun, "svc taken over despite the id mismatch", "svc", func(r registry.Row, ok bool) bool {
+		return ok && r.Rejected == "TAKEN_OVER"
 	})
 	rec, ok := logs.find("conflict id differs from this name's registered id; applying it by name")
 	if !ok {
@@ -2691,7 +2840,7 @@ func TestConflictIsStickyUntilLocalEnable(t *testing.T) {
 	_ = first.SendApp(context.Background(), map[string]any{
 		"mcpwarp": map[string]any{"v": 1, "op": "conflict", "id": "id-svc-a", "name": "svc-a", "reason": "taken_over"},
 	})
-	waitForRow(t, tun, "svc-a rejected", "svc-a", func(r registry.Row, ok bool) bool { return ok && r.Rejected == "CONFLICT" })
+	waitForRow(t, tun, "svc-a taken over", "svc-a", func(r registry.Row, ok bool) bool { return ok && r.Rejected == "TAKEN_OVER" })
 
 	_ = first.SendApp(context.Background(), map[string]any{
 		"mcpwarp": map[string]any{"v": 1, "op": "enable", "id": "id-svc-a", "name": "svc-a"},
@@ -2718,8 +2867,8 @@ func TestConflictIsStickyUntilLocalEnable(t *testing.T) {
 	if got := batchAt(1); len(got) != 1 || got[0] != "svc-b" {
 		t.Fatalf("register batch after the take-over = %v, want [svc-b]", got)
 	}
-	waitForRow(t, tun, "svc-a still rejected after the reconnect", "svc-a", func(r registry.Row, ok bool) bool {
-		return ok && r.Rejected == "CONFLICT"
+	waitForRow(t, tun, "svc-a still taken over after the reconnect", "svc-a", func(r registry.Row, ok bool) bool {
+		return ok && r.Rejected == "TAKEN_OVER"
 	})
 
 	tun.RegisterService("svc-a")
@@ -2732,15 +2881,16 @@ func TestConflictIsStickyUntilLocalEnable(t *testing.T) {
 	})
 }
 
-// TestConflictBeforeItsRegisteredReplyStands: a "conflict" can overtake the
-// "registered" reply naming that same success (the tunnel records the hold
-// before replying, and a concurrent take-over's frame can go first). The
-// late success must not flip the name back to active with a URL — on the
-// first batch, and on an `e` whose reply loses the same race — and the next
-// batch must still leave it out. A later `e` that isn't overtaken wins.
+// TestConflictBeforeItsRegisteredReplyStands: for a name this connection
+// holds, a "conflict" can overtake the "registered" reply to an `e`
+// re-registering it (the tunnel records the hold before replying, and a
+// concurrent take-over's frame can go first). The late success must not
+// flip the name back to active, and the next batch must still leave it
+// out. A later `e` that isn't overtaken wins. (A conflict for a name only
+// in an outstanding register, never held, is ignored instead:
+// TestFramesConflictOnlyForHeldNames.)
 func TestConflictBeforeItsRegisteredReplyStands(t *testing.T) {
 	var raceConflict atomic.Bool
-	raceConflict.Store(true)
 	var mu sync.Mutex
 	var batches [][]string
 	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
@@ -2820,34 +2970,35 @@ func TestConflictBeforeItsRegisteredReplyStands(t *testing.T) {
 	}
 	defer tun.Close(context.Background())
 
+	// The entry from the first batch's success stays for routing
+	// bookkeeping; the registry's TAKEN_OVER is what makes it read
+	// taken_over.
 	stillTakenOver := func(when string) {
 		t.Helper()
 		for _, r := range tun.Registry().Rows() {
-			if r.Name == "svc-a" && (r.Rejected != "CONFLICT" || r.URL != "" || r.Reregistering) {
-				t.Fatalf("svc-a %s = %+v, want rejected CONFLICT with no URL", when, r)
+			if r.Name == "svc-a" && (r.Rejected != "TAKEN_OVER" || r.Reregistering) {
+				t.Fatalf("svc-a %s = %+v, want rejected TAKEN_OVER", when, r)
 			}
-		}
-		if _, ok := tun.Registry().Get("svc-a"); ok {
-			t.Fatalf("svc-a %s got a routable entry from the overtaken success", when)
 		}
 	}
 
 	waitUntil("the first batch's reply", func() bool { return sentinels() >= 1 })
-	stillTakenOver("after the first batch")
-	waitForRow(t, tun, "svc-b active", "svc-b", func(r registry.Row, ok bool) bool { return ok && r.URL != "" })
+	waitForRow(t, tun, "svc-a held", "svc-a", func(r registry.Row, ok bool) bool { return ok && r.Rejected == "" && r.URL != "" })
 
-	_ = srv.Latest().Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
-	waitUntil("the reconnect's reply", func() bool { return batchCount() >= 2 && sentinels() >= 2 })
-	if got := batchAt(1); len(got) != 1 || got[0] != "svc-b" {
-		t.Fatalf("register batch after the take-over = %v, want [svc-b]", got)
-	}
-
+	raceConflict.Store(true)
 	tun.RegisterService("svc-a")
-	waitUntil("the overtaken e's reply", func() bool { return batchCount() >= 3 && sentinels() >= 3 })
-	if got := batchAt(2); len(got) != 1 || got[0] != "svc-a" {
+	waitUntil("the overtaken e's reply", func() bool { return batchCount() >= 2 && sentinels() >= 2 })
+	if got := batchAt(1); len(got) != 1 || got[0] != "svc-a" {
 		t.Fatalf("register batch after e = %v, want [svc-a]", got)
 	}
 	stillTakenOver("after an e whose reply was overtaken")
+
+	_ = srv.Latest().Close(uint32(wsmixer.InternalErrorCode), "forcing reconnect for test")
+	waitUntil("the reconnect's reply", func() bool { return batchCount() >= 3 && sentinels() >= 3 })
+	if got := batchAt(2); len(got) != 1 || got[0] != "svc-b" {
+		t.Fatalf("register batch after the take-over = %v, want [svc-b]", got)
+	}
+	stillTakenOver("after the reconnect")
 
 	raceConflict.Store(false)
 	tun.RegisterService("svc-a")
@@ -2860,23 +3011,28 @@ func TestConflictBeforeItsRegisteredReplyStands(t *testing.T) {
 }
 
 // TestConflictBeforeItsRegisterErrorStands is the error-side sibling of
-// TestConflictBeforeItsRegisteredReplyStands: a stale reply's error for a
-// taken-over name (here SERVER_DISABLED, which would read as "disabled",
-// resumable by a dashboard enable that OpEnable ignores for it) must not
-// replace its CONFLICT.
+// TestConflictBeforeItsRegisteredReplyStands: once the held svc-a is taken
+// over ahead of the reply to its `e`, that reply's error for it (here
+// SERVER_DISABLED, which would read as "disabled", resumable by a
+// dashboard enable that OpEnable ignores for it) must not replace its
+// TAKEN_OVER.
 func TestConflictBeforeItsRegisterErrorStands(t *testing.T) {
+	var registers atomic.Int32
 	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
-			if fakeedge.RegisterNames(raw) == nil {
+			names := fakeedge.RegisterNames(raw)
+			if names == nil {
+				return
+			}
+			if registers.Add(1) == 1 {
+				_ = c.Registered(fakeedge.Accepted(names...), nil)
 				return
 			}
 			_ = c.SendApp(context.Background(), map[string]any{
 				"mcpwarp": map[string]any{"v": 1, "op": "conflict", "id": "id-svc-a", "name": "svc-a", "reason": "taken_over"},
 			})
 			_ = c.SendApp(context.Background(), map[string]any{
-				"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []any{
-					map[string]any{"name": "svc-b", "id": "id-svc-b", "url": "https://svc-b.example/mcp", "created": false},
-				}, "errors": []map[string]any{
+				"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": []any{}, "errors": []map[string]any{
 					{"name": "svc-a", "code": "SERVER_DISABLED", "message": "server is disabled"},
 				}},
 			})
@@ -2902,6 +3058,8 @@ func TestConflictBeforeItsRegisterErrorStands(t *testing.T) {
 	}
 	defer tun.Close(context.Background())
 
+	waitForRow(t, tun, "svc-a held", "svc-a", func(r registry.Row, ok bool) bool { return ok && r.Rejected == "" && r.URL != "" })
+	tun.RegisterService("svc-a")
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, ok := logs.find("ignoring unrecognized mcpwarp app message"); ok {
@@ -2912,8 +3070,8 @@ func TestConflictBeforeItsRegisterErrorStands(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	waitForRow(t, tun, "svc-a still rejected CONFLICT", "svc-a", func(r registry.Row, ok bool) bool {
-		return ok && r.Rejected == "CONFLICT" && !r.Disabled && r.URL == ""
+	waitForRow(t, tun, "svc-a still rejected TAKEN_OVER", "svc-a", func(r registry.Row, ok bool) bool {
+		return ok && r.Rejected == "TAKEN_OVER" && !r.Disabled && !r.Reregistering
 	})
 	waitForRow(t, tun, "svc-b active", "svc-b", func(r registry.Row, ok bool) bool {
 		return ok && r.Rejected == "" && r.URL == "https://svc-b.example/mcp"
@@ -2926,8 +3084,10 @@ func TestConflictBeforeItsRegisterErrorStands(t *testing.T) {
 // TestTooManyServicesRejectsEveryPendingName: the tunnel refuses an
 // oversized register as a whole with an error op and no "registered" reply.
 // Every name that batch carried must read rejected with the code (not stay
-// pending forever), one AppError with the hint is published, and it isn't
-// fatal.
+// pending forever), each published as a ServiceChanged with the hint and no
+// AppError beside them. With that batch being every service and nothing
+// ever registered, every service is refused, so it is fatal (ws-mixer-spec
+// MCPWARP.md §6A.6 G5 after G7).
 func TestTooManyServicesRejectsEveryPendingName(t *testing.T) {
 	srv := fakeedge.Serve(t, func(c *fakeedge.Conn) {
 		c.OnApp(func(raw json.RawMessage) {
@@ -2955,15 +3115,14 @@ func TestTooManyServicesRejectsEveryPendingName(t *testing.T) {
 	t.Cleanup(bus.Close)
 
 	logs := &recordingHandler{}
-	var exitCode atomic.Int32
-	exitCode.Store(-1)
+	exits := make(chan int, 1)
 	tun, err := Start(context.Background(), Config{
 		URL:         srv.URL,
 		TokenSource: staticToken{token: "t"},
 		Services:    []appproto.RegisterService{{Name: "svc-a", Kind: "http"}, {Name: "svc-b", Kind: "stdio"}},
 		Bus:         bus,
 		Log:         slog.New(logs),
-		FatalExit:   func(code int) { exitCode.Store(int32(code)) },
+		FatalExit:   func(code int) { exits <- code },
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -2981,12 +3140,16 @@ func TestTooManyServicesRejectsEveryPendingName(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	var appErrs []eventbus.AppError
+	rejected := map[string]eventbus.ServiceChanged{}
 collect:
 	for {
 		select {
 		case evt := <-bus.Control:
-			if ae, ok := evt.(eventbus.AppError); ok {
-				appErrs = append(appErrs, ae)
+			switch e := evt.(type) {
+			case eventbus.AppError:
+				appErrs = append(appErrs, e)
+			case eventbus.ServiceChanged:
+				rejected[e.Name] = e
 			}
 		default:
 			break collect
@@ -2996,11 +3159,15 @@ collect:
 		for range bus.Control {
 		}
 	}()
-	if len(appErrs) != 1 {
-		t.Fatalf("expected exactly one AppError, got %d: %+v", len(appErrs), appErrs)
+	if len(appErrs) != 0 {
+		t.Fatalf("expected no AppError (the frame's names are reported per service), got %+v", appErrs)
 	}
-	if ae := appErrs[0]; ae.Code != "TOO_MANY_SERVICES" || ae.Service != "" || ae.Hint != tooManyServicesHint {
-		t.Fatalf("AppError = %+v, want TOO_MANY_SERVICES with no service and hint %q", ae, tooManyServicesHint)
+	for name, kind := range map[string]string{"svc-a": "http", "svc-b": "stdio"} {
+		want := eventbus.ServiceChanged{Name: name, Kind: kind, State: "rejected", Code: "TOO_MANY_SERVICES",
+			Message: "register carries 2 services, max 1 per message", Hint: tooManyServicesHint}
+		if got := rejected[name]; got != want {
+			t.Fatalf("%s ServiceChanged = %+v, want %+v", name, got, want)
+		}
 	}
 	for name, kind := range map[string]string{"svc-a": "http", "svc-b": "stdio"} {
 		waitForRow(t, tun, name+" rejected", name, func(r registry.Row, ok bool) bool {
@@ -3010,8 +3177,16 @@ collect:
 	if _, ok := logs.find(tooManyServicesHint); !ok {
 		t.Fatal("expected the hint to be logged")
 	}
-	if got := exitCode.Load(); got != -1 {
-		t.Fatalf("expected no FatalExit for TOO_MANY_SERVICES, got exit code %d", got)
+	if _, ok := logs.find("No service could be registered."); !ok {
+		t.Fatal("expected the G5 error to be logged")
+	}
+	select {
+	case got := <-exits:
+		if got != 1 {
+			t.Fatalf("expected exit code 1, got %d", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("FatalExit was never called once TOO_MANY_SERVICES refused every service")
 	}
 }
 

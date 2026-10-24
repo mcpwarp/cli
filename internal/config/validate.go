@@ -84,7 +84,7 @@ func validateConfig(raw []byte) (*Config, issueList) {
 	if len(rawServers) > MaxServers {
 		issues = append(issues, issue{
 			path:    "servers",
-			message: fmt.Sprintf("too many servers (%d): the tunnel accepts at most %d in one register message, which carries them all", len(rawServers), MaxServers),
+			message: fmt.Sprintf("config has %d servers; the limit is %d, remove some", len(rawServers), MaxServers),
 		})
 	}
 

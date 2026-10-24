@@ -8,11 +8,11 @@ const (
 	KindHTTP  = "http"
 )
 
-// MaxServers is the tunnel's cap on services per register message
-// (mcpwarp-saas agentconn.go's maxServicesPerRegister). The CLI registers
-// every configured server in one message on each welcome, and the tunnel
-// refuses a bigger one as a whole (TOO_MANY_SERVICES, nothing registered),
-// so a config over the cap is rejected here instead (DESIGN.md §6).
+// MaxServers caps a config at the tunnel's per-message cap on services
+// (mcpwarp-saas agentconn.go's maxServicesPerRegister). It is a config
+// limit, not a wire necessity: internal/tunnel registers in frames of at
+// most 100 names, one in flight (appproto.MaxServicesPerFrame), so a larger
+// list would still go out; the cap is kept at 100 by choice (DESIGN.md §6).
 const MaxServers = 100
 
 // Server is one entry of config.json's "servers" array.

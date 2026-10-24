@@ -501,19 +501,32 @@ func (c *Conn) Registered(services []Service, errs []RegisterError) error {
 	return c.SendOp("registered", map[string]any{"services": svcs, "errors": es})
 }
 
+// Unregistered replies "unregistered" listing each name at id "id-<name>",
+// as the tunnel answers every "unregister" (ws-mixer-spec MCPWARP.md §2.2).
+func (c *Conn) Unregistered(names ...string) error {
+	svcs := make([]map[string]any, len(names))
+	for i, n := range names {
+		svcs[i] = map[string]any{"name": n, "id": "id-" + n}
+	}
+	return c.SendOp("unregistered", map[string]any{"services": svcs})
+}
+
 // ReplyRegisteredAll binds a handler that answers every "register" with a
-// "registered" accepting each name it carried (see Accepted). seen, if
-// non-nil, gets each batch's names first.
+// "registered" accepting each name it carried (see Accepted), and every
+// "unregister" with its "unregistered". seen, if non-nil, gets each register
+// batch's names first.
 func (c *Conn) ReplyRegisteredAll(seen func(names []string)) {
 	c.OnApp(func(raw json.RawMessage) {
-		names := RegisterNames(raw)
-		if names == nil {
-			return
+		f := ParseFrame(raw)
+		switch f.Op {
+		case "register":
+			if seen != nil {
+				seen(f.Names)
+			}
+			_ = c.Registered(Accepted(f.Names...), nil)
+		case "unregister":
+			_ = c.Unregistered(f.Names...)
 		}
-		if seen != nil {
-			seen(names)
-		}
-		_ = c.Registered(Accepted(names...), nil)
 	})
 }
 

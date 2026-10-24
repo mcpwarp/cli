@@ -26,7 +26,7 @@ func TestForwardJSON(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/mcp", nil)
 	req.Host = "example.com"
-	resp, err := f.Forward(context.Background(), req, target, &PathOptions{PublicPathname: "/mcp"})
+	resp, err := f.Forward(context.Background(), req, target)
 	if err != nil {
 		t.Fatalf("forward: %v", err)
 	}
@@ -40,7 +40,7 @@ func TestForwardJSON(t *testing.T) {
 	}
 }
 
-func TestForwardMergesQueryOnPublicPath(t *testing.T) {
+func TestForwardMergesInboundQueryOntoTarget(t *testing.T) {
 	var gotQuery string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotQuery = r.URL.RawQuery
@@ -53,7 +53,7 @@ func TestForwardMergesQueryOnPublicPath(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/mcp?inbound=2", nil)
 	req.Host = "example.com"
-	resp, err := f.Forward(context.Background(), req, target, &PathOptions{PublicPathname: "/mcp"})
+	resp, err := f.Forward(context.Background(), req, target)
 	if err != nil {
 		t.Fatalf("forward: %v", err)
 	}
@@ -65,26 +65,29 @@ func TestForwardMergesQueryOnPublicPath(t *testing.T) {
 	}
 }
 
-func TestForwardNonPublicPathPassesThroughVerbatim(t *testing.T) {
+// TestForwardUsesTargetPath: the public /mcp is always replaced by the
+// target's own pathname, whatever it is (MCPWARP.md §4.3: only /mcp reaches
+// Forward).
+func TestForwardUsesTargetPath(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 	}))
 	defer srv.Close()
 
-	target, _ := url.Parse(srv.URL + "/mcp")
+	target, _ := url.Parse(srv.URL + "/api/v1/endpoint")
 	f := NewForwarder()
 	defer f.Close()
 
-	req, _ := http.NewRequest(http.MethodGet, "http://example.com/other/path", nil)
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/mcp", nil)
 	req.Host = "example.com"
-	resp, err := f.Forward(context.Background(), req, target, &PathOptions{PublicPathname: "/mcp"})
+	resp, err := f.Forward(context.Background(), req, target)
 	if err != nil {
 		t.Fatalf("forward: %v", err)
 	}
 	resp.Body.Close()
-	if gotPath != "/other/path" {
-		t.Fatalf("expected inbound path passthrough, got %q", gotPath)
+	if gotPath != "/api/v1/endpoint" {
+		t.Fatalf("expected the target's own path, got %q", gotPath)
 	}
 }
 
@@ -100,7 +103,7 @@ func TestForward429PassesThrough(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/mcp", nil)
 	req.Host = "example.com"
-	resp, err := f.Forward(context.Background(), req, target, nil)
+	resp, err := f.Forward(context.Background(), req, target)
 	if err != nil {
 		t.Fatalf("forward: %v", err)
 	}
@@ -147,7 +150,7 @@ func TestForwardUnreachable(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/mcp", nil)
 	req.Host = "example.com"
-	_, err := f.Forward(context.Background(), req, target, nil)
+	_, err := f.Forward(context.Background(), req, target)
 	if !errors.Is(err, ErrTargetUnreachable) {
 		t.Fatalf("expected ErrTargetUnreachable, got %v", err)
 	}

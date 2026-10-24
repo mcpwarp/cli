@@ -684,7 +684,7 @@ func TestSupervisor_EnsureRunning_DisabledStartsChildAndWaitsUntilHealthy(t *tes
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		errc <- s.EnsureRunning(ctx)
+		errc <- s.EnsureRunning(ctx, nil)
 	}()
 
 	waitEntered(t, g)
@@ -739,7 +739,7 @@ func TestSupervisor_EnsureRunning_ConcurrentCallersSpawnOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs <- s.EnsureRunning(ctx)
+			errs <- s.EnsureRunning(ctx, nil)
 		}()
 	}
 	wg.Add(1)
@@ -785,7 +785,7 @@ func TestSupervisor_EnsureRunning_HealthyReturnsImmediately(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := s.EnsureRunning(ctx); err != nil {
+	if err := s.EnsureRunning(ctx, nil); err != nil {
 		t.Fatalf("want nil for a healthy child, got %v", err)
 	}
 	if g.count() != 0 {
@@ -813,7 +813,7 @@ func TestSupervisor_EnsureRunning_DisableDuringWaitWins(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		errc <- s.EnsureRunning(ctx)
+		errc <- s.EnsureRunning(ctx, nil)
 	}()
 	waitEntered(t, g)
 
@@ -866,7 +866,7 @@ func TestSupervisor_EnsureRunning_DisableInFlightRefuses(t *testing.T) {
 	s.terminating = make(chan struct{}) // a Disable() mid-close
 	s.mu.Unlock()
 
-	if err := s.EnsureRunning(context.Background()); !errors.Is(err, ErrDisabled) {
+	if err := s.EnsureRunning(context.Background(), nil); !errors.Is(err, ErrDisabled) {
 		t.Fatalf("want ErrDisabled while a Disable is in flight, got %v", err)
 	}
 	if g.count() != 0 {
@@ -875,6 +875,39 @@ func TestSupervisor_EnsureRunning_DisableInFlightRefuses(t *testing.T) {
 	s.mu.Lock()
 	s.terminating = nil
 	s.mu.Unlock()
+}
+
+// TestSupervisor_EnsureRunning_AllowRefusesSpawn: from Disabled, an allow
+// that errs is the refusal — returned as is, nothing spawned, the state
+// left Disabled — and it is consulted only for a spawn: a Healthy
+// supervisor never calls it.
+func TestSupervisor_EnsureRunning_AllowRefusesSpawn(t *testing.T) {
+	child := spawnTestChild(t, 0, time.Hour)
+	fb := &fakeBridge{}
+	g := newGatedSpawn(t)
+	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: fb}, Deps{
+		Sleep: func(time.Duration) {},
+		Spawn: g.spawn,
+	})
+	t.Cleanup(func() { s.Stop() })
+
+	calls := 0
+	refused := errors.New("disabled locally")
+	allow := func() error { calls++; return refused }
+	if err := s.EnsureRunning(context.Background(), allow); err != nil || calls != 0 {
+		t.Fatalf("healthy: EnsureRunning = %v with allow called %d times, want nil and no call", err, calls)
+	}
+
+	s.Disable()
+	if err := s.EnsureRunning(context.Background(), allow); !errors.Is(err, refused) {
+		t.Fatalf("want allow's error from Disabled, got %v", err)
+	}
+	if calls != 1 || g.count() != 0 {
+		t.Fatalf("allow called %d times, %d spawns; want 1 call and no spawn", calls, g.count())
+	}
+	if got := s.GetState(); got != Disabled {
+		t.Fatalf("want still disabled, got %v", got)
+	}
 }
 
 // TestSupervisor_EnsureRunning_FailedRefusesWithoutSpawning: a supervisor
@@ -903,7 +936,7 @@ func TestSupervisor_EnsureRunning_FailedRefusesWithoutSpawning(t *testing.T) {
 	before := spawns
 	mu.Unlock()
 
-	if err := s.EnsureRunning(context.Background()); !errors.Is(err, ErrFailed) {
+	if err := s.EnsureRunning(context.Background(), nil); !errors.Is(err, ErrFailed) {
 		t.Fatalf("want ErrFailed, got %v", err)
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -962,7 +995,7 @@ func TestSupervisor_EnsureRunning_BackoffRefusesWithoutShortcutting(t *testing.T
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	if err := s.EnsureRunning(context.Background()); !errors.Is(err, ErrRestarting) {
+	if err := s.EnsureRunning(context.Background(), nil); !errors.Is(err, ErrRestarting) {
 		t.Fatalf("want ErrRestarting during backoff, got %v", err)
 	}
 	if got := s.GetState(); got != Restarting {
@@ -999,7 +1032,7 @@ func TestSupervisor_EnsureRunning_CtxBoundsWaitButSpawnCompletes(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if err := s.EnsureRunning(ctx); !errors.Is(err, context.DeadlineExceeded) {
+	if err := s.EnsureRunning(ctx, nil); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("want DeadlineExceeded, got %v", err)
 	}
 	waitEntered(t, g)
@@ -1036,7 +1069,7 @@ func TestSupervisor_EnsureRunning_SpawnFailureFromDisabledReportsBackoff(t *test
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		errc <- s.EnsureRunning(ctx)
+		errc <- s.EnsureRunning(ctx, nil)
 	}()
 	select {
 	case err := <-errc:
@@ -1078,7 +1111,7 @@ func TestSupervisor_EnsureRunning_JoinsInFlightRestart(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		errc <- s.EnsureRunning(ctx)
+		errc <- s.EnsureRunning(ctx, nil)
 	}()
 	select {
 	case err := <-errc:
@@ -1122,7 +1155,7 @@ func TestSupervisor_Restart_JoinsInFlightEnsureRunningSpawn(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		errc <- s.EnsureRunning(ctx)
+		errc <- s.EnsureRunning(ctx, nil)
 	}()
 	waitEntered(t, g)
 
@@ -1274,7 +1307,7 @@ func TestSupervisor_Restart_DuringDisableReturnsWithoutSpawning(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		errc <- s.EnsureRunning(ctx)
+		errc <- s.EnsureRunning(ctx, nil)
 	}()
 	waitEntered(t, g)
 
@@ -1407,7 +1440,7 @@ func TestSupervisor_EnsureRunning_StoppedRefuses(t *testing.T) {
 	child := spawnTestChild(t, 0, time.Hour)
 	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: &fakeBridge{}}, Deps{Sleep: func(time.Duration) {}})
 	s.Stop()
-	if err := s.EnsureRunning(context.Background()); !errors.Is(err, ErrStopped) {
+	if err := s.EnsureRunning(context.Background(), nil); !errors.Is(err, ErrStopped) {
 		t.Fatalf("want ErrStopped, got %v", err)
 	}
 }

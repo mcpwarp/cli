@@ -102,6 +102,9 @@ var (
 	// cancelCounts counts the notifications/cancelled received per requestId
 	// under an era mode (guarded by stateMu).
 	cancelCounts = map[any]int{}
+	// received lists, in the order they were read, the methods of every
+	// message handled under an era mode, minus debug/* (guarded by stateMu).
+	received []string
 	// cancelMetas holds the _meta of the last such notification that had one.
 	cancelMetas = map[any]any{}
 )
@@ -142,6 +145,11 @@ func hasVersion(v string) bool {
 // handleEra answers one parsed stdin message under the selected era mode.
 func handleEra(msg map[string]any, method string, id any, hasID bool) {
 	params, _ := msg["params"].(map[string]any)
+	if method != "" && !strings.HasPrefix(method, "debug/") {
+		stateMu.Lock()
+		received = append(received, method)
+		stateMu.Unlock()
+	}
 	if method == "notifications/cancelled" {
 		stateMu.Lock()
 		cancelledRequestIDs[params["requestId"]] = true
@@ -397,6 +405,8 @@ func discoverResult() map[string]any {
 //	                                                 order, then -> {released}
 //	debug/cancelCount      {requestId}               -> {count} notifications/cancelled
 //	                                                 received for it
+//	debug/received                                   -> {methods} every method read so
+//	                                                 far, in order, minus debug/*
 //	debug/cancelMeta       {requestId}               -> {hasMeta, meta} of the last
 //	                                                 cancel for it that carried _meta
 //	debug/listens                                    -> {ids} the subscriptions/listen
@@ -437,6 +447,14 @@ func handleEraDebug(method string, id any, params, meta map[string]any) {
 		n := cancelCounts[params["requestId"]]
 		stateMu.Unlock()
 		reply(id, map[string]any{"count": n})
+	case "debug/received":
+		stateMu.Lock()
+		methods := make([]any, len(received))
+		for i, m := range received {
+			methods[i] = m
+		}
+		stateMu.Unlock()
+		reply(id, map[string]any{"methods": methods})
 	case "debug/cancelMeta":
 		stateMu.Lock()
 		meta, has := cancelMetas[params["requestId"]]

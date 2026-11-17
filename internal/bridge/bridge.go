@@ -197,6 +197,7 @@ type StartBridgeOptions struct {
 // ResponseWriter after the handler returns.
 type pendingEntry struct {
 	originalID    any
+	child         *StdioChild   // the process the request was sent to; fixed at creation
 	progressToken any           // nil if the request carried none
 	version       any           // the protocol version the request carried, nil if none
 	discover      bool          // a client's server/discover, forwarded like any request
@@ -593,23 +594,25 @@ func (b *Bridge) isAbandoned(id int64) bool {
 
 // findInternalIDForOriginalID resolves a legacy client's own
 // notifications/cancelled requestId (in the client's id space) back to the
-// bridge-minted internal id. Picks the most recently issued match if more
-// than one pending request happens to share the original id. An initialize
-// is never matched: it cannot be cancelled.
-func (b *Bridge) findInternalIDForOriginalID(originalID any) (int64, bool) {
+// bridge-minted internal id, with the process that request was sent to. Picks
+// the most recently issued match if more than one pending request happens to
+// share the original id. An initialize is never matched: it cannot be
+// cancelled.
+func (b *Bridge) findInternalIDForOriginalID(originalID any) (int64, *StdioChild, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	found := int64(0)
+	var child *StdioChild
 	ok := false
 	for internalID, entry := range b.pending {
 		if entry.raw == nil && entry.originalID == originalID {
 			if !ok || internalID > found {
-				found = internalID
+				found, child = internalID, entry.child
 				ok = true
 			}
 		}
 	}
-	return found, ok
+	return found, child, ok
 }
 
 func (b *Bridge) handleChildResponse(id int64, msg map[string]any) {
@@ -1404,12 +1407,12 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 
 	// One lazy respawn here covers requests, notifications and
 	// subscriptions/listen alike. The child is snapshotted right after:
-	// requests and listens use that snapshot (admitModern may move it to a
-	// newer one), while notifications and client responses read
-	// currentChild() again. A bare client response (!hasMethod) is
-	// left out: it answers the dead child's own request, which a fresh
-	// child never issued, so respawning for it would only resurrect a
-	// disabled service on a stray late reply.
+	// requests, listens and modern-shaped notifications use that snapshot
+	// (admitModern may move it to a newer one), while 2025-shaped
+	// notifications and client responses read currentChild() again. A bare
+	// client response (!hasMethod) is left out: it answers the dead child's
+	// own request, which a fresh child never issued, so respawning for it
+	// would only resurrect a disabled service on a stray late reply.
 	if hasMethod {
 		b.ensureLiveChild(r.Context())
 	}
@@ -1423,37 +1426,55 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	if !modernShaped && (hasMethod || hasID) && !child.HasExited() && b.refuseLegacyRequest(w, parsed, st) {
 		return
 	}
-	if modernShaped && hasID {
+	// notifications/initialized means nothing in the 2026 protocol, and the
+	// child must not read an enveloped one as the end of a 2025 handshake.
+	if modernShaped && !hasID && method == "notifications/initialized" {
+		writeEmpty(w, 202, nil)
+		return
+	}
+	if modernShaped {
+		// A modern-shaped notification takes the same era gate as a request:
+		// a child that has not answered a discover must not be the first to
+		// read an enveloped line from us. Only requests are validated further.
 		var ok bool
 		if child, st, ok = b.admitModern(w, r, parsed, child, st); !ok {
 			return
 		}
-		if code, msg := modernRequestProblem(r, parsed); code != 0 {
-			writeJSON(w, http.StatusBadRequest, jsonRPCErrorBody(parsed["id"], code, msg, nil))
-			return
-		}
-		// Only a modern-shaped request with an id is a listen; a 2025-shaped
-		// one is ordinary traffic and an id-less one a notification.
-		if method == "subscriptions/listen" {
-			b.handleSubscriptionsListen(w, r, parsed, child)
-			return
+		if hasID {
+			if code, msg := modernRequestProblem(r, parsed); code != 0 {
+				writeJSON(w, http.StatusBadRequest, jsonRPCErrorBody(parsed["id"], code, msg, nil))
+				return
+			}
+			// Only a modern-shaped request with an id is a listen; a
+			// 2025-shaped one is ordinary traffic and an id-less one a
+			// notification.
+			if method == "subscriptions/listen" {
+				b.handleSubscriptionsListen(w, r, parsed, child)
+				return
+			}
 		}
 	}
 
 	if hasMethod && !hasID {
 		// Notification.
 		outgoing := parsed
+		target := b.currentChild()
+		if modernShaped {
+			target = child
+		}
 		if method == "notifications/cancelled" {
 			// The client names a request by its own id; one that matches no
 			// pending request is not the child's to see, since the child only
-			// knows the bridge's ids.
+			// knows the bridge's ids. It goes to the process the request was
+			// sent to, and only while that is still the live one: ids mean
+			// nothing to any other process.
 			cancelParams, _ := isRequestParams(parsed)
 			reqID, ok := cancelParams["requestId"]
 			internalID, found := int64(0), false
 			if ok && isJSONID(reqID) {
-				internalID, found = b.findInternalIDForOriginalID(reqID)
+				internalID, target, found = b.findInternalIDForOriginalID(reqID)
 			}
-			if !found {
+			if !found || target.HasExited() || target != b.currentChild() {
 				writeEmpty(w, 202, nil)
 				return
 			}
@@ -1462,8 +1483,7 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 			p["requestId"] = internalID
 			outgoing["params"] = p
 		}
-		child := b.currentChild()
-		if err := child.Send(outgoing); err != nil {
+		if err := target.Send(outgoing); err != nil {
 			b.log.Warn("failed to write notification to stdio child", "server", b.name, "err", err)
 			writeJSON(w, 502, map[string]any{"error": "local server is not running"})
 			return
@@ -1579,6 +1599,7 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 
 	entry := &pendingEntry{
 		originalID:    originalID,
+		child:         child,
 		progressToken: progressToken,
 		version:       requestProtocolVersion(parsed),
 		discover:      parsed["method"] == "server/discover",

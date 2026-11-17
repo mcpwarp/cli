@@ -313,13 +313,6 @@ func probeRequest(id string) map[string]any {
 	}
 }
 
-func cancelledNotification(id any) map[string]any {
-	return map[string]any{
-		"jsonrpc": "2.0", "method": "notifications/cancelled",
-		"params": map[string]any{"requestId": id},
-	}
-}
-
 // handleProbeResponse feeds the child's answer to a probe id to st's machine,
 // which tells a live probe's answer from a late one.
 func (b *Bridge) handleProbeResponse(st *eraState, id string, msg map[string]any) {

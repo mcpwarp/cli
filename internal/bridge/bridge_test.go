@@ -210,7 +210,7 @@ func TestBridge_ProgressNotificationArrivesOnSSEResponseWithRewrittenToken(t *te
 	if !strings.Contains(text, `"progressToken":"client-tok"`) {
 		t.Fatalf("expected the progress token rewritten back to the client's own, got: %s", text)
 	}
-	if strings.Contains(text, `"progressToken":"p1"`) && !strings.Contains(text, `"client-tok"`) {
+	if strings.Contains(text, `"progressToken":"`+internalProgressToken(firstBridgeID)+`"`) {
 		t.Fatalf("bridge-internal progress token leaked to the client: %s", text)
 	}
 	if !strings.Contains(text, `"result":{"ok":true}`) {
@@ -666,18 +666,16 @@ func TestBridge_LegacyGETStream_EndsClientSideAfterChildExit(t *testing.T) {
 }
 
 // TestBridge_SubscriptionsListenPushFinishRewritesTagToClientID exercises
-// the subscriptions map end to end: acknowledge, a pushed notification,
+// the listens map end to end: acknowledge, a pushed notification,
 // and the final response are all tagged/addressed in the *client's* id
 // space, even though subscriptions/push and subscriptions/finish below
-// address the subscription by the bridge-minted internal id (1, since
-// this is the first request on a fresh bridge).
+// address the subscription by the bridge-minted internal id.
 func TestBridge_SubscriptionsListenPushFinishRewritesTagToClientID(t *testing.T) {
 	b := startTestBridge(t)
 
-	req, _ := http.NewRequest(http.MethodPost, b.URL(), strings.NewReader(
-		`{"jsonrpc":"2.0","id":"client-sub","method":"subscriptions/listen","params":{}}`))
-	req.Header.Set("Accept", "text/event-stream")
-	resp, err := http.DefaultClient.Do(req)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, _, err := eraSend(ctx, b.URL(), "text/event-stream", modernBody("client-sub", "subscriptions/listen", nil, nil), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -686,6 +684,7 @@ func TestBridge_SubscriptionsListenPushFinishRewritesTagToClientID(t *testing.T)
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
 	reader := bufio.NewReader(resp.Body)
+	listenID := waitListenID(t, b, "client-sub")
 
 	ack := readSSELineContaining(t, reader, "notifications/subscriptions/acknowledged")
 	if !strings.Contains(ack, `"io.modelcontextprotocol/subscriptionId":"client-sub"`) {
@@ -694,7 +693,7 @@ func TestBridge_SubscriptionsListenPushFinishRewritesTagToClientID(t *testing.T)
 
 	pushResp := postJSON(t, b.URL(), map[string]any{
 		"jsonrpc": "2.0", "method": "subscriptions/push",
-		"params": map[string]any{"subscriptionId": 1, "notifyMethod": "sub/event", "notifyParams": map[string]any{"n": 7}},
+		"params": map[string]any{"subscriptionId": listenID, "notifyMethod": "sub/event", "notifyParams": map[string]any{"n": 7}},
 	}, nil)
 	if pushResp.StatusCode != 202 {
 		t.Fatalf("push notification status = %d", pushResp.StatusCode)
@@ -708,7 +707,7 @@ func TestBridge_SubscriptionsListenPushFinishRewritesTagToClientID(t *testing.T)
 
 	finishResp := postJSON(t, b.URL(), map[string]any{
 		"jsonrpc": "2.0", "method": "subscriptions/finish",
-		"params": map[string]any{"subscriptionId": 1, "result": map[string]any{"resultType": "complete"}},
+		"params": map[string]any{"subscriptionId": listenID, "result": map[string]any{"resultType": "complete"}},
 	}, nil)
 	if finishResp.StatusCode != 202 {
 		t.Fatalf("finish notification status = %d", finishResp.StatusCode)
@@ -738,9 +737,8 @@ func TestBridge_ServerInitiatedRequestRoutedByShapeEvenOnIDCollision(t *testing.
 	defer getResp.Body.Close()
 	time.Sleep(200 * time.Millisecond) // let it register as the open push sink
 
-	// The first request on a fresh bridge is minted internal id 1 — the
-	// same id the fixture's server/request-1 assigns its own
-	// server-initiated request below.
+	// The fixture's server/request-1 gives its own server-initiated request
+	// the very internal id the bridge minted for it.
 	reqDone := make(chan *http.Response, 1)
 	go func() {
 		resp, err := http.DefaultClient.Do(mustRequest(t, b.URL(), `{"jsonrpc":"2.0","id":55,"method":"server/request-1"}`))
@@ -754,13 +752,14 @@ func TestBridge_ServerInitiatedRequestRoutedByShapeEvenOnIDCollision(t *testing.
 
 	reader := bufio.NewReader(getResp.Body)
 	serverReqLine := readSSELineContaining(t, reader, `"method":"server/ping"`)
-	if !strings.Contains(serverReqLine, `"id":1`) {
-		t.Fatalf("expected the server-initiated request's own colliding id 1, got: %s", serverReqLine)
+	collidingID := firstPendingID(t, b)
+	if !strings.Contains(serverReqLine, fmt.Sprintf(`"id":%d`, collidingID)) {
+		t.Fatalf("expected the server-initiated request's own colliding id %d, got: %s", collidingID, serverReqLine)
 	}
 
-	// Answer it in the child's own id space (id 1, no method) — a client
-	// answering a server-initiated request, never id-rewritten.
-	ansResp := postJSON(t, b.URL(), map[string]any{"jsonrpc": "2.0", "id": 1, "result": map[string]any{"pong": true}}, nil)
+	// Answer it in the child's own id space (the colliding id, no method) —
+	// a client answering a server-initiated request, never id-rewritten.
+	ansResp := postJSON(t, b.URL(), map[string]any{"jsonrpc": "2.0", "id": collidingID, "result": map[string]any{"pong": true}}, nil)
 	if ansResp.StatusCode != 202 {
 		t.Fatalf("answer status = %d", ansResp.StatusCode)
 	}
@@ -802,20 +801,20 @@ func TestBridge_DisconnectSendsSynthesizedNotificationsCancelled(t *testing.T) {
 		}
 		close(done)
 	}()
-	_ = firstPendingID(t, b) // wait for it to register as pending
+	internalID := firstPendingID(t, b) // wait for it to register as pending
 	cancel()
 	<-done
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		askResp := postJSON(t, b.URL(), map[string]any{"jsonrpc": "2.0", "id": 999, "method": "debug/wasCancelled", "params": map[string]any{"requestId": float64(1)}}, nil)
+		askResp := postJSON(t, b.URL(), map[string]any{"jsonrpc": "2.0", "id": 999, "method": "debug/wasCancelled", "params": map[string]any{"requestId": float64(internalID)}}, nil)
 		askBody := decodeBody(t, askResp)
 		if result, _ := askBody["result"].(map[string]any); result != nil && result["cancelled"] == true {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("child never observed notifications/cancelled for internal id 1")
+	t.Fatalf("child never observed notifications/cancelled for internal id %d", internalID)
 }
 
 // TestBridge_ClientSentNotificationsCancelledRewritesToInternalID covers
@@ -832,7 +831,7 @@ func TestBridge_ClientSentNotificationsCancelledRewritesToInternalID(t *testing.
 			resp.Body.Close()
 		}
 	}()
-	_ = firstPendingID(t, b)
+	internalID := firstPendingID(t, b)
 
 	cancelResp := postJSON(t, b.URL(), map[string]any{
 		"jsonrpc": "2.0", "method": "notifications/cancelled",
@@ -845,14 +844,14 @@ func TestBridge_ClientSentNotificationsCancelledRewritesToInternalID(t *testing.
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		askResp := postJSON(t, b.URL(), map[string]any{"jsonrpc": "2.0", "id": 999, "method": "debug/wasCancelled", "params": map[string]any{"requestId": float64(1)}}, nil)
+		askResp := postJSON(t, b.URL(), map[string]any{"jsonrpc": "2.0", "id": 999, "method": "debug/wasCancelled", "params": map[string]any{"requestId": float64(internalID)}}, nil)
 		askBody := decodeBody(t, askResp)
 		if result, _ := askBody["result"].(map[string]any); result != nil && result["cancelled"] == true {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("requestId was not rewritten to internal id 1")
+	t.Fatalf("requestId was not rewritten to internal id %d", internalID)
 }
 
 // TestBridge_TimeoutMarksAbandonedAndDropsLateResponse exercises the

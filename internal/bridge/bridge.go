@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"runtime/debug"
@@ -24,11 +25,12 @@ const (
 	// inbound body should be allowed to grow unbounded either.
 	maxBodyBytes = 16 * 1024 * 1024
 	// maxPending: past this many simultaneously in-flight client requests
-	// (regular + subscriptions), refuse new ones with 503.
+	// (listens have their own cap), refuse new ones with 503.
 	defaultMaxPending = 1024
-	// abandonedCap bounds the set of ids abandoned to a request timeout, so
-	// a late child response for one is recognized and dropped rather than
-	// logged as a mystery.
+	// abandonedCap bounds the set of ids whose request or listen is over
+	// (timed out, cancelled, or ended by the child), so a late child response
+	// or cancel for one is recognized and dropped rather than logged as a
+	// mystery.
 	abandonedCap = 1000
 	// closeBarrier: how long Close waits for in-flight request handlers to
 	// finish writing their own response before force-closing sockets.
@@ -72,17 +74,33 @@ func getMeta(container map[string]any) (map[string]any, bool) {
 	return isRecord(container["_meta"])
 }
 
-// numericID converts a decoded JSON-RPC id (float64/json.Number) to an
-// int64 internal id, if it is numeric and integral.
-func numericID(v any) (int64, bool) {
+const (
+	// Bridge-minted ids live in [firstBridgeID, maxBridgeID]: well above the
+	// small ids a child numbers its own requests with, and exact in a float64.
+	firstBridgeID = 1 << 30
+	maxBridgeID   = math.MaxInt32
+)
+
+// bridgeIDFrom reads a bridge-minted id from a decoded JSON value: a JSON
+// number that is integral (7.0 counts) and within [firstBridgeID,
+// maxBridgeID]. Strings never match.
+func bridgeIDFrom(v any) (int64, bool) {
+	var f float64
 	switch n := v.(type) {
 	case float64:
-		return int64(n), true
+		f = n
 	case json.Number:
-		i, err := n.Int64()
-		return i, err == nil
+		var err error
+		if f, err = n.Float64(); err != nil {
+			return 0, false
+		}
+	default:
+		return 0, false
 	}
-	return 0, false
+	if f != math.Trunc(f) || f < firstBridgeID || f > maxBridgeID {
+		return 0, false
+	}
+	return int64(f), true
 }
 
 func internalProgressToken(id int64) string {
@@ -124,6 +142,15 @@ type StartBridgeOptions struct {
 	Log            *slog.Logger
 	RequestTimeout time.Duration // 0 -> defaultRequestTimeout
 	MaxPending     int           // 0 -> defaultMaxPending
+	// MaxListens caps open subscriptions/listen streams (0 ->
+	// defaultMaxListens); ListenBudget caps the bytes one listen may have
+	// queued for a client that is not reading (0 -> defaultListenBudget);
+	// ListenKeepalive is the period of the SSE comment line an idle listen
+	// stream carries (0 -> defaultListenKeepalive). Test seams, like
+	// RequestTimeout.
+	MaxListens      int
+	ListenBudget    int
+	ListenKeepalive time.Duration
 	// ProbeTimeout bounds the lazy server/discover probe (0 ->
 	// defaultProbeTimeout); HeadHoldTimeout bounds how long a modern
 	// request's SSE head waits for the child's first message (0 ->
@@ -171,6 +198,8 @@ type StartBridgeOptions struct {
 type pendingEntry struct {
 	originalID    any
 	progressToken any           // nil if the request carried none
+	version       any           // the protocol version the request carried, nil if none
+	discover      bool          // a client's server/discover, forwarded like any request
 	sse           *sseResponder // non-nil iff Accept: text/event-stream
 	plain         http.ResponseWriter
 	extraHeaders  map[string]string
@@ -303,12 +332,6 @@ func (e *pendingEntry) abandon() {
 	})
 }
 
-type subscriptionEntry struct {
-	originalID any
-	res        *sseResponder
-	done       chan struct{}
-}
-
 var (
 	errUpstreamTimeout = errors.New("upstream timeout")
 	errChildGone       = errors.New("bridge closing")
@@ -323,6 +346,13 @@ type Bridge struct {
 
 	timeout      time.Duration
 	maxPending   int
+	maxListens   int
+	listenBudget int
+	keepalive    time.Duration
+	// writeGrace is how long a listen handler may stay in Write once its
+	// listen has ended without it; guarded by mu, which admitListen reads it
+	// under.
+	writeGrace   time.Duration
 	ensureChild  func(ctx context.Context) error
 	probeTimeout time.Duration
 	reprobeCap   time.Duration
@@ -338,14 +368,16 @@ type Bridge struct {
 
 	// mu guards everything below, including era (the current process's
 	// eraState) and every eraState's fields.
-	mu            sync.Mutex
-	child         *StdioChild
-	era           *eraState
-	closing       bool
-	failed        string
-	hasFailed     bool
-	pending       map[int64]*pendingEntry
-	subscriptions map[int64]*subscriptionEntry
+	mu        sync.Mutex
+	child     *StdioChild
+	era       *eraState
+	closing   bool
+	failed    string
+	hasFailed bool
+	pending   map[int64]*pendingEntry
+	// listens holds the open subscriptions/listen streams by bridge id. An
+	// entry's own fields are guarded by its mutex, taken after mu.
+	listens       map[int64]*listenEntry
 	abandoned     map[int64]struct{}
 	abandonedFIFO []int64
 	// abandonedInit maps an abandoned initialize's id to its process, so the
@@ -381,6 +413,18 @@ func StartBridge(opts StartBridgeOptions) (*Bridge, error) {
 	if maxPending == 0 {
 		maxPending = defaultMaxPending
 	}
+	maxListens := opts.MaxListens
+	if maxListens == 0 {
+		maxListens = defaultMaxListens
+	}
+	listenBudget := opts.ListenBudget
+	if listenBudget == 0 {
+		listenBudget = defaultListenBudget
+	}
+	keepalive := opts.ListenKeepalive
+	if keepalive <= 0 {
+		keepalive = defaultListenKeepalive
+	}
 	probeTimeout := opts.ProbeTimeout
 	if probeTimeout == 0 {
 		probeTimeout = defaultProbeTimeout
@@ -408,6 +452,10 @@ func StartBridge(opts StartBridgeOptions) (*Bridge, error) {
 		log:           log,
 		timeout:       timeout,
 		maxPending:    maxPending,
+		maxListens:    maxListens,
+		listenBudget:  listenBudget,
+		keepalive:     keepalive,
+		writeGrace:    defaultListenWriteGrace,
 		ensureChild:   opts.EnsureChild,
 		probeTimeout:  probeTimeout,
 		reprobeCap:    reprobeCap,
@@ -417,10 +465,10 @@ func StartBridge(opts StartBridgeOptions) (*Bridge, error) {
 		session:       newSession(),
 		pushHub:       newPushStreamHub(log.With("server", opts.Name)),
 		pending:       make(map[int64]*pendingEntry),
-		subscriptions: make(map[int64]*subscriptionEntry),
+		listens:       make(map[int64]*listenEntry),
 		abandoned:     make(map[int64]struct{}),
 		abandonedInit: make(map[int64]*eraState),
-		nextID:        1,
+		nextID:        firstBridgeID,
 	}
 	b.era = b.newEraState(child)
 	b.wireChild(child, b.era)
@@ -479,7 +527,9 @@ func (b *Bridge) ReplaceChild(child *StdioChild) {
 	b.era = st
 	b.hasFailed = false
 	b.failed = ""
+	gone := b.takeListensLocked(func(l *listenEntry) bool { return l.child != child })
 	b.mu.Unlock()
+	endListens(gone, listenChildGone)
 	b.wireChild(child, st)
 }
 
@@ -518,6 +568,10 @@ func (b *Bridge) ensureLiveChild(parent context.Context) {
 func (b *Bridge) addAbandoned(id int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.addAbandonedLocked(id)
+}
+
+func (b *Bridge) addAbandonedLocked(id int64) {
 	if _, ok := b.abandoned[id]; !ok {
 		b.abandoned[id] = struct{}{}
 		b.abandonedFIFO = append(b.abandonedFIFO, id)
@@ -540,14 +594,15 @@ func (b *Bridge) isAbandoned(id int64) bool {
 // findInternalIDForOriginalID resolves a legacy client's own
 // notifications/cancelled requestId (in the client's id space) back to the
 // bridge-minted internal id. Picks the most recently issued match if more
-// than one pending request happens to share the original id.
+// than one pending request happens to share the original id. An initialize
+// is never matched: it cannot be cancelled.
 func (b *Bridge) findInternalIDForOriginalID(originalID any) (int64, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	found := int64(0)
 	ok := false
 	for internalID, entry := range b.pending {
-		if entry.originalID == originalID {
+		if entry.raw == nil && entry.originalID == originalID {
 			if !ok || internalID > found {
 				found = internalID
 				ok = true
@@ -559,12 +614,13 @@ func (b *Bridge) findInternalIDForOriginalID(originalID any) (int64, bool) {
 
 func (b *Bridge) handleChildResponse(id int64, msg map[string]any) {
 	b.mu.Lock()
-	sub, hasSub := b.subscriptions[id]
-	if hasSub {
-		delete(b.subscriptions, id)
+	listen, hasListen := b.listens[id]
+	if hasListen {
+		delete(b.listens, id)
+		b.addAbandonedLocked(id)
 	}
 	var entry *pendingEntry
-	if !hasSub {
+	if !hasListen {
 		entry = b.pending[id]
 		if entry != nil {
 			delete(b.pending, id)
@@ -575,7 +631,7 @@ func (b *Bridge) handleChildResponse(id int64, msg map[string]any) {
 	switch {
 	case entry != nil:
 		initEra = entry.era
-	case !hasSub:
+	case !hasListen:
 		initEra = b.abandonedInit[id]
 		delete(b.abandonedInit, id)
 	}
@@ -587,13 +643,10 @@ func (b *Bridge) handleChildResponse(id int64, msg map[string]any) {
 		b.noteInitializeAnswer(initEra, msg)
 	}
 
-	if hasSub {
-		rewritten := cloneMsg(msg)
-		rewritten["id"] = sub.originalID
-		rewriteSubscriptionTag(rewritten, id, sub.originalID)
-		sub.res.writeFrame(rewritten)
-		sub.res.end()
-		close(sub.done)
+	if hasListen {
+		final := rewriteListenTag(msg, id, listen.originalID)
+		final["id"] = listen.originalID
+		listen.finish(final)
 		return
 	}
 	if entry != nil {
@@ -605,7 +658,7 @@ func (b *Bridge) handleChildResponse(id int64, msg map[string]any) {
 		return
 	}
 	if abandoned {
-		b.log.Debug("late response for an abandoned (timed-out) request id, dropping", "server", b.name, "id", id)
+		b.log.Debug("late response for a request or listen that is already over, dropping", "server", b.name, "id", id)
 		return
 	}
 	b.log.Debug("response with unrecognized id from stdio child, dropping", "server", b.name, "id", id)
@@ -616,9 +669,11 @@ func (b *Bridge) isAbandonedLocked(id int64) bool {
 	return ok
 }
 
-// rewriteSubscriptionTag rewrites params/result._meta[subscriptionIdKey]
-// from `from` to `to` in place, if present.
-func rewriteSubscriptionTag(msg map[string]any, from, to any) {
+// rewriteListenTag returns a copy of msg whose params/result
+// _meta[subscriptionIdKey] is `to` where it names bridge id `from`. The
+// child's own message and its nested maps are left untouched.
+func rewriteListenTag(msg map[string]any, from int64, to any) map[string]any {
+	out := cloneMsg(msg)
 	for _, key := range []string{"params", "result"} {
 		container, ok := isRecord(msg[key])
 		if !ok {
@@ -628,28 +683,32 @@ func rewriteSubscriptionTag(msg map[string]any, from, to any) {
 		if !ok {
 			continue
 		}
-		if meta[subscriptionIDMetaKey] == from {
-			meta[subscriptionIDMetaKey] = to
-			return
+		if id, ok := bridgeIDFrom(meta[subscriptionIDMetaKey]); ok && id == from {
+			c, m := cloneMsg(container), cloneMsg(meta)
+			m[subscriptionIDMetaKey] = to
+			c["_meta"] = m
+			out[key] = c
 		}
 	}
+	return out
 }
 
-func getSubscriptionIDTag(params map[string]any) (any, bool) {
+// subscriptionTag returns params._meta's subscription tag; present reports
+// whether the key is there at all, whatever its value.
+func subscriptionTag(params map[string]any) (tag any, present bool) {
 	meta, ok := getMeta(params)
 	if !ok {
 		return nil, false
 	}
-	v, ok := meta[subscriptionIDMetaKey]
-	if !ok || !isJSONID(v) {
-		return nil, false
-	}
-	return v, true
+	tag, present = meta[subscriptionIDMetaKey]
+	return tag, present
 }
 
 func (b *Bridge) handleChildNotification(msg map[string]any) {
-	if msg["method"] == "notifications/progress" {
-		params, _ := isRequestParams(msg)
+	method, _ := msg["method"].(string)
+	params, _ := isRequestParams(msg)
+
+	if method == "notifications/progress" {
 		var token any
 		if params != nil {
 			token = params["progressToken"]
@@ -657,7 +716,18 @@ func (b *Bridge) handleChildNotification(msg map[string]any) {
 		if internalID, ok := internalIDFromProgressToken(token); ok {
 			b.mu.Lock()
 			entry := b.pending[internalID]
+			listen := b.listens[internalID]
 			b.mu.Unlock()
+			if listen != nil {
+				if listen.progressToken != nil {
+					rewritten := cloneMsg(msg)
+					p := cloneMsg(params)
+					p["progressToken"] = listen.progressToken
+					rewritten["params"] = p
+					b.enqueueListen(internalID, listen, rewritten)
+				}
+				return
+			}
 			if entry != nil {
 				rewritten := cloneMsg(msg)
 				if params != nil {
@@ -672,29 +742,79 @@ func (b *Bridge) handleChildNotification(msg map[string]any) {
 				}
 				return
 			}
+			if internalID >= firstBridgeID && internalID <= maxBridgeID {
+				b.log.Debug("progress notification for a request or listen that is over, dropping", "server", b.name)
+				return
+			}
 		}
 	}
-	params, _ := isRequestParams(msg)
-	if subID, ok := getSubscriptionIDTag(params); ok {
-		b.mu.Lock()
-		sub := b.subscriptions[mustInt64(subID)]
-		b.mu.Unlock()
-		if sub != nil {
-			rewritten := cloneMsg(msg)
-			rewriteSubscriptionTag(rewritten, subID, sub.originalID)
-			sub.res.writeFrame(rewritten)
+
+	// A cancel naming a bridge id is about a request the bridge minted for the
+	// client, so it is never relayed, tagged or not: it ends the listen it
+	// names, and is otherwise dropped (a pending request, a listen already
+	// ended, an unknown id). This is decided by the id alone; the bridge does
+	// not track a 2025 child's own server-to-client requests, so one numbered
+	// inside the bridge range would be taken for the bridge's. A tagged cancel
+	// naming anything else is not a listen's to deliver and is dropped too.
+	// Only an untagged cancel outside the range, a 2025 child cancelling its
+	// own server-to-client request, goes to the push stream.
+	if method == "notifications/cancelled" {
+		if id, ok := bridgeIDFrom(params["requestId"]); ok {
+			b.mu.Lock()
+			listen := b.listens[id]
+			if listen != nil {
+				delete(b.listens, id)
+				b.addAbandonedLocked(id)
+			}
+			b.mu.Unlock()
+			if listen != nil {
+				listen.end(listenEndedByChild)
+			}
 			return
 		}
+		if _, tagged := subscriptionTag(params); tagged {
+			b.log.Debug("tagged cancel naming no listen, dropping", "server", b.name)
+			return
+		}
+	}
+
+	// A tagged message belongs to one listen and never goes to a GET stream,
+	// whether or not that listen is still open.
+	if tag, tagged := subscriptionTag(params); tagged {
+		id, ok := bridgeIDFrom(tag)
+		b.mu.Lock()
+		listen := b.listens[id]
+		b.mu.Unlock()
+		if !ok || listen == nil {
+			b.log.Debug("tagged notification for no open listen, dropping", "server", b.name, "method", method)
+			return
+		}
+		b.enqueueListen(id, listen, rewriteListenTag(msg, id, listen.originalID))
+		return
 	}
 	b.pushHub.Dispatch(msg)
 }
 
-// mustInt64 best-effort-converts a JSON-RPC id value to the int64 key
-// space subscriptions are stored under; subscription ids are always
-// bridge-minted, so this only ever sees a numeric value in practice.
-func mustInt64(v any) int64 {
-	n, _ := numericID(v)
-	return n
+// enqueueListen queues msg for a listen's handler. A listen that goes over
+// its byte budget is removed and cancelled at the child, off the child's pump:
+// the write may block on a child that is itself blocked writing to us.
+func (b *Bridge) enqueueListen(id int64, l *listenEntry, msg map[string]any) {
+	if !l.enqueue(frameSSE(msg)) {
+		return
+	}
+	b.mu.Lock()
+	removed := b.listens[id] == l
+	if removed {
+		delete(b.listens, id)
+		b.addAbandonedLocked(id)
+	}
+	b.mu.Unlock()
+	l.armWriteDeadline()
+	if !removed {
+		return // the handler already left and cancelled it
+	}
+	b.log.Warn("subscriptions/listen client is not keeping up; ending the listen", "server", b.name)
+	go func() { _ = l.child.Send(bridgeCancel(id, cancelReasonOverflow, l.version)) }()
 }
 
 func (b *Bridge) wireChild(c *StdioChild, st *eraState) {
@@ -711,16 +831,16 @@ func (b *Bridge) wireChild(c *StdioChild, st *eraState) {
 				b.handleProbeResponse(st, s, msg)
 				return
 			}
-			id, ok := numericID(idVal)
+			id, ok := bridgeIDFrom(idVal)
 			if !ok {
-				b.pushHub.Dispatch(msg)
+				b.log.Debug("response with an id the bridge never minted, dropping", "server", b.name)
 				return
 			}
 			b.handleChildResponse(id, msg)
 		case hasID && hasMethod:
 			// Server-initiated request (legacy, <=2025-11-25 only) — shape
 			// alone routes this to the legacy push stream, never the
-			// pending/subscriptions maps, even on an id collision.
+			// pending/listens maps, even on an id collision.
 			b.pushHub.Dispatch(msg)
 		case !hasID && hasMethod:
 			b.handleChildNotification(msg)
@@ -734,18 +854,14 @@ func (b *Bridge) wireChild(c *StdioChild, st *eraState) {
 		b.mu.Lock()
 		pending := b.pending
 		b.pending = make(map[int64]*pendingEntry)
-		subs := b.subscriptions
-		b.subscriptions = make(map[int64]*subscriptionEntry)
+		gone := b.takeListensLocked(func(l *listenEntry) bool { return l.child == c })
 		b.endEraLocked(st)
 		b.mu.Unlock()
 
 		for _, entry := range pending {
 			entry.rejectWith(errChildRestarted)
 		}
-		for _, sub := range subs {
-			sub.res.end()
-			close(sub.done)
-		}
+		endListens(gone, listenChildGone)
 		b.pushHub.Close()
 	})
 
@@ -904,6 +1020,22 @@ func (s *sseResponder) writeFrame(msg any) {
 	}
 }
 
+// writeRaw writes a pre-framed chunk (an SSE event or comment), committing the
+// head first, and reports a failed write.
+func (s *sseResponder) writeRaw(chunk string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ended {
+		return errChildGone
+	}
+	s.commitLocked()
+	_, err := io.WriteString(s.w, chunk)
+	if err == nil && s.flusher != nil {
+		s.flusher.Flush()
+	}
+	return err
+}
+
 // finalStatus answers with a plain JSON body and the given status instead
 // of a stream, iff the head is still held; it then ends the response and
 // reports true.
@@ -1059,6 +1191,9 @@ func (h *headerTrackingWriter) Write(p []byte) (int, error) {
 	h.started = true
 	return n, err
 }
+
+// Unwrap lets http.ResponseController reach the real writer.
+func (h *headerTrackingWriter) Unwrap() http.ResponseWriter { return h.ResponseWriter }
 
 func (h *headerTrackingWriter) Flush() {
 	if f, ok := h.ResponseWriter.(http.Flusher); ok {
@@ -1268,9 +1403,9 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 
 	// One lazy respawn here covers requests, notifications and
 	// subscriptions/listen alike. The child is snapshotted right after:
-	// regular requests use that snapshot (admitModern may move it to a newer
-	// one), while notifications, client responses and subscriptions/listen
-	// read currentChild() again. A bare client response (!hasMethod) is
+	// requests and listens use that snapshot (admitModern may move it to a
+	// newer one), while notifications and client responses read
+	// currentChild() again. A bare client response (!hasMethod) is
 	// left out: it answers the dead child's own request, which a fresh
 	// child never issued, so respawning for it would only resurrect a
 	// disabled service on a stray late reply.
@@ -1296,27 +1431,35 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, jsonRPCErrorBody(parsed["id"], code, msg, nil))
 			return
 		}
-	}
-
-	if method == "subscriptions/listen" {
-		b.handleSubscriptionsListen(w, r, parsed, sessionID, hasSession)
-		return
+		// Only a modern-shaped request with an id is a listen; a 2025-shaped
+		// one is ordinary traffic and an id-less one a notification.
+		if method == "subscriptions/listen" {
+			b.handleSubscriptionsListen(w, r, parsed, child)
+			return
+		}
 	}
 
 	if hasMethod && !hasID {
 		// Notification.
 		outgoing := parsed
 		if method == "notifications/cancelled" {
-			if cancelParams, ok := isRequestParams(parsed); ok {
-				if reqID, ok := cancelParams["requestId"]; ok && isJSONID(reqID) {
-					if internalID, ok := b.findInternalIDForOriginalID(reqID); ok {
-						outgoing = cloneMsg(parsed)
-						p := cloneMsg(cancelParams)
-						p["requestId"] = internalID
-						outgoing["params"] = p
-					}
-				}
+			// The client names a request by its own id; one that matches no
+			// pending request is not the child's to see, since the child only
+			// knows the bridge's ids.
+			cancelParams, _ := isRequestParams(parsed)
+			reqID, ok := cancelParams["requestId"]
+			internalID, found := int64(0), false
+			if ok && isJSONID(reqID) {
+				internalID, found = b.findInternalIDForOriginalID(reqID)
 			}
+			if !found {
+				writeEmpty(w, 202, nil)
+				return
+			}
+			outgoing = cloneMsg(parsed)
+			p := cloneMsg(cancelParams)
+			p["requestId"] = internalID
+			outgoing["params"] = p
 		}
 		child := b.currentChild()
 		if err := child.Send(outgoing); err != nil {
@@ -1359,16 +1502,33 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 // internal id in the same critical section — checking then minting under
 // two separate lock acquisitions left a window where more callers than
 // maxPending could all pass the check before any of them landed in
-// b.pending/b.subscriptions.
+// b.pending.
 func (b *Bridge) admitAndMintID() (int64, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.pending)+len(b.subscriptions) >= b.maxPending {
+	if len(b.pending) >= b.maxPending {
 		return 0, false
 	}
-	id := b.nextID
-	b.nextID++
-	return id, true
+	return b.mintIDLocked(), true
+}
+
+// mintIDLocked hands out the next bridge id. Past maxBridgeID the counter
+// wraps to firstBridgeID, skipping any id a request, a listen or a late
+// answer could still be addressed by.
+func (b *Bridge) mintIDLocked() int64 {
+	for {
+		id := b.nextID
+		if id < firstBridgeID || id > maxBridgeID {
+			id = firstBridgeID
+		}
+		b.nextID = id + 1
+		_, pending := b.pending[id]
+		_, listening := b.listens[id]
+		_, abandoned := b.abandoned[id]
+		if !pending && !listening && !abandoned {
+			return id
+		}
+	}
 }
 
 type requestKind int
@@ -1387,12 +1547,7 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 	}
 	originalID := parsed["id"]
 
-	var progressToken any
-	if params, ok := isRequestParams(parsed); ok {
-		if meta, ok := getMeta(params); ok {
-			progressToken = meta["progressToken"]
-		}
-	}
+	progressToken := requestProgressToken(parsed)
 	accept := r.Header.Get("Accept")
 	wantsSSE := strings.Contains(accept, "text/event-stream")
 
@@ -1424,6 +1579,8 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 	entry := &pendingEntry{
 		originalID:    originalID,
 		progressToken: progressToken,
+		version:       requestProtocolVersion(parsed),
+		discover:      parsed["method"] == "server/discover",
 		sse:           sse,
 		plain:         w,
 		extraHeaders:  extraHeaders,
@@ -1456,17 +1613,7 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 		entry.abandon()
 	}()
 
-	outgoing := cloneMsg(parsed)
-	outgoing["id"] = internalID
-	if progressToken != nil {
-		p := cloneMsg(outgoing["params"].(map[string]any))
-		meta := cloneMsg(p["_meta"].(map[string]any))
-		meta["progressToken"] = internalProgressToken(internalID)
-		p["_meta"] = meta
-		outgoing["params"] = p
-	}
-
-	if err := child.Send(outgoing); err != nil {
+	if err := child.Send(forwardedRequest(parsed, internalID, progressToken)); err != nil {
 		b.mu.Lock()
 		delete(b.pending, internalID)
 		b.mu.Unlock()
@@ -1508,65 +1655,11 @@ func (b *Bridge) onRequestDisconnect(internalID int64, entry *pendingEntry, chil
 	entry.abandon()
 	if still {
 		b.addAbandoned(internalID)
-		_ = child.Send(cancelledNotification(internalID))
-	}
-}
-
-func (b *Bridge) handleSubscriptionsListen(w http.ResponseWriter, r *http.Request, parsed map[string]any, sessionID string, hasSession bool) {
-	internalID, ok := b.admitAndMintID()
-	if !ok {
-		writeJSON(w, 503, map[string]any{"error": "too many in-flight requests"})
-		return
-	}
-	child := b.currentChild()
-	if child.HasExited() {
-		writeJSON(w, 502, map[string]any{"error": "local server is not running"})
-		return
-	}
-	originalID := parsed["id"]
-
-	openSSEHeaders(w, sessionID, hasSession)
-	w.WriteHeader(200)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-	res := newSSEResponder(w)
-	sub := &subscriptionEntry{originalID: originalID, res: res, done: make(chan struct{})}
-
-	b.mu.Lock()
-	b.subscriptions[internalID] = sub
-	b.mu.Unlock()
-
-	outgoing := cloneMsg(parsed)
-	outgoing["id"] = internalID
-	if err := child.Send(outgoing); err != nil {
-		b.mu.Lock()
-		_, still := b.subscriptions[internalID]
-		delete(b.subscriptions, internalID)
-		b.mu.Unlock()
-		if still {
-			b.log.Warn("failed to write subscriptions/listen to stdio child", "server", b.name, "err", err)
-			res.end()
-		}
-		return
-	}
-
-	select {
-	case <-sub.done:
-	case <-r.Context().Done():
-		b.mu.Lock()
-		_, still := b.subscriptions[internalID]
-		delete(b.subscriptions, internalID)
-		b.mu.Unlock()
-		if still {
-			_ = child.Send(map[string]any{
-				"jsonrpc": "2.0", "method": "notifications/cancelled",
-				"params": map[string]any{"requestId": internalID},
-			})
-		} else {
-			// Already removed by a concurrent handleChildResponse — wait
-			// for it to finish writing to res before returning.
-			<-sub.done
+		// A forwarded server/discover is never cancelled: a child that picks
+		// its era from the first message other than discover must not be
+		// handed one this way.
+		if !entry.discover {
+			_ = child.Send(bridgeCancel(internalID, cancelReasonDisconnect, entry.version))
 		}
 	}
 }
@@ -1590,8 +1683,7 @@ func (b *Bridge) CloseContext(ctx context.Context) error {
 	b.closing = true
 	pending := b.pending
 	b.pending = make(map[int64]*pendingEntry)
-	subs := b.subscriptions
-	b.subscriptions = make(map[int64]*subscriptionEntry)
+	gone := b.takeListensLocked(func(*listenEntry) bool { return true })
 	b.endEraLocked(b.era)
 	b.mu.Unlock()
 
@@ -1600,9 +1692,9 @@ func (b *Bridge) CloseContext(ctx context.Context) error {
 	for _, entry := range pending {
 		entry.rejectWith(errChildGone)
 	}
-	for _, sub := range subs {
-		sub.res.end()
-		close(sub.done)
+	endListens(gone, listenClosing)
+	for _, l := range gone {
+		l.armWriteDeadline() // a handler stuck in Write gives up too
 	}
 
 	done := make(chan struct{})

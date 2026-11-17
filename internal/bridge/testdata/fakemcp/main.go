@@ -35,6 +35,14 @@ func writeLine(v map[string]any) {
 	stdoutMu.Unlock()
 }
 
+// writeRawLines writes lines to stdout verbatim, in one write so no other
+// line can land between them.
+func writeRawLines(lines []string) {
+	stdoutMu.Lock()
+	fmt.Print(strings.Join(lines, "\n") + "\n")
+	stdoutMu.Unlock()
+}
+
 func reply(id any, result any) {
 	writeLine(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
 }
@@ -122,6 +130,10 @@ func main() {
 			modernBareInitializeRejection = true
 		case "--discover-no-versions":
 			discoverNoVersions = true
+		case "--listen":
+			listenMode = true
+		case "--listen-no-ack":
+			listenMode, listenNoAck = true, true
 		}
 		if n, ok := strings.CutPrefix(arg, "--reject-initialize="); ok {
 			if v, err := strconv.Atoi(n); err == nil {
@@ -251,19 +263,18 @@ func main() {
 			stateMu.Unlock()
 			sendServerRequest("srv-1", "server/ping", map[string]any{})
 		case "server/request-1":
-			// Deliberately collides its own id (the number 1) with
-			// whatever internal id the bridge may have minted 1 for on a
-			// concurrently in-flight client request — proves shape-based
+			// Deliberately collides its own id with the internal id the
+			// bridge minted for this very request — proves shape-based
 			// classification rather than id-based routing.
 			originalID := id
 			stateMu.Lock()
-			pendingServerReqID, pendingServerReqSet = float64(1), true
+			pendingServerReqID, pendingServerReqSet = id, true
 			onServerResponse = func(response map[string]any) {
 				notify("server/ack", map[string]any{"ackedResult": response["result"]})
 				reply(originalID, map[string]any{"ok": true})
 			}
 			stateMu.Unlock()
-			sendServerRequest(1, "server/ping", map[string]any{})
+			sendServerRequest(id, "server/ping", map[string]any{})
 		case "slow":
 			delayMs := 200.0
 			if params, ok := msg["params"].(map[string]any); ok {

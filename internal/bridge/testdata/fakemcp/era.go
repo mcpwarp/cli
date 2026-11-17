@@ -83,6 +83,19 @@ var (
 	// requestCount counts the requests handled under an era mode, minus
 	// server/discover and debug/* (guarded by stateMu).
 	requestCount int
+	// listenMode (--listen) makes a modern child serve subscriptions/listen:
+	// it records the request id as the child saw it in openListens until a
+	// notifications/cancelled names it, and sends the tagged acknowledgement.
+	// Without it the method is unknown. Guarded by stateMu.
+	// listenNoAck (--listen-no-ack) leaves the acknowledgement out.
+	listenMode  bool
+	listenNoAck bool
+	openListens []any
+	// cancelCounts counts the notifications/cancelled received per requestId
+	// under an era mode (guarded by stateMu).
+	cancelCounts = map[any]int{}
+	// cancelMetas holds the _meta of the last such notification that had one.
+	cancelMetas = map[any]any{}
 )
 
 func hold(f func()) {
@@ -124,6 +137,16 @@ func handleEra(msg map[string]any, method string, id any, hasID bool) {
 	if method == "notifications/cancelled" {
 		stateMu.Lock()
 		cancelledRequestIDs[params["requestId"]] = true
+		cancelCounts[params["requestId"]]++
+		if meta, ok := params["_meta"]; ok {
+			cancelMetas[params["requestId"]] = meta
+		}
+		for i, open := range openListens {
+			if open == params["requestId"] {
+				openListens = append(openListens[:i:i], openListens[i+1:]...)
+				break
+			}
+		}
 		stateMu.Unlock()
 		return
 	}
@@ -302,6 +325,25 @@ func handleModern(method string, id any, params, meta map[string]any, modernShap
 			"resultType": "complete",
 			"content":    []any{map[string]any{"type": "text", "text": "modern:" + toolName(params)}},
 		})
+	case "subscriptions/listen":
+		stateMu.Lock()
+		supported, ack := listenMode, !listenNoAck
+		if supported {
+			openListens = append(openListens, id)
+		}
+		stateMu.Unlock()
+		if !supported {
+			replyError(id, -32601, "Method not found: "+method, nil)
+			return
+		}
+		if !ack {
+			return
+		}
+		var notifications any = map[string]any{}
+		if n, ok := params["notifications"]; ok {
+			notifications = n
+		}
+		notifyTagged("notifications/subscriptions/acknowledged", map[string]any{"notifications": notifications}, id)
 	default:
 		replyError(id, -32601, "Method not found: "+method, nil)
 	}
@@ -339,6 +381,20 @@ func discoverResult() map[string]any {
 //	                                                 debug/release
 //	debug/release                                    sends every held answer in
 //	                                                 order, then -> {released}
+//	debug/cancelCount      {requestId}               -> {count} notifications/cancelled
+//	                                                 received for it
+//	debug/cancelMeta       {requestId}               -> {hasMeta, meta} of the last
+//	                                                 cancel for it that carried _meta
+//	debug/listens                                    -> {ids} the subscriptions/listen
+//	                                                 ids the child has seen and not
+//	                                                 had cancelled (--listen)
+//	debug/raw              {lines}                   writes each string to stdout
+//	                                                 verbatim, in one write, then
+//	                                                 -> {written}
+//	debug/flood            {subscriptionId, count, size}
+//	                                                 count notifications tagged with
+//	                                                 subscriptionId, each carrying
+//	                                                 size bytes, then -> {sent}
 //	debug/delayedError     {delayMs, code, message?} error after the delay
 //	debug/progressThenError {delayMs, code}          a progress notification for
 //	                                                 _meta.progressToken now, then
@@ -362,6 +418,39 @@ func handleEraDebug(method string, id any, params, meta map[string]any) {
 		cancelled := cancelledRequestIDs[params["requestId"]]
 		stateMu.Unlock()
 		reply(id, map[string]any{"cancelled": cancelled})
+	case "debug/cancelCount":
+		stateMu.Lock()
+		n := cancelCounts[params["requestId"]]
+		stateMu.Unlock()
+		reply(id, map[string]any{"count": n})
+	case "debug/cancelMeta":
+		stateMu.Lock()
+		meta, has := cancelMetas[params["requestId"]]
+		stateMu.Unlock()
+		reply(id, map[string]any{"hasMeta": has, "meta": meta})
+	case "debug/listens":
+		stateMu.Lock()
+		ids := append([]any{}, openListens...)
+		stateMu.Unlock()
+		reply(id, map[string]any{"ids": ids})
+	case "debug/raw":
+		var lines []string
+		raw, _ := params["lines"].([]any)
+		for _, l := range raw {
+			if s, ok := l.(string); ok {
+				lines = append(lines, s)
+			}
+		}
+		writeRawLines(lines)
+		reply(id, map[string]any{"written": len(lines)})
+	case "debug/flood":
+		count, _ := params["count"].(float64)
+		size, _ := params["size"].(float64)
+		payload := strings.Repeat("x", int(size))
+		for i := 0; i < int(count); i++ {
+			notifyTagged("notifications/flood", map[string]any{"i": i, "payload": payload}, params["subscriptionId"])
+		}
+		reply(id, map[string]any{"sent": int(count)})
 	case "debug/release":
 		stateMu.Lock()
 		queued := held

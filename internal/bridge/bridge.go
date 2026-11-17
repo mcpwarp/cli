@@ -1271,9 +1271,9 @@ func (b *Bridge) acquireRequestSlot() bool {
 	return true
 }
 
-// writeMethodNotAllowed answers GET/DELETE against a child known to be
-// modern-only: the 2026-07-28 HTTP binding has no standalone stream and no
-// sessions to terminate.
+// writeMethodNotAllowed answers GET/DELETE when the bridge refuses 2025
+// traffic for the child: the 2026-07-28 HTTP binding has no standalone
+// stream and no sessions to terminate.
 func writeMethodNotAllowed(w http.ResponseWriter) {
 	w.Header().Set("Allow", "POST")
 	writeJSON(w, 405, map[string]any{"error": "method not allowed"})
@@ -1375,8 +1375,9 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	// skips the gate too; its session is minted only once the child has
 	// answered it successfully.
 	modernShaped := hasMethod && isModernShaped(parsed)
-	// A live child known to take only modern requests refuses 2025-style
-	// ones before any session gate: there are no sessions to be unknown.
+	// Once the bridge refuses 2025 traffic for a live child, it refuses
+	// 2025-style requests before any session gate: there are no sessions to
+	// be unknown.
 	if !modernShaped && (hasMethod || hasID) {
 		if c, st := b.currentChildEra(); !c.HasExited() && b.refuseLegacyRequest(w, parsed, st) {
 			return
@@ -1414,11 +1415,11 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	child, st := b.currentChildEra()
-	// A child known to take only modern requests is given nothing 2025-style:
-	// not initialize or any other request, nor a notification or a client
-	// response (this revision defines no client notifications over HTTP and
-	// forbids client responses). A dead child's verdict does not count: it
-	// gets the "not running" answer below.
+	// Once the bridge refuses 2025 traffic for the child, the child is given
+	// nothing 2025-style: not initialize or any other request, nor a
+	// notification or a client response (this revision defines no client
+	// notifications over HTTP and forbids client responses). A dead child's
+	// verdict does not count: it gets the "not running" answer below.
 	if !modernShaped && (hasMethod || hasID) && !child.HasExited() && b.refuseLegacyRequest(w, parsed, st) {
 		return
 	}

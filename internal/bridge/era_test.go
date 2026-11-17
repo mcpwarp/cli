@@ -231,14 +231,15 @@ const (
 )
 
 // debugCall round-trips one of the fake's debug/* methods in whatever shape
-// the bridge will currently take: modern-shaped for a child known to be
-// modern-only, otherwise 2025-style, carrying the session id if one exists.
+// the bridge will currently take: modern-shaped once the bridge refuses 2025
+// traffic for the child, otherwise 2025-style, carrying the session id if one
+// exists.
 // It returns the answer's result.
 func debugCall(t *testing.T, b *Bridge, method string, params map[string]any) map[string]any {
 	t.Helper()
 	var body map[string]any
 	hdr := map[string]string{}
-	if b.eraModernOnly() {
+	if b.eraRefusesLegacy() {
 		body = modernBody(1, method, params, nil)
 	} else {
 		body = map[string]any{"jsonrpc": "2.0", "id": 1, "method": method}
@@ -312,7 +313,7 @@ func TestEraState_Transitions(t *testing.T) {
 			t.Fatalf("modern call: %d %s", r.status, r.body)
 		}
 		expect("modern")
-		only := b.eraModernOnly()
+		only := b.eraRefusesLegacy()
 		if only {
 			t.Fatal("a dual-era child must not be modern-only")
 		}
@@ -338,11 +339,27 @@ func TestEraState_Transitions(t *testing.T) {
 		if got := eraName(b); got != "modern" {
 			t.Fatalf("era = %q, want modern", got)
 		}
-		only := b.eraModernOnly()
-		if !only {
-			t.Fatal("expected modern-only")
+		// The probe answer alone does not make the bridge refuse 2025 traffic;
+		// the child's own rejection of a forwarded initialize does.
+		if b.eraRefusesLegacy() {
+			t.Fatal("refusing 2025 traffic on a probe answer alone")
+		}
+		if r := eraPost(t, b, acceptJSON, eraInitialize(2).body, nil); r.status != 400 || strings.Contains(r.body, "only speaks") {
+			t.Fatalf("initialize: %d %s", r.status, r.body)
+		}
+		if !b.eraRefusesLegacy() {
+			t.Fatal("not refusing 2025 traffic after the child rejected initialize")
 		}
 	})
+}
+
+// makeRefusing has b's modern child reject a forwarded initialize, so the
+// bridge refuses later 2025 traffic itself.
+func makeRefusing(t *testing.T, b *Bridge) {
+	t.Helper()
+	if r := eraPost(t, b, acceptJSON, eraInitialize(900).body, nil); r.status != 400 || !b.eraRefusesLegacy() {
+		t.Fatalf("setup: initialize %d %s, refuses %v", r.status, r.body, b.eraRefusesLegacy())
+	}
 }
 
 func shortProbe(o *StartBridgeOptions) { o.ProbeTimeout = 200 * time.Millisecond }
@@ -990,15 +1007,15 @@ func TestEraLegacyChildRejectingOneInitializeIsNotLockedOut(t *testing.T) {
 			if bad.header.Get("Mcp-Session-Id") != "" || sessionMinted(b) {
 				t.Fatalf("%s %s: session from a rejected initialize", accept, code)
 			}
-			if b.eraModernOnly() {
+			if b.eraRefusesLegacy() {
 				t.Fatalf("%s %s: a single rejection with no version list must not read as modern-only", accept, code)
 			}
 			if code != "-32602" {
 				// Modern-looking, so a background probe starts; the legacy
 				// child's own answer makes the verdict explicit.
 				waitFor(t, "the background probe's legacy answer", func() bool { return eraName(b) == "legacy" })
-				if b.eraModernOnly() || verdictSourceOf(b) != srcProbe {
-					t.Fatalf("%s %s: modernOnly=%v src=%v after the probe", accept, code, b.eraModernOnly(), verdictSourceOf(b))
+				if b.eraRefusesLegacy() || verdictSourceOf(b) != srcProbe {
+					t.Fatalf("%s %s: refuses2025=%v src=%v after the probe", accept, code, b.eraRefusesLegacy(), verdictSourceOf(b))
 				}
 			} else if probeInFlight(b) || eraName(b) != "unknown" {
 				t.Fatalf("%s %s: a bad-params rejection started a probe or set a verdict: era=%q", accept, code, eraName(b))
@@ -1019,7 +1036,7 @@ func TestEraInitializeRejectionWithModernEvidenceIsCached(t *testing.T) {
 	// so only the rejection itself can have set what is seen here.
 	b := startEraBridge(t, nil, "--era=legacy-silent")
 	completeRejected(b, initRejection(-32601, "2026-07-28"))
-	if got := eraName(b); got != "modern" || !b.eraModernOnly() {
+	if got := eraName(b); got != "modern" || !b.eraRefusesLegacy() {
 		t.Fatalf("era = %q", got)
 	}
 	// An explicit legacy answer is not overwritten by a rejection's say-so.
@@ -1053,7 +1070,7 @@ func TestEraInitializeRejectionOverwritesTimeoutVerdictOnly(t *testing.T) {
 			if r.status != 400 || !strings.Contains(r.body, `"supported":["2026-07-28"]`) {
 				t.Fatalf("initialize: %d %s", r.status, r.body)
 			}
-			if got := eraName(b); got != "modern" || !b.eraModernOnly() {
+			if got := eraName(b); got != "modern" || !b.eraRefusesLegacy() {
 				t.Fatalf("modern evidence did not overwrite the timeout verdict: era = %q", got)
 			}
 		})
@@ -1066,7 +1083,7 @@ func TestEraInitializeRejectionOverwritesTimeoutVerdictOnly(t *testing.T) {
 			if r.status != 400 {
 				t.Fatalf("initialize: %d %s", r.status, r.body)
 			}
-			if got := eraName(b); got != "legacy" || b.eraModernOnly() {
+			if got := eraName(b); got != "legacy" || b.eraRefusesLegacy() {
 				t.Fatalf("an explicit legacy verdict was overwritten: era = %q", got)
 			}
 		})
@@ -1098,8 +1115,8 @@ func TestEraInitializeRejectionStartsProbeWithoutWaiting(t *testing.T) {
 		// Its answer applies with the usual precedence (dual lists both).
 		releaseDirect(t, b)
 		waitFor(t, "the probe's answer", func() bool { return eraName(b) == "modern" })
-		if b.eraModernOnly() || verdictSourceOf(b) != srcProbe {
-			t.Fatalf("%s: modernOnly=%v src=%v", accept, b.eraModernOnly(), verdictSourceOf(b))
+		if b.eraRefusesLegacy() || verdictSourceOf(b) != srcProbe {
+			t.Fatalf("%s: refuses2025=%v src=%v", accept, b.eraRefusesLegacy(), verdictSourceOf(b))
 		}
 	}
 
@@ -1166,7 +1183,7 @@ func TestEraVerdictPrecedence(t *testing.T) {
 		if r := eraPost(t, b, acceptJSON, eraInitialize(1).body, nil); r.status != 400 {
 			t.Fatalf("initialize: %d %s", r.status, r.body)
 		}
-		if !b.eraModernOnly() || verdictSourceOf(b) != srcRejection {
+		if !b.eraRefusesLegacy() || verdictSourceOf(b) != srcRejection {
 			t.Fatalf("setup: era=%q src=%v", eraName(b), verdictSourceOf(b))
 		}
 		if r := eraPost(t, b, acceptJSON, eraInitialize(2).body, nil); r.status != 400 || !strings.Contains(r.body, "initialize is not supported") || !strings.Contains(r.body, `"code":-32600`) {
@@ -1178,8 +1195,8 @@ func TestEraVerdictPrecedence(t *testing.T) {
 		if r := eraPost(t, b, acceptJSON, modernCall(3), nil); r.status != 200 {
 			t.Fatalf("modern call: %d %s", r.status, r.body)
 		}
-		if b.eraModernOnly() || verdictSourceOf(b) != srcProbe {
-			t.Fatalf("probe did not outrank the rejection: modernOnly=%v src=%v", b.eraModernOnly(), verdictSourceOf(b))
+		if b.eraRefusesLegacy() || verdictSourceOf(b) != srcProbe {
+			t.Fatalf("probe did not outrank the rejection: refuses2025=%v src=%v", b.eraRefusesLegacy(), verdictSourceOf(b))
 		}
 		if r := eraPost(t, b, acceptJSON, eraInitialize(4).body, nil); r.status != 200 || r.header.Get("Mcp-Session-Id") == "" {
 			t.Fatalf("2025 traffic still locked out of a dual-era child: %d %s", r.status, r.body)
@@ -1197,12 +1214,12 @@ func TestEraVerdictPrecedence(t *testing.T) {
 		}
 		// The probe times out: a timeout never overrides the rejection.
 		timeOutProbeByHand(t, b)
-		if !b.eraModernOnly() || verdictSourceOf(b) != srcRejection {
+		if !b.eraRefusesLegacy() || verdictSourceOf(b) != srcRejection {
 			t.Fatalf("a timeout overwrote the rejection verdict: era=%q src=%v", eraName(b), verdictSourceOf(b))
 		}
 		releaseHeld(t, b)
-		if b.eraModernOnly() || verdictSourceOf(b) != srcProbe {
-			t.Fatalf("late answer did not outrank the rejection: modernOnly=%v src=%v", b.eraModernOnly(), verdictSourceOf(b))
+		if b.eraRefusesLegacy() || verdictSourceOf(b) != srcProbe {
+			t.Fatalf("late answer did not outrank the rejection: refuses2025=%v src=%v", b.eraRefusesLegacy(), verdictSourceOf(b))
 		}
 	})
 	t.Run("probe answer overwrites a timeout, rejection overwrites a timeout only", func(t *testing.T) {
@@ -1405,24 +1422,39 @@ func TestEraProbe_ClientDisconnectDuringProbe(t *testing.T) {
 	}
 }
 
-func TestEra_GetAndDeleteAre405OnModernOnlyChild(t *testing.T) {
+func TestEra_GetAndDeleteAre405OnceRefusing2025Traffic(t *testing.T) {
 	b := startEraBridge(t, nil, "--era=modern")
 	if r := eraPost(t, b, acceptJSON, modernCall(1), nil); r.status != 200 {
 		t.Fatalf("modern call: %d %s", r.status, r.body)
 	}
-
-	get, _ := http.NewRequest(http.MethodGet, b.URL(), nil)
-	get.Header.Set("Accept", "text/event-stream")
-	del, _ := http.NewRequest(http.MethodDelete, b.URL(), nil)
-	for _, req := range []*http.Request{get, del} {
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
+	statuses := func() (int, int, string) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		get, _ := http.NewRequestWithContext(ctx, http.MethodGet, b.URL(), nil)
+		get.Header.Set("Accept", "text/event-stream")
+		del, _ := http.NewRequestWithContext(ctx, http.MethodDelete, b.URL(), nil)
+		var codes [2]int
+		allow := ""
+		for i, req := range []*http.Request{get, del} {
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			codes[i] = resp.StatusCode
+			if i == 0 {
+				allow = resp.Header.Get("Allow")
+			}
 		}
-		resp.Body.Close()
-		if resp.StatusCode != 405 || resp.Header.Get("Allow") != "POST" {
-			t.Errorf("%s: status %d, Allow %q", req.Method, resp.StatusCode, resp.Header.Get("Allow"))
-		}
+		return codes[0], codes[1], allow
+	}
+	// A probe answer alone does not rule out a dual-era child.
+	if g, d, _ := statuses(); g == 405 || d == 405 {
+		t.Fatalf("405 on a probe answer alone: GET %d, DELETE %d", g, d)
+	}
+	makeRefusing(t, b)
+	if g, d, allow := statuses(); g != 405 || d != 405 || allow != "POST" {
+		t.Fatalf("after the child rejected initialize: GET %d, DELETE %d, Allow %q", g, d, allow)
 	}
 }
 
@@ -1490,14 +1522,12 @@ func TestEra_NoSessionAfterFailedInitialize(t *testing.T) {
 	}
 }
 
-func TestEra_LegacyShapedTrafficToModernOnlyChildIsRefused(t *testing.T) {
+func TestEra_LegacyShapedTrafficIsRefusedOnceRefusing2025Traffic(t *testing.T) {
 	b := startEraBridge(t, nil, "--era=modern")
 	if r := eraPost(t, b, acceptJSON, modernCall(1), nil); r.status != 200 {
 		t.Fatalf("modern call: %d %s", r.status, r.body)
 	}
-	if !b.eraModernOnly() {
-		t.Fatal("setup: the child should be known modern-only")
-	}
+	makeRefusing(t, b)
 	before := forwardedCount(t, b)
 
 	call := func(id int) map[string]any {
@@ -1548,9 +1578,11 @@ func TestEra_LegacyShapedTrafficToModernOnlyChildIsRefused(t *testing.T) {
 	}
 }
 
-// Until the child is known modern-only, 2025-style requests go through, and
-// that includes a verdict that is only a probe timeout.
-func TestEra_LegacyShapedRequestsForwardUntilModernOnlyIsKnown(t *testing.T) {
+// Until the child has rejected a forwarded initialize with modern evidence,
+// 2025-style requests go through: with no verdict, with a verdict that is
+// only a probe timeout, and with a probe answer listing only the modern
+// version.
+func TestEra_LegacyShapedRequestsForwardUntilRefusing2025Traffic(t *testing.T) {
 	b := startEraBridge(t, shortProbe, "--era=modern", "--discover-hold")
 	ping := map[string]any{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": map[string]any{"name": "echo"}}
 	forwarded := func(what string) {
@@ -1571,11 +1603,16 @@ func TestEra_LegacyShapedRequestsForwardUntilModernOnlyIsKnown(t *testing.T) {
 	forwarded("verdict is a probe timeout")
 
 	releaseHeld(t, b)
-	if !b.eraModernOnly() {
-		t.Fatal("late answer should have made the child modern-only")
+	if eraName(b) != "modern" || b.eraRefusesLegacy() {
+		t.Fatalf("after the late answer: era=%q refuses=%v", eraName(b), b.eraRefusesLegacy())
 	}
+	forwarded("verdict is a probe answer listing only the modern version")
+
+	// The child's own rejection of a forwarded initialize completes the
+	// evidence.
+	makeRefusing(t, b)
 	if r := eraPost(t, b, acceptJSON, ping, nil); r.status != 400 || !strings.Contains(r.body, `"supported":["2026-07-28"]`) {
-		t.Fatalf("once modern-only: %d %s", r.status, r.body)
+		t.Fatalf("once refusing: %d %s", r.status, r.body)
 	}
 }
 
@@ -1806,7 +1843,7 @@ func TestEra_ConcurrentInitializesWithDifferentOutcomes(t *testing.T) {
 			// The rejection's background probe may land before or after the
 			// accepted answer: either the initialized child's own legacy
 			// answer or a pre-initialize one that cached nothing.
-			if got := eraName(b); (got != "legacy-capable" && got != "legacy") || b.eraModernOnly() {
+			if got := eraName(b); (got != "legacy-capable" && got != "legacy") || b.eraRefusesLegacy() {
 				t.Fatalf("era = %q", got)
 			}
 		})
@@ -2145,6 +2182,24 @@ func TestEraInitializeRejectionEvidence(t *testing.T) {
 			t.Errorf("%s: got %v, %v; want %v, %v", c.name, cls, got, c.looksModern, c.wantEvidence)
 		}
 	}
+	// A valid list naming a 2025-era version says the child takes initialize,
+	// whatever the code; an empty or invalid list does not.
+	for _, c := range []struct {
+		name string
+		msg  map[string]any
+		want rejectionClass
+	}{
+		{"-32602 listing a legacy version", rej(-32602, "2025-06-18", "2026-07-28"), rejLegacyListed},
+		{"-32601 listing a legacy version too", rej(-32601, "2026-07-28", "2025-11-25"), rejLegacyListed},
+		{"-32022 listing only a legacy version", rej(-32022, "2025-11-25"), rejLegacyListed},
+		{"-32601 with an empty list", rej(-32601, []any{}...), rejMixed},
+		{"-32601 with a non-string entry", rej(-32601, "2025-11-25", 7.0), rejMixed},
+		{"-32601 with a modern-only list", rej(-32601, "2026-07-28"), rejModernOnly},
+	} {
+		if cls, _ := classifyInitializeRejection(c.msg); cls != c.want {
+			t.Errorf("%s: class %v, want %v", c.name, cls, c.want)
+		}
+	}
 
 	// A bare -32601 goes back to the client unchanged and caches nothing, so
 	// 2025 traffic is still forwarded; the probe it starts is what decides.
@@ -2153,7 +2208,7 @@ func TestEraInitializeRejectionEvidence(t *testing.T) {
 	if r.status != 400 || !strings.Contains(r.body, `"code":-32601`) || !strings.Contains(r.body, "bad initialize") || strings.Contains(r.body, "supported") {
 		t.Fatalf("rejection: %d %s", r.status, r.body)
 	}
-	if b.eraModernOnly() || eraName(b) != "unknown" {
+	if b.eraRefusesLegacy() || eraName(b) != "unknown" {
 		t.Fatalf("a bare -32601 cached a verdict: era=%q src=%v", eraName(b), verdictSourceOf(b))
 	}
 	before := forwardedCount(t, b)
@@ -2166,7 +2221,7 @@ func TestEraInitializeRejectionEvidence(t *testing.T) {
 	// The probe's DiscoverResult lists both versions: dual-era, not modern-only.
 	releaseDirect(t, b)
 	waitFor(t, "the probe's answer", func() bool { return verdictSourceOf(b) == srcProbe })
-	if b.eraModernOnly() {
+	if b.eraRefusesLegacy() {
 		t.Fatal("a dual-era probe answer reads as modern-only")
 	}
 	if r := eraPost(t, b, acceptJSON, eraInitialize(3).body, nil); r.status != 200 || r.header.Get("Mcp-Session-Id") == "" {
@@ -2203,12 +2258,12 @@ func TestEraRejectionEvidenceWhileProbeInFlight(t *testing.T) {
 		if r := <-res; r.status != 200 {
 			t.Fatalf("waiter: %d %s", r.status, r.body)
 		}
-		if !b.eraModernOnly() || verdictSourceOf(b) != srcRejection {
-			t.Fatalf("modernOnly=%v src=%v after the timeout", b.eraModernOnly(), verdictSourceOf(b))
+		if !b.eraRefusesLegacy() || verdictSourceOf(b) != srcRejection {
+			t.Fatalf("refuses2025=%v src=%v after the timeout", b.eraRefusesLegacy(), verdictSourceOf(b))
 		}
 		releaseDirect(t, b)
 		waitFor(t, "the late answer", func() bool { return verdictSourceOf(b) == srcProbe })
-		if b.eraModernOnly() {
+		if b.eraRefusesLegacy() {
 			t.Fatal("the late probe answer (both versions) did not outrank the rejection")
 		}
 	})
@@ -2242,7 +2297,7 @@ func TestEraModernChildRejectingInitializeWithoutSupported(t *testing.T) {
 		if sessionMinted(b) {
 			t.Fatalf("%s: session from a rejected initialize", accept)
 		}
-		if b.eraModernOnly() || eraName(b) != "unknown" {
+		if b.eraRefusesLegacy() || eraName(b) != "unknown" {
 			t.Fatalf("%s: the bare rejection cached a verdict: %q", accept, eraName(b))
 		}
 		// Not refused while the probe is out: initialize keeps being forwarded.
@@ -2255,8 +2310,8 @@ func TestEraModernChildRejectingInitializeWithoutSupported(t *testing.T) {
 		if n := discoverCount(t, b); n != 1 {
 			t.Fatalf("%s: child saw %d probes, want 1", accept, n)
 		}
-		// The probe's own list makes it modern-only: the next one is the
-		// bridge's own refusal.
+		// The probe's own list completes the evidence the bare rejections
+		// started: the next initialize gets the bridge's own refusal.
 		r = eraPost(t, b, accept, eraInitialize(3).body, nil)
 		if r.status != 400 || !strings.Contains(r.body, `"code":-32600`) || !strings.Contains(r.body, `"supported":["2026-07-28"]`) {
 			t.Fatalf("%s: initialize after the probe: %d %s", accept, r.status, r.body)
@@ -2398,13 +2453,13 @@ func TestEra_RejectedInitializeRacingTheHoldDeadlineLeavesNoSession(t *testing.T
 }
 
 // With the child dead and not respawned, a 2025-shaped request gets the
-// "not running" answer, not the modern-only refusal its stale verdict would
-// give.
-func TestEra_DeadChildIsNotRunningRatherThanModernOnlyRefusal(t *testing.T) {
+// "not running" answer, not the refusal its stale verdict would give.
+func TestEra_DeadChildIsNotRunningRatherThanRefused(t *testing.T) {
 	b := startEraBridge(t, nil, "--era=modern")
-	if r := eraPost(t, b, acceptJSON, modernCall(1), nil); r.status != 200 || !b.eraModernOnly() {
-		t.Fatalf("setup: %d %s, modern-only %v", r.status, r.body, b.eraModernOnly())
+	if r := eraPost(t, b, acceptJSON, modernCall(1), nil); r.status != 200 {
+		t.Fatalf("setup: %d %s", r.status, r.body)
 	}
+	makeRefusing(t, b)
 	child := b.GetCurrentChild()
 	_ = child.Close()
 	waitFor(t, "the child to exit", func() bool { return child.HasExited() })
@@ -2731,7 +2786,7 @@ func TestEraProbe_ModernLookingRejectionOnTimeoutVerdictStartsAProbe(t *testing.
 	if !probeInFlight(b) {
 		t.Fatal("no background probe was started")
 	}
-	if verdictSourceOf(b) != srcTimeout || b.eraModernOnly() {
+	if verdictSourceOf(b) != srcTimeout || b.eraRefusesLegacy() {
 		t.Fatalf("a bare rejection changed the verdict: src=%v", verdictSourceOf(b))
 	}
 }
@@ -2774,7 +2829,7 @@ func TestEraInitializeBareRejectionCachesNothing(t *testing.T) {
 					t.Fatalf("initialize %d: %d %s", i, r.status, r.body)
 				}
 			}
-			if eraName(b) != "unknown" || b.eraModernOnly() {
+			if eraName(b) != "unknown" || b.eraRefusesLegacy() {
 				t.Fatalf("cached a verdict: %q", eraName(b))
 			}
 			before := forwardedCount(t, b)
@@ -2807,7 +2862,7 @@ func TestEraInitializeBareRejectionCachesNothing(t *testing.T) {
 			if r := <-res; r.status != 200 {
 				t.Fatalf("modern request: %d %s", r.status, r.body)
 			}
-			if !b.eraModernOnly() || verdictSourceOf(b) != srcProbe {
+			if !b.eraRefusesLegacy() || verdictSourceOf(b) != srcProbe {
 				t.Fatalf("the probe did not settle the verdict: src=%v", verdictSourceOf(b))
 			}
 		})
@@ -2825,7 +2880,7 @@ func TestEraInitializeRejectionVersionEvidence(t *testing.T) {
 		if rec.Code != 400 || !strings.Contains(rec.Body.String(), `"message":"nope"`) {
 			t.Fatalf("%d %s", rec.Code, rec.Body.String())
 		}
-		if !b.eraModernOnly() || verdictSourceOf(b) != srcRejection {
+		if !b.eraRefusesLegacy() || verdictSourceOf(b) != srcRejection {
 			t.Fatalf("not cached: src=%v", verdictSourceOf(b))
 		}
 		r := eraPost(t, b, acceptJSON, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "ping"}, nil)
@@ -2859,7 +2914,7 @@ func TestEraInitializeRejectionVersionEvidence(t *testing.T) {
 			t.Fatalf("initialize: %d %s", r.status, r.body)
 		}
 		completeRejected(b, initRejection(-32601, "2026-07-28"))
-		if b.eraModernOnly() || verdictSourceOf(b) == srcRejection {
+		if b.eraRefusesLegacy() || verdictSourceOf(b) == srcRejection {
 			t.Fatalf("evidence after an accepted initialize was used: src=%v", verdictSourceOf(b))
 		}
 		if r := eraPost(t, b, acceptJSON, eraInitialize(2).body, nil); r.status != 200 || r.header.Get("Mcp-Session-Id") == "" {
@@ -2880,7 +2935,7 @@ func TestEraSilentLegacyChildRejectingOneInitializeIsNotLockedOut(t *testing.T) 
 		timedOut, _ := probeTimedOutVerdict(b)
 		return timedOut
 	})
-	if b.eraModernOnly() {
+	if b.eraRefusesLegacy() {
 		t.Fatal("locked out")
 	}
 	if good := eraPost(t, b, acceptJSON, eraInitialize(2).body, nil); good.status != 200 || good.header.Get("Mcp-Session-Id") == "" {
@@ -2905,8 +2960,8 @@ func TestEraProbe_ModernChildDiscardingFirstProbeIsFoundByReprobe(t *testing.T) 
 		t.Fatalf("second initialize: %d %s", r.status, r.body)
 	}
 	waitFor(t, "the re-probe's answer", func() bool { return eraName(b) == "modern" })
-	if !b.eraModernOnly() || verdictSourceOf(b) != srcProbe {
-		t.Fatalf("modernOnly=%v src=%v", b.eraModernOnly(), verdictSourceOf(b))
+	if !b.eraRefusesLegacy() || verdictSourceOf(b) != srcProbe {
+		t.Fatalf("refuses2025=%v src=%v", b.eraRefusesLegacy(), verdictSourceOf(b))
 	}
 	if r := eraPost(t, b, acceptJSON, eraInitialize(3).body, nil); r.status != 400 || !strings.Contains(r.body, `"supported":["2026-07-28"]`) || !strings.Contains(r.body, "only speaks") {
 		t.Fatalf("initialize once known: %d %s", r.status, r.body)

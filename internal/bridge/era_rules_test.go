@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -215,7 +216,7 @@ func TestEraProbe_SoftRecheckAnswersOnARejectionVerdictBackOff(t *testing.T) {
 		t.Run(via, func(t *testing.T) {
 			t.Parallel()
 			b := startEraBridge(t, backoffOpts, "--era=modern", "--discover-error=-32602:1000000")
-			if r := eraPost(t, b, acceptJSON, eraInitialize(1).body, nil); r.status != 400 || !b.eraModernOnly() || verdictSourceOf(b) != srcRejection {
+			if r := eraPost(t, b, acceptJSON, eraInitialize(1).body, nil); r.status != 400 || !b.eraRefusesLegacy() || verdictSourceOf(b) != srcRejection {
 				t.Fatalf("setup: %d %s src=%v", r.status, r.body, verdictSourceOf(b))
 			}
 			start := time.Now()
@@ -260,12 +261,12 @@ func TestEra_RejectionVerdictIsRecheckedByLaterTraffic(t *testing.T) {
 				t.Fatalf("setup: %d %s src=%v", r.status, r.body, verdictSourceOf(b))
 			}
 			// The odd rejection lists only 2026-07-28; its check probe is dropped too.
-			if r := eraPost(t, b, acceptJSON, eraInitialize(2).body, nil); r.status != 400 || !b.eraModernOnly() {
-				t.Fatalf("rejection: %d %s modernOnly=%v", r.status, r.body, b.eraModernOnly())
+			if r := eraPost(t, b, acceptJSON, eraInitialize(2).body, nil); r.status != 400 || !b.eraRefusesLegacy() {
+				t.Fatalf("rejection: %d %s refuses2025=%v", r.status, r.body, b.eraRefusesLegacy())
 			}
 			waitFor(t, "the check probe to time out", func() bool { return !probeInFlight(b) && len(outstandingProbes(b)) == 2 })
-			if !b.eraModernOnly() || verdictSourceOf(b) != srcRejection {
-				t.Fatalf("after the unanswered check: modernOnly=%v src=%v", b.eraModernOnly(), verdictSourceOf(b))
+			if !b.eraRefusesLegacy() || verdictSourceOf(b) != srcRejection {
+				t.Fatalf("after the unanswered check: refuses2025=%v src=%v", b.eraRefusesLegacy(), verdictSourceOf(b))
 			}
 
 			waitReprobeDue(t, b)
@@ -283,7 +284,7 @@ func TestEra_RejectionVerdictIsRecheckedByLaterTraffic(t *testing.T) {
 			}
 			releaseDirect(t, b)
 			waitFor(t, "the re-check's dual-era answer", func() bool { return verdictSourceOf(b) == srcProbe })
-			if b.eraModernOnly() {
+			if b.eraRefusesLegacy() {
 				t.Fatal("the dual-era answer left the child modern-only")
 			}
 			if r := eraPost(t, b, acceptJSON, eraInitialize(5).body, nil); r.status != 200 || r.header.Get("Mcp-Session-Id") == "" {
@@ -434,5 +435,89 @@ func TestEraProbe_SoftLegacyBackoffUnderSteadyTraffic(t *testing.T) {
 	}
 	if n := discoverCount(t, b); n > backoffMax || n < 3 {
 		t.Fatalf("child saw %d probes in %s, want 3..%d", n, backoffRun, backoffMax)
+	}
+}
+
+// A dual-era child that answers server/discover with only the modern version
+// (as dual-era SDK servers do until their era is locked) still takes a 2025
+// client: after a 2026 request has probed it, a 2025 initialize is forwarded
+// and gets a session, GET opens the 2025 stream, and a 2025 request works.
+func TestEra_ProbeAnswerAloneDoesNotRefuse2025Traffic(t *testing.T) {
+	b := startEraBridge(t, nil, "--era=dual", "--discover-modern-version-only")
+	if r := eraPost(t, b, acceptJSON, modernCall(1), nil); r.status != 200 {
+		t.Fatalf("modern call: %d %s", r.status, r.body)
+	}
+	b.mu.Lock()
+	versions := strings.Join(b.era.m.verdict.versions, ",")
+	b.mu.Unlock()
+	if eraName(b) != "modern" || versions != eraTestVersion || b.eraRefusesLegacy() {
+		t.Fatalf("setup: era=%q versions=%q refuses=%v", eraName(b), versions, b.eraRefusesLegacy())
+	}
+
+	init := eraPost(t, b, acceptJSON, eraInitialize(2).body, nil)
+	sid := init.header.Get("Mcp-Session-Id")
+	if init.status != 200 || sid == "" || !strings.Contains(init.body, `"protocolVersion":"2025-11-25"`) {
+		t.Fatalf("initialize: %d %s", init.status, init.body)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	get, _ := http.NewRequestWithContext(ctx, http.MethodGet, b.URL(), nil)
+	get.Header.Set("Accept", "text/event-stream")
+	get.Header.Set("Mcp-Session-Id", sid)
+	resp, err := http.DefaultClient.Do(get)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET: %d", resp.StatusCode)
+	}
+
+	call := eraPost(t, b, acceptJSON, eraLegacyToolsCall(3).body, map[string]string{"Mcp-Session-Id": sid})
+	if call.status != 200 || !strings.Contains(call.body, "legacy:echo") {
+		t.Fatalf("2025 request: %d %s", call.status, call.body)
+	}
+
+	del, _ := http.NewRequest(http.MethodDelete, b.URL(), nil)
+	del.Header.Set("Mcp-Session-Id", sid)
+	dresp, err := http.DefaultClient.Do(del)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dresp.Body.Close()
+	if dresp.StatusCode == 405 {
+		t.Fatalf("DELETE: %d", dresp.StatusCode)
+	}
+}
+
+// The same child rejecting one initialize with a list that names a 2025-era
+// version (a 2025 server's unsupported-version error) has said it takes
+// initialize: that is no evidence for refusing 2025 traffic, and the next,
+// correct initialize is forwarded and gets a session.
+func TestEra_RejectionListingALegacyVersionDoesNotRefuse2025Traffic(t *testing.T) {
+	b := startEraBridge(t, nil, "--era=dual", "--discover-modern-version-only",
+		"--reject-initialize=1", "--reject-code=-32602", "--reject-legacy-list")
+	// The request waits for the probe, so its answer is the verdict by now:
+	// modern, listing only the modern version.
+	if r := eraPost(t, b, acceptJSON, modernCall(1), nil); r.status != 200 {
+		t.Fatalf("modern call: %d %s", r.status, r.body)
+	}
+	b.mu.Lock()
+	versions := strings.Join(b.era.m.verdict.versions, ",")
+	b.mu.Unlock()
+	if eraName(b) != "modern" || versions != eraTestVersion || b.eraRefusesLegacy() {
+		t.Fatalf("setup: era=%q versions=%q refuses=%v", eraName(b), versions, b.eraRefusesLegacy())
+	}
+	bad := eraPost(t, b, acceptJSON, eraInitialize(2).body, nil)
+	if bad.status != 400 || !strings.Contains(bad.body, `"supported":["2025-06-18","2026-07-28"]`) || strings.Contains(bad.body, "only speaks") {
+		t.Fatalf("rejected initialize: %d %s", bad.status, bad.body)
+	}
+	if b.eraRefusesLegacy() {
+		t.Fatal("refusing 2025 traffic after the child listed a 2025 version")
+	}
+	good := eraPost(t, b, acceptJSON, eraInitialize(3).body, nil)
+	if good.status != 200 || good.header.Get("Mcp-Session-Id") == "" {
+		t.Fatalf("second initialize: %d %s", good.status, good.body)
 	}
 }

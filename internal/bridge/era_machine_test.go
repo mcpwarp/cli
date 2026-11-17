@@ -65,6 +65,7 @@ func pre() mopt      { return func(m *eraMachine) { m.probe.pre = true } }
 func inited() mopt   { return func(m *eraMachine) { m.initOK = true } }
 func ended() mopt    { return func(m *eraMachine) { m.ended = true } }
 func wfail() mopt    { return func(m *eraMachine) { m.writeFailed = true } }
+func rejected() mopt { return func(m *eraMachine) { m.rejectedInit = true } }
 func streak(n int) mopt {
 	return func(m *eraMachine) { m.softStreak = n }
 }
@@ -417,6 +418,73 @@ func machineRows() []machineRow {
 	}
 }
 
+// When the bridge refuses 2025 traffic itself: only once this process has
+// rejected a forwarded initialize in a modern-looking way and there is
+// version evidence that it speaks only 2026-era versions, in either order.
+// A probe answer alone never does it.
+func TestEraMachineRefusesLegacy(t *testing.T) {
+	probe := func(o probeOutcome, s float64, v ...string) []eraEvent {
+		return []eraEvent{wrote(1, s), ans(1, o, s, v...)}
+	}
+	cat := func(parts ...[]eraEvent) []eraEvent {
+		var out []eraEvent
+		for _, p := range parts {
+			out = append(out, p...)
+		}
+		return out
+	}
+	one := func(ev eraEvent) []eraEvent { return []eraEvent{ev} }
+	rows := []struct {
+		name     string
+		events   []eraEvent
+		versions string // "" when 2025 traffic is forwarded
+	}{
+		{"probe answer with only the modern version: forwarded", cat(one(req(0)), probe(probeModern, 1, vNew)), ""},
+		{"probe answer, then a bare rejection: refused", cat(one(req(0)), probe(probeModern, 1, vNew), one(rej(rejBare, 2))), vNew},
+		{"bare rejection, then the probe answer: refused", cat(one(rej(rejBare, 0)), probe(probeModern, 1, vNew)), vNew},
+		{"bare rejection, no probe answer yet: forwarded", one(rej(rejBare, 0)), ""},
+		{"invalid list, then a probe answer with only the modern version: refused", cat(one(rej(rejMixed, 0)), probe(probeModern, 1, vNew)), vNew},
+		{"list naming a legacy version, then a probe answer with only the modern version: forwarded", cat(one(rej(rejLegacyListed, 0)), probe(probeModern, 1, vNew)), ""},
+		{"probe answer with only the modern version, then a list naming a legacy version: forwarded", cat(one(req(0)), probe(probeModern, 1, vNew), one(rej(rejLegacyListed, 2))), ""},
+		{"bare rejection, then a list naming a legacy version, then the probe answer: forwarded", cat(one(rej(rejBare, 0)), one(rej(rejLegacyListed, 0.5)), probe(probeModern, 1, vNew)), ""},
+		{"modern-only list, then a list naming a legacy version (an initialize already in flight): forwarded", cat(one(rej(rejModernOnly, 0, vNew)), one(rej(rejLegacyListed, 0.5))), ""},
+		{"list naming a legacy version, then a bare rejection, then the probe answer: refused", cat(one(rej(rejLegacyListed, 0)), one(rej(rejBare, 0.5)), probe(probeModern, 1, vNew)), vNew},
+		{"rejection with a modern-only list, no probe answer: refused", one(rej(rejModernOnly, 0, "2027-01-01")), "2027-01-01"},
+		{"probe answer listing a legacy version, then a bare rejection: forwarded", cat(one(req(0)), probe(probeModern, 1, vNew, vOld), one(rej(rejBare, 2))), ""},
+		{"probe answer listing a legacy version clears a refusal", cat(one(rej(rejModernOnly, 0, vNew)), probe(probeModern, 1, vNew, vOld)), ""},
+		{"explicit legacy probe answer clears a refusal", cat(one(rej(rejModernOnly, 0, vNew)), probe(probeLegacy, 1)), ""},
+		{"re-check answering only the modern version keeps the refusal", cat(one(rej(rejModernOnly, 0, vNew)), probe(probeModern, 1, vNew)), vNew},
+		{"re-check answering modern without versions keeps the refusal", cat(one(rej(rejModernOnly, 0, vNew)), probe(probeModern, 1)), vNew},
+		{"an accepted initialize clears a refusal", cat(one(req(0)), probe(probeModern, 1, vNew), one(rej(rejBare, 2)), one(initAcc(vOld))), ""},
+		{"no refusal after an accepted initialize", cat(one(initAcc(vOld)), one(rej(rejModernOnly, 1, vNew))), ""},
+		{"a not-modern-looking rejection counts for nothing", cat(one(req(0)), probe(probeModern, 1, vNew), one(rej(rejNotModern, 2))), ""},
+	}
+	for _, r := range rows {
+		m := mach()
+		for _, ev := range r.events {
+			m, _ = m.apply(ev)
+		}
+		versions, refuses := m.refusesLegacy()
+		if got := strings.Join(versions, ","); refuses != (r.versions != "") || got != r.versions {
+			t.Errorf("%s: refuses=%v versions=%q, want %q (%s)", r.name, refuses, got, r.versions, describe(m))
+		}
+	}
+
+	// A refusal on the child's own final answer is not re-checked by refused
+	// traffic; one resting on a rejection's list is.
+	m := mach()
+	for _, ev := range cat(one(rej(rejModernOnly, 0, vNew)), probe(probeModern, 1, vNew)) {
+		m, _ = m.apply(ev)
+	}
+	if _, eff := m.apply(refused(1000)); eff.start != "" {
+		t.Errorf("a refusal on a final probe answer was re-checked: %s", describe(m))
+	}
+	m = with(sRejection, rejected())
+	if _, eff := m.apply(refused(1000)); eff.start == "" {
+		t.Errorf("a refusal on a rejection's list was not re-checked: %s", describe(m))
+	}
+}
+
 func TestEraMachineTable(t *testing.T) {
 	for _, r := range machineRows() {
 		before := describe(r.from)
@@ -525,6 +593,10 @@ func TestEraMachineInvariants(t *testing.T) {
 		"soft+writing":        with(sSoft, streak(2), pr(probeWriting, 2, 20)),
 		"soft+unsent":         with(sSoft, streak(2), pr(probeUnsent, 2, 20)),
 		"write failed":        mach(seq(1), quiet(15), wfail()),
+		"rejection refusing":  with(sRejection, rejected()),
+		"probe-only modern":   sModernOnly,
+		"modern refusing":     with(sModernOnly, rejected()),
+		"rejected, probe out": with(sWritten, rejected()),
 		"written+wfail":       with(sWritten, wfail()),
 		"borrowed+written":    with(sBorrowed, pr(probeWritten, 2, 30)),
 		"borrowed+unsent":     with(sBorrowed, pr(probeUnsent, 2, 30)),
@@ -542,7 +614,7 @@ func TestEraMachineInvariants(t *testing.T) {
 			}
 			events = append(events, timer(n, s), wrote(n, s), writeFailed(n, s))
 		}
-		for _, c := range []rejectionClass{rejNotModern, rejBare, rejMixed} {
+		for _, c := range []rejectionClass{rejNotModern, rejBare, rejMixed, rejLegacyListed} {
 			events = append(events, rej(c, s))
 		}
 		events = append(events, rej(rejModernOnly, s, vNew))
@@ -633,6 +705,12 @@ func TestEraMachineInvariants(t *testing.T) {
 			}
 			if next.verdict.kind == verdictRejection && !onlyModernVersions(next.verdict.versions) {
 				fail("a rejection verdict without modern-only versions")
+			}
+			if _, refuses := next.refusesLegacy(); refuses && (!next.rejectedInit || next.initOK) {
+				fail("refuses 2025 traffic without a rejected forwarded initialize, or after an accepted one")
+			}
+			if _, refuses := next.refusesLegacy(); refuses && !(m.rejectedInit || ev.kind == evInitRejected) {
+				fail("refuses 2025 traffic although no initialize was ever rejected")
 			}
 			if next.verdict.final() && len(next.outstanding) > len(m.outstanding) {
 				fail("outstanding ids added under a probe answer")
@@ -802,7 +880,7 @@ func TestEraMachineProbeStartsAreSpaced(t *testing.T) {
 			case 4:
 				feed(eraEvent{kind: evLegacyRefused})
 			case 5:
-				cls := []rejectionClass{rejNotModern, rejBare, rejMixed, rejModernOnly}[rng.Intn(4)]
+				cls := []rejectionClass{rejNotModern, rejBare, rejMixed, rejModernOnly, rejLegacyListed}[rng.Intn(5)]
 				var v []string
 				if cls == rejModernOnly {
 					v = []string{vNew}

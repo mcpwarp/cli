@@ -130,6 +130,10 @@ func main() {
 			modernBareInitializeRejection = true
 		case "--discover-no-versions":
 			discoverNoVersions = true
+		case "--discover-modern-version-only":
+			discoverModernOnly = true
+		case "--reject-legacy-list":
+			rejectLegacyList = true
 		case "--listen":
 			listenMode = true
 		case "--listen-no-ack":

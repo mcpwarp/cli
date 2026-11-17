@@ -207,17 +207,21 @@ func (b *Bridge) currentChildEra() (*StdioChild, *eraState) {
 	return b.child, b.era
 }
 
-func (b *Bridge) eraModernOnly() bool {
+// eraRefusesLegacy reports whether the bridge refuses 2025-style traffic for
+// the current process itself (eraMachine.refusesLegacy).
+func (b *Bridge) eraRefusesLegacy() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.era.m.verdict.modernOnly()
+	_, refuses := b.era.m.refusesLegacy()
+	return refuses
 }
 
-// modernOnlyVersions returns st's supported versions iff st is modern-only.
-func (b *Bridge) modernOnlyVersions(st *eraState) ([]string, bool) {
+// legacyRefusalVersions returns the versions to name in st's refusal of
+// 2025-style traffic, iff st refuses it.
+func (b *Bridge) legacyRefusalVersions(st *eraState) ([]string, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return st.m.modernOnlyVersions()
+	return st.m.refusesLegacy()
 }
 
 func (b *Bridge) legacyVersionOf(st *eraState) string {
@@ -406,7 +410,7 @@ func legacyChildError(id any, version string) map[string]any {
 }
 
 // legacyRequestRefusal is the 400 the bridge itself gives, without forwarding,
-// to any 2025-style request once the child is known modern-only; lead is what
+// to any 2025-style request once it refuses 2025 traffic for the child; lead is what
 // the client asked for that is refused.
 func legacyRequestRefusal(id any, lead string, supported []string) map[string]any {
 	msg := lead + ": this server only speaks MCP protocol version(s) " +
@@ -427,9 +431,11 @@ func jsonRPCErrorBody(id any, code int, message string, data any) map[string]any
 }
 
 // refuseLegacyRequest answers a 2025-style request with the 400 refusal if
-// the child is known to be modern-only, and reports whether it did.
+// the bridge refuses 2025 traffic for this process (eraMachine.refusesLegacy),
+// and reports whether it did. Otherwise the request, initialize included, is
+// forwarded and the child's own answer decides.
 func (b *Bridge) refuseLegacyRequest(w http.ResponseWriter, parsed map[string]any, st *eraState) bool {
-	supported, only := b.modernOnlyVersions(st)
+	supported, only := b.legacyRefusalVersions(st)
 	if !only {
 		return false
 	}
@@ -450,13 +456,14 @@ func (b *Bridge) refuseLegacyRequest(w http.ResponseWriter, parsed map[string]an
 	return true
 }
 
-// refuseStatelessMethod answers GET or DELETE with 405 if the current child is
-// known to be modern-only (the 2026-07-28 HTTP binding has no standalone
-// stream and no sessions to terminate), and reports whether it did.
+// refuseStatelessMethod answers GET or DELETE with 405 if the bridge refuses
+// 2025 traffic for the current process (the 2026-07-28 HTTP binding has no
+// standalone stream and no sessions to terminate), and reports whether it
+// did.
 func (b *Bridge) refuseStatelessMethod(w http.ResponseWriter) bool {
 	b.mu.Lock()
 	st := b.era
-	only := st.m.verdict.modernOnly()
+	_, only := st.m.refusesLegacy()
 	b.mu.Unlock()
 	if !only {
 		return false
@@ -538,8 +545,9 @@ func (b *Bridge) completeInitialize(entry *pendingEntry, msg map[string]any) {
 // classifyInitializeRejection sorts a rejected initialize. It looks modern
 // ("no initialize here") with code -32601 or -32022, or a data.supported array;
 // it is modern-only evidence only when data.supported is a non-empty list of
-// modern versions, returned as the second value. The bridge never makes up a
-// list.
+// modern versions, returned as the second value. A valid list naming a
+// 2025-era version says the child does take initialize, whatever the code:
+// rejLegacyListed. The bridge never makes up a list.
 func classifyInitializeRejection(msg map[string]any) (rejectionClass, []string) {
 	errObj, _ := isRecord(msg["error"])
 	data, _ := isRecord(errObj["data"])
@@ -553,8 +561,12 @@ func classifyInitializeRejection(msg map[string]any) (rejectionClass, []string) 
 	case !hasList:
 		return rejBare, nil
 	}
-	if list, ok := versionList(raw); ok && onlyModernVersions(list) {
+	list, ok := versionList(raw)
+	switch {
+	case ok && onlyModernVersions(list):
 		return rejModernOnly, list
+	case ok && len(list) > 0:
+		return rejLegacyListed, nil
 	}
 	return rejMixed, nil
 }

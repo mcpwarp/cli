@@ -80,6 +80,14 @@ var (
 	discoverErrorCode  int
 	discoverErrorCount int
 	discoverNoVersions bool
+	// discoverModernOnly (--discover-modern-version-only) lists only the
+	// modern version in the DiscoverResult, as dual-era servers that have
+	// not locked their era do; initialize is still accepted under --era=dual.
+	discoverModernOnly bool
+	// rejectLegacyList (--reject-legacy-list) makes a rejected initialize
+	// carry data.supported naming a 2025-era version too, as a 2025 server's
+	// unsupported-version error does.
+	rejectLegacyList bool
 	// requestCount counts the requests handled under an era mode, minus
 	// server/discover and debug/* (guarded by stateMu).
 	requestCount int
@@ -213,6 +221,9 @@ func handleLegacy(method string, id any, params map[string]any) {
 			if rejectModernEvidence {
 				data = map[string]any{"supported": []any{modernVersion}}
 			}
+			if rejectLegacyList {
+				data = map[string]any{"supported": []any{"2025-06-18", modernVersion}, "requested": params["protocolVersion"]}
+			}
 			answer = func() { replyError(id, rejectCode, "Invalid params: bad initialize", data) }
 		} else {
 			legacyInitDone = true
@@ -305,6 +316,9 @@ func handleModern(method string, id any, params, meta map[string]any, modernShap
 		result := discoverResult()
 		if discoverNoVersions {
 			delete(result, "supportedVersions")
+		}
+		if discoverModernOnly {
+			result["supportedVersions"] = []any{modernVersion}
 		}
 		if discoverHold {
 			hold(func() { replyUnlessCancelled(id, result) })

@@ -59,6 +59,11 @@ func (v eraVerdict) final() bool {
 	return (v.kind == verdictModern && !v.borrowed) || v.kind == verdictLegacy
 }
 
+// modernOnly reports version evidence that the child speaks only 2026-era
+// versions: a rejection's modern-only list, or modern versions alone from a
+// probe answer. On its own it is not enough to refuse 2025 traffic (see
+// refusesLegacy): dual-era servers answer the probe with only the modern
+// version too.
 func (v eraVerdict) modernOnly() bool {
 	switch v.kind {
 	case verdictRejection:
@@ -120,6 +125,11 @@ type eraMachine struct {
 	probe         probeState
 	initOK        bool   // the process has accepted an initialize
 	legacyVersion string // protocolVersion from its initialize result
+	// rejectedInit: the process rejected a forwarded initialize in a
+	// modern-looking way before accepting any. It is half of the evidence
+	// for refusing 2025 traffic (refusesLegacy); the version evidence may
+	// come before or after it. Never set once an initialize was accepted.
+	rejectedInit bool
 	// evidence is modern-only evidence from an initialize rejection that came
 	// while a probe was live and no verdict was cached. It stands in for that
 	// probe if it times out, fails to be written or gets a soft-legacy answer.
@@ -192,7 +202,7 @@ const (
 	evProbeTimer                        // a flight's timer fired
 	evWriteDone                         // a probe's write to stdin returned
 	evGone                              // the process exited or was replaced, or the bridge is closing
-	evLegacyRefused                     // the bridge refused 2025-style traffic (POST, GET, DELETE) as modern-only
+	evLegacyRefused                     // the bridge refused 2025-style traffic (POST, GET, DELETE) itself
 )
 
 var eraEventNames = [...]string{"modern-request", "init-accepted", "init-rejected", "probe-answer", "probe-timer", "write-done", "gone", "legacy-refused"}
@@ -207,10 +217,11 @@ func (k eraEventKind) String() string {
 type rejectionClass int
 
 const (
-	rejNotModern  rejectionClass = iota // not -32601/-32022 and no data.supported
-	rejBare                             // -32601 or -32022 without data.supported
-	rejMixed                            // data.supported, but not a non-empty list of modern versions only
-	rejModernOnly                       // data.supported lists modern versions only
+	rejNotModern    rejectionClass = iota // not -32601/-32022 and no data.supported
+	rejBare                               // -32601 or -32022 without data.supported
+	rejMixed                              // data.supported, but empty or not a valid version list
+	rejModernOnly                         // data.supported lists modern versions only
+	rejLegacyListed                       // data.supported is a valid list naming a 2025-era version
 )
 
 type eraEvent struct {
@@ -388,7 +399,7 @@ func (m eraMachine) startProbe(now time.Time) (eraMachine, string) {
 func (m eraMachine) onInitAccepted(ev eraEvent) eraMachine {
 	if !m.initOK {
 		m.verdict, m.outstanding, m.evidence, m.quietUntil, m.softStreak = eraVerdict{}, nil, nil, time.Time{}, 0
-		m.writeFailed = false
+		m.writeFailed, m.rejectedInit = false, false
 		if m.probe.phase != probeIdle {
 			m.probe.pre = true
 		}
@@ -406,12 +417,18 @@ func (m eraMachine) onInitAccepted(ev eraEvent) eraMachine {
 // before the rejection's own evidence. Its evidence counts only before the
 // process has accepted an initialize: it replaces a weak verdict, fills in
 // the versions of a modern answer that named none, and is remembered while
-// the first probe is out.
+// the first probe is out. A rejection whose list names a 2025-era version is
+// the child saying it takes initialize: it is no evidence of any kind, and it
+// withdraws an earlier rejection's half of the evidence for refusing 2025
+// traffic; it may still start the probe.
 func (m eraMachine) onInitRejected(ev eraEvent) (eraMachine, eraEffects) {
 	if ev.rejClass == rejNotModern {
 		return m, ignored("not a modern-looking rejection")
 	}
 	probe := m.rejectionProbeDue(ev.now)
+	if !m.initOK {
+		m.rejectedInit = ev.rejClass != rejLegacyListed
+	}
 	if ev.rejClass == rejModernOnly && !m.initOK {
 		switch {
 		case m.verdict.kind == verdictNone && m.probe.live():
@@ -617,8 +634,8 @@ func (m eraMachine) onWriteDone(ev eraEvent) (eraMachine, eraEffects) {
 }
 
 // onGone ends the machine: waiters get "gone", and nothing from this process
-// is applied any more. The verdict is kept: a dead process's modern-only
-// verdict still decides GET and DELETE until it is replaced (POSTs check
+// is applied any more. The verdict is kept: a dead process's refusal of 2025
+// traffic still decides GET and DELETE until it is replaced (POSTs check
 // HasExited first).
 func (m eraMachine) onGone() (eraMachine, eraEffects) {
 	var eff eraEffects
@@ -639,10 +656,18 @@ func (m eraMachine) timeoutAnswer(now time.Time) eraAnswer {
 	return m.verdict.answer()
 }
 
-// modernOnlyVersions returns the versions of a verdict that rules out
-// 2025-era traffic; they are always the child's own.
-func (m eraMachine) modernOnlyVersions() ([]string, bool) {
-	if !m.verdict.modernOnly() {
+// refusesLegacy reports whether the bridge refuses 2025-style traffic for
+// this process itself (initialize and other 2025-shaped requests get its own
+// 400, GET and DELETE a 405), and with which versions, always the child's
+// own. It takes both halves of the evidence: the process rejected a forwarded
+// initialize in a modern-looking way, and there is version evidence that it
+// speaks only 2026-era versions (that rejection's list, or a probe answer
+// with no legacy version, in either order). A probe answer alone never
+// suffices, since dual-era servers answer it with only the modern version
+// too; until a rejection, 2025 traffic is forwarded and the child decides.
+// An accepted initialize rules it out for the life of the process.
+func (m eraMachine) refusesLegacy() ([]string, bool) {
+	if !m.rejectedInit || m.initOK || !m.verdict.modernOnly() {
 		return nil, false
 	}
 	return append([]string(nil), m.verdict.versions...), true

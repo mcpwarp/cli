@@ -111,9 +111,12 @@ func buildEraWant() map[string]eraExpect {
 			both(k+"4 stateless after initialize, live session", c4xx(400, bodyLegacyChildVer))
 		case "modern":
 			both(k+"1 stateless before initialize", ok(bodyModernCall, false))
-			// The child is known modern-only: the bridge refuses with a clean
-			// 400 and mints no session.
-			both(k+"2 initialize by 2025 client", c4xx(400, bodyInitRefused))
+			// The probe answer alone does not tell a 2026-only child from a
+			// dual-era one, so initialize is forwarded: the child's own
+			// rejection comes back in a clean 400, and no session is minted.
+			// That rejection, with the probe answer, is what makes the bridge
+			// refuse later 2025 traffic itself.
+			both(k+"2 initialize by 2025 client", c4xx(400, bodyInitChildError))
 			// No session was minted, so the stateless client is not locked
 			// out by a session gate.
 			both(k+"3 stateless after initialize, no session", ok(bodyModernCall, false))

@@ -124,6 +124,18 @@ type StartBridgeOptions struct {
 	Log            *slog.Logger
 	RequestTimeout time.Duration // 0 -> defaultRequestTimeout
 	MaxPending     int           // 0 -> defaultMaxPending
+	// ProbeTimeout bounds the lazy server/discover probe (0 ->
+	// defaultProbeTimeout); HeadHoldTimeout bounds how long a modern
+	// request's SSE head waits for the child's first message (0 ->
+	// defaultHeadHold); InitializeHoldTimeout is the same for a 2025-style
+	// initialize, which waits so Mcp-Session-Id can ride on the head (0 ->
+	// defaultInitializeHold). MaxReprobeInterval caps the re-probe backoff
+	// (0 -> reprobeBackoffFactor probe timeouts). Test seams, like
+	// RequestTimeout.
+	ProbeTimeout          time.Duration
+	HeadHoldTimeout       time.Duration
+	InitializeHoldTimeout time.Duration
+	MaxReprobeInterval    time.Duration
 	// Bus, if non-nil, is passed to NewStdioChildWithBus so this bridge's
 	// initial child publishes its stderr lines as eventbus.LogLine
 	// telemetry (DESIGN.md §3) — the same wiring a supervisor's own
@@ -151,6 +163,11 @@ type StartBridgeOptions struct {
 	EnsureChild func(ctx context.Context) error
 }
 
+// pendingEntry is one in-flight client request. once guards every write to
+// the client: resolveWith, rejectWith, resolveInitialized, respond and
+// abandon are mutually exclusive, and abandon (run by the handler on every
+// exit path) makes any later one a no-op, so nothing writes to the
+// ResponseWriter after the handler returns.
 type pendingEntry struct {
 	originalID    any
 	progressToken any           // nil if the request carried none
@@ -160,18 +177,78 @@ type pendingEntry struct {
 	timer         *time.Timer
 	done          chan struct{}
 	once          sync.Once
+	// modern: a modern-shaped request to a modern child, whose final
+	// errors get an HTTP status mapped from the JSON-RPC code.
+	modern bool
+	// raw, non-nil only for a 2025-style initialize, hands the child's
+	// answer to the handler goroutine instead of writing it from the
+	// child's pump (see completeInitialize).
+	raw chan map[string]any
+	// revoke releases a provisional session handed out with a held
+	// initialize head; set only for initialize.
+	revoke func()
+	// era, set only for initialize, is the process the child's answer
+	// reports on, whether or not the handler is still waiting for it.
+	era *eraState
+}
+
+// releaseProvisional revokes the provisional session this response carries,
+// if any: the initialize it answered was rejected, abandoned or failed.
+func (e *pendingEntry) releaseProvisional() {
+	if e.sse != nil && e.revoke != nil && e.sse.takeProvisional() {
+		e.revoke()
+	}
 }
 
 func (e *pendingEntry) resolveWith(msg map[string]any) {
+	status := http.StatusOK
+	if e.modern {
+		status = modernErrorStatus(msg)
+	}
+	e.respond(status, msg)
+}
+
+// respond writes msg (its id rewritten to the client's) with status. In SSE
+// form a non-200 status is only possible while the head is still held;
+// otherwise the message goes out as a frame in the already-committed 200
+// stream.
+func (e *pendingEntry) respond(status int, msg map[string]any) {
+	e.once.Do(func() {
+		e.timer.Stop()
+		if status != http.StatusOK {
+			e.releaseProvisional()
+		}
+		rewritten := cloneMsg(msg)
+		rewritten["id"] = e.originalID
+		if e.sse != nil {
+			if status == http.StatusOK || !e.sse.finalStatus(status, e.extraHeaders, rewritten) {
+				e.sse.writeFrame(rewritten)
+				e.sse.end()
+			}
+		} else {
+			writeJSONHeaders(e.plain, status, e.extraHeaders, rewritten)
+		}
+		close(e.done)
+	})
+}
+
+// resolveInitialized is resolveWith for a successful initialize: session
+// supplies the Mcp-Session-Id header, and runs (so the session gets minted)
+// only if the head can still carry it.
+func (e *pendingEntry) resolveInitialized(msg map[string]any, session func() map[string]string) {
 	e.once.Do(func() {
 		e.timer.Stop()
 		rewritten := cloneMsg(msg)
 		rewritten["id"] = e.originalID
 		if e.sse != nil {
+			if !e.sse.setHeadersIfUncommitted(session) {
+				session() // head already out with a provisional id: confirm it
+				e.sse.takeProvisional()
+			}
 			e.sse.writeFrame(rewritten)
 			e.sse.end()
 		} else {
-			writeJSONHeaders(e.plain, 200, e.extraHeaders, rewritten)
+			writeJSONHeaders(e.plain, http.StatusOK, session(), rewritten)
 		}
 		close(e.done)
 	})
@@ -180,6 +257,7 @@ func (e *pendingEntry) resolveWith(msg map[string]any) {
 func (e *pendingEntry) rejectWith(err error) {
 	e.once.Do(func() {
 		e.timer.Stop()
+		e.releaseProvisional()
 		if errors.Is(err, errChildRestarted) {
 			body := map[string]any{
 				"jsonrpc": "2.0",
@@ -187,20 +265,39 @@ func (e *pendingEntry) rejectWith(err error) {
 				"error":   map[string]any{"code": -32000, "message": "local server restarted"},
 			}
 			if e.sse != nil {
-				e.sse.writeFrame(body)
-				e.sse.end()
+				if !e.sse.finalStatus(502, nil, body) {
+					e.sse.writeFrame(body)
+					e.sse.end()
+				}
 			} else {
-				writeJSON(e.plain, 502, body)
+				writeJSONFlush(e.plain, 502, body)
 			}
 			close(e.done)
 			return
 		}
+		status, body := 502, map[string]any{"error": "local server is not running"}
+		if errors.Is(err, errUpstreamTimeout) {
+			status, body = 504, map[string]any{"error": "upstream timeout"}
+		}
 		if e.sse != nil {
-			e.sse.end()
-		} else if errors.Is(err, errUpstreamTimeout) {
-			writeJSON(e.plain, 504, map[string]any{"error": "upstream timeout"})
+			if !e.sse.finalStatus(status, nil, body) {
+				e.sse.end()
+			}
 		} else {
-			writeJSON(e.plain, 502, map[string]any{"error": "local server is not running"})
+			writeJSONFlush(e.plain, status, body)
+		}
+		close(e.done)
+	})
+}
+
+// abandon claims the entry without writing anything: the client is gone, or
+// the handler is unwinding. It waits out a writer already inside once.
+func (e *pendingEntry) abandon() {
+	e.once.Do(func() {
+		e.timer.Stop()
+		e.releaseProvisional()
+		if e.sse != nil {
+			e.sse.detach()
 		}
 		close(e.done)
 	})
@@ -224,9 +321,13 @@ type Bridge struct {
 	name string
 	log  *slog.Logger
 
-	timeout     time.Duration
-	maxPending  int
-	ensureChild func(ctx context.Context) error
+	timeout      time.Duration
+	maxPending   int
+	ensureChild  func(ctx context.Context) error
+	probeTimeout time.Duration
+	reprobeCap   time.Duration
+	headHold     time.Duration
+	initHold     time.Duration
 
 	listener net.Listener
 	server   *http.Server
@@ -235,8 +336,11 @@ type Bridge struct {
 	session *session
 	pushHub *pushStreamHub
 
+	// mu guards everything below, including era (the current process's
+	// eraState) and every eraState's fields.
 	mu            sync.Mutex
 	child         *StdioChild
+	era           *eraState
 	closing       bool
 	failed        string
 	hasFailed     bool
@@ -244,6 +348,10 @@ type Bridge struct {
 	subscriptions map[int64]*subscriptionEntry
 	abandoned     map[int64]struct{}
 	abandonedFIFO []int64
+	// abandonedInit maps an abandoned initialize's id to its process, so the
+	// child's late answer still reaches the era state; its ids are a subset
+	// of abandoned's and are evicted with them.
+	abandonedInit map[int64]*eraState
 	nextID        int64
 
 	wg sync.WaitGroup
@@ -273,6 +381,22 @@ func StartBridge(opts StartBridgeOptions) (*Bridge, error) {
 	if maxPending == 0 {
 		maxPending = defaultMaxPending
 	}
+	probeTimeout := opts.ProbeTimeout
+	if probeTimeout == 0 {
+		probeTimeout = defaultProbeTimeout
+	}
+	reprobeCap := opts.MaxReprobeInterval
+	if reprobeCap == 0 {
+		reprobeCap = reprobeBackoffFactor * probeTimeout
+	}
+	headHold := opts.HeadHoldTimeout
+	if headHold == 0 {
+		headHold = defaultHeadHold
+	}
+	initHold := opts.InitializeHoldTimeout
+	if initHold == 0 {
+		initHold = defaultInitializeHold
+	}
 
 	child, err := NewStdioChildWithBus(opts.SpawnSpec, log.With("server", opts.Name), opts.Name, opts.Bus)
 	if err != nil {
@@ -285,15 +409,21 @@ func StartBridge(opts StartBridgeOptions) (*Bridge, error) {
 		timeout:       timeout,
 		maxPending:    maxPending,
 		ensureChild:   opts.EnsureChild,
+		probeTimeout:  probeTimeout,
+		reprobeCap:    reprobeCap,
+		headHold:      headHold,
+		initHold:      initHold,
 		child:         child,
 		session:       newSession(),
 		pushHub:       newPushStreamHub(log.With("server", opts.Name)),
 		pending:       make(map[int64]*pendingEntry),
 		subscriptions: make(map[int64]*subscriptionEntry),
 		abandoned:     make(map[int64]struct{}),
+		abandonedInit: make(map[int64]*eraState),
 		nextID:        1,
 	}
-	b.wireChild(child)
+	b.era = b.newEraState(child)
+	b.wireChild(child, b.era)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -331,14 +461,26 @@ func (b *Bridge) GetCurrentChild() *StdioChild {
 
 // ReplaceChild swaps in a freshly spawned child after a supervisor
 // restart. The listener/port/session are untouched; only routing wiring
-// moves to the new child. Clears a previously-latched MarkFailed.
+// moves to the new child, which starts with a fresh era state (the old
+// process's discover result says nothing about it). Clears a
+// previously-latched MarkFailed.
 func (b *Bridge) ReplaceChild(child *StdioChild) {
+	st := b.newEraState(child)
 	b.mu.Lock()
 	b.child = child
+	b.endEraLocked(b.era)
+	// The old process's late initialize answers can only reach its ended
+	// state; drop them rather than pin it until FIFO eviction.
+	for id, old := range b.abandonedInit {
+		if old == b.era {
+			delete(b.abandonedInit, id)
+		}
+	}
+	b.era = st
 	b.hasFailed = false
 	b.failed = ""
 	b.mu.Unlock()
-	b.wireChild(child)
+	b.wireChild(child, st)
 }
 
 // MarkFailed latches a permanent-failure response for every new request
@@ -383,6 +525,7 @@ func (b *Bridge) addAbandoned(id int64) {
 			oldest := b.abandonedFIFO[0]
 			b.abandonedFIFO = b.abandonedFIFO[1:]
 			delete(b.abandoned, oldest)
+			delete(b.abandonedInit, oldest)
 		}
 	}
 }
@@ -428,7 +571,21 @@ func (b *Bridge) handleChildResponse(id int64, msg map[string]any) {
 		}
 	}
 	abandoned := b.isAbandonedLocked(id)
+	var initEra *eraState
+	switch {
+	case entry != nil:
+		initEra = entry.era
+	case !hasSub:
+		initEra = b.abandonedInit[id]
+		delete(b.abandonedInit, id)
+	}
 	b.mu.Unlock()
+
+	// An initialize answer reaches the era state here, before any handler
+	// sees it, so it counts even if nobody is waiting for it any more.
+	if initEra != nil {
+		b.noteInitializeAnswer(initEra, msg)
+	}
 
 	if hasSub {
 		rewritten := cloneMsg(msg)
@@ -440,6 +597,10 @@ func (b *Bridge) handleChildResponse(id int64, msg map[string]any) {
 		return
 	}
 	if entry != nil {
+		if entry.raw != nil {
+			entry.raw <- msg // buffered 1, and a request has one answer
+			return
+		}
 		entry.resolveWith(msg)
 		return
 	}
@@ -536,7 +697,7 @@ func mustInt64(v any) int64 {
 	return n
 }
 
-func (b *Bridge) wireChild(c *StdioChild) {
+func (b *Bridge) wireChild(c *StdioChild, st *eraState) {
 	c.OnMessage(func(msg map[string]any) {
 		idVal, hasIDRaw := msg["id"]
 		hasID := hasIDRaw && isJSONID(idVal)
@@ -546,6 +707,10 @@ func (b *Bridge) wireChild(c *StdioChild) {
 
 		switch {
 		case hasID && !hasMethod:
+			if s, isProbe := idVal.(string); isProbe && strings.HasPrefix(s, probeIDPrefix) {
+				b.handleProbeResponse(st, s, msg)
+				return
+			}
 			id, ok := numericID(idVal)
 			if !ok {
 				b.pushHub.Dispatch(msg)
@@ -571,6 +736,7 @@ func (b *Bridge) wireChild(c *StdioChild) {
 		b.pending = make(map[int64]*pendingEntry)
 		subs := b.subscriptions
 		b.subscriptions = make(map[int64]*subscriptionEntry)
+		b.endEraLocked(st)
 		b.mu.Unlock()
 
 		for _, entry := range pending {
@@ -599,6 +765,16 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(text)))
 	w.WriteHeader(status)
 	_, _ = w.Write(text)
+}
+
+// writeJSONFlush is writeJSON for a final answer that may be followed at once
+// by Close hard-closing the listener: flushing puts it on the wire before the
+// handler's return, which is when net/http would otherwise do so.
+func writeJSONFlush(w http.ResponseWriter, status int, body any) {
+	writeJSON(w, status, body)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func writeJSONHeaders(w http.ResponseWriter, status int, extra map[string]string, body any) {
@@ -635,16 +811,84 @@ func openSSEHeaders(w http.ResponseWriter, sessionID string, hasSession bool) {
 
 // sseResponder wraps an http.ResponseWriter opened as an SSE stream,
 // serializing writes and guarding against writing to a finished response.
+// It is also the single owner of the response head: with newHeldSSEResponder
+// the head is not written until the first frame, an explicit commit, the
+// hold deadline, or end — whichever comes first, all under mu — so a final
+// error arriving while the head is held can still choose its HTTP status
+// (finalStatus), and nothing can write once ended is set.
 type sseResponder struct {
-	mu      sync.Mutex
-	w       http.ResponseWriter
-	flusher http.Flusher
-	ended   bool
+	mu          sync.Mutex
+	w           http.ResponseWriter
+	flusher     http.Flusher
+	ended       bool
+	headWritten bool
+	extra       map[string]string
+	holdTimer   *time.Timer
+	// provisional: the head went out at the hold deadline carrying a
+	// provisional session id that the caller must revoke if the answer
+	// turns out to be a rejection.
+	provisional bool
+	// mintHead, set only for a held initialize, supplies the headers of a
+	// provisional session; commitLocked runs it, so every way the head can
+	// go out (hold deadline, a progress frame) carries a session id.
+	mintHead func() (map[string]string, bool)
 }
 
+// newSSEResponder wraps a response whose 200 SSE head the caller has
+// already written.
 func newSSEResponder(w http.ResponseWriter) *sseResponder {
 	f, _ := w.(http.Flusher)
-	return &sseResponder{w: w, flusher: f}
+	return &sseResponder{w: w, flusher: f, headWritten: true}
+}
+
+// newHeldSSEResponder wraps a response whose head is still unwritten; extra
+// headers ride on it if it is committed as a 200 stream.
+func newHeldSSEResponder(w http.ResponseWriter, extra map[string]string) *sseResponder {
+	f, _ := w.(http.Flusher)
+	return &sseResponder{w: w, flusher: f, extra: extra}
+}
+
+func (s *sseResponder) commitLocked() {
+	if s.headWritten {
+		return
+	}
+	s.headWritten = true
+	if s.holdTimer != nil {
+		s.holdTimer.Stop()
+	}
+	if s.mintHead != nil {
+		h, tracked := s.mintHead()
+		s.mintHead = nil
+		s.provisional = tracked
+		s.mergeExtraLocked(h)
+	}
+	for k, v := range s.extra {
+		s.w.Header().Set(k, v)
+	}
+	openSSEHeaders(s.w, "", false)
+	s.w.WriteHeader(200)
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+}
+
+// commit writes the 200 SSE head now, unless something already has.
+func (s *sseResponder) commit() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ended {
+		s.commitLocked()
+	}
+}
+
+// holdFor arms the deadline that commits the head if nothing has by then.
+func (s *sseResponder) holdFor(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.headWritten || s.ended {
+		return
+	}
+	s.holdTimer = time.AfterFunc(d, s.commit)
 }
 
 func (s *sseResponder) writeFrame(msg any) {
@@ -653,16 +897,101 @@ func (s *sseResponder) writeFrame(msg any) {
 	if s.ended {
 		return
 	}
+	s.commitLocked()
 	_, _ = io.WriteString(s.w, frameSSE(msg))
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}
 }
 
+// finalStatus answers with a plain JSON body and the given status instead
+// of a stream, iff the head is still held; it then ends the response and
+// reports true.
+func (s *sseResponder) finalStatus(status int, headers map[string]string, body any) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ended || s.headWritten {
+		return false
+	}
+	s.headWritten, s.ended = true, true
+	if s.holdTimer != nil {
+		s.holdTimer.Stop()
+	}
+	writeJSONHeaders(s.w, status, headers, body)
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+	return true
+}
+
+// setHeadersIfUncommitted sets the headers f returns on the pending head,
+// calling f only if the head can still carry them.
+func (s *sseResponder) setHeadersIfUncommitted(f func() map[string]string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ended || s.headWritten {
+		return false
+	}
+	s.mintHead = nil
+	s.mergeExtraLocked(f())
+	return true
+}
+
+func (s *sseResponder) mergeExtraLocked(h map[string]string) {
+	if s.extra == nil {
+		s.extra = map[string]string{}
+	}
+	for k, v := range h {
+		s.extra[k] = v
+	}
+}
+
+// holdForInitialize is holdFor for an initialize, whose head must carry
+// Mcp-Session-Id: when the head is committed, at the deadline or earlier,
+// mint supplies the headers of a provisional session (and whether the caller
+// must later revoke it).
+func (s *sseResponder) holdForInitialize(d time.Duration, mint func() (map[string]string, bool)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.headWritten || s.ended {
+		return
+	}
+	s.mintHead = mint
+	s.holdTimer = time.AfterFunc(d, s.commit)
+}
+
+// takeProvisional reports, once, whether a provisional session is
+// outstanding on this response. It also disarms a mint that has not run, so a
+// hold deadline firing after the caller released the session cannot hand out
+// one that nobody will revoke.
+func (s *sseResponder) takeProvisional() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mintHead = nil
+	p := s.provisional
+	s.provisional = false
+	return p
+}
+
+// end finishes the stream, writing the 200 head first if it was still held.
 func (s *sseResponder) end() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.ended {
+		s.commitLocked()
+	}
 	s.ended = true
+}
+
+// detach finishes the response without writing anything: the handler is
+// returning, so no later writer may touch w.
+func (s *sseResponder) detach() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ended = true
+	if s.holdTimer != nil {
+		s.holdTimer.Stop()
+	}
 }
 
 // pushSinkAdapter adapts an sseResponder plus a per-request done channel to
@@ -807,9 +1136,20 @@ func (b *Bridge) acquireRequestSlot() bool {
 	return true
 }
 
+// writeMethodNotAllowed answers GET/DELETE against a child known to be
+// modern-only: the 2026-07-28 HTTP binding has no standalone stream and no
+// sessions to terminate.
+func writeMethodNotAllowed(w http.ResponseWriter) {
+	w.Header().Set("Allow", "POST")
+	writeJSON(w, 405, map[string]any{"error": "method not allowed"})
+}
+
 func (b *Bridge) handleGet(w http.ResponseWriter, r *http.Request) {
 	if !strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 		writeJSON(w, 405, map[string]any{"error": "method not allowed"})
+		return
+	}
+	if b.refuseStatelessMethod(w) {
 		return
 	}
 	headerSessionID, hasHeader := firstHeader(r.Header, "Mcp-Session-Id")
@@ -847,6 +1187,9 @@ func (b *Bridge) handleGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Bridge) handleDelete(w http.ResponseWriter, r *http.Request) {
+	if b.refuseStatelessMethod(w) {
+		return
+	}
 	headerSessionID, hasHeader := firstHeader(r.Header, "Mcp-Session-Id")
 	newID, ok := b.session.rotate(headerSessionID, hasHeader)
 	if !ok {
@@ -892,30 +1235,67 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	// whenever hasOwnProperty is.
 	_, hasID := parsed["id"]
 
-	headerSessionID, hasHeader := firstHeader(r.Header, "Mcp-Session-Id")
-	check := b.session.check(method, headerSessionID, hasHeader)
-	switch check.kind {
-	case sessionUnknown:
-		writeJSON(w, 404, map[string]any{"error": "unknown session"})
-		return
-	case sessionMissing:
-		jsonRPCError(w, 400, -32600, "invalid request: Mcp-Session-Id header is required once a session has been established")
-		return
+	// A modern-shaped message is stateless: any Mcp-Session-Id on it is
+	// ignored (no gate, no 404, never echoed). A 2025-style initialize
+	// skips the gate too; its session is minted only once the child has
+	// answered it successfully.
+	modernShaped := hasMethod && isModernShaped(parsed)
+	// A live child known to take only modern requests refuses 2025-style
+	// ones before any session gate: there are no sessions to be unknown.
+	if !modernShaped && (hasMethod || hasID) {
+		if c, st := b.currentChildEra(); !c.HasExited() && b.refuseLegacyRequest(w, parsed, st) {
+			return
+		}
 	}
 	var sessionID string
-	hasSession := check.kind == sessionOK
-	if hasSession {
-		sessionID = check.sessionID
+	var hasSession bool
+	if !modernShaped && method != "initialize" {
+		headerSessionID, hasHeader := firstHeader(r.Header, "Mcp-Session-Id")
+		check := b.session.check(method, headerSessionID, hasHeader)
+		switch check.kind {
+		case sessionUnknown:
+			writeJSON(w, 404, map[string]any{"error": "unknown session"})
+			return
+		case sessionMissing:
+			jsonRPCError(w, 400, -32600, "invalid request: Mcp-Session-Id header is required once a session has been established")
+			return
+		}
+		hasSession = check.kind == sessionOK
+		if hasSession {
+			sessionID = check.sessionID
+		}
 	}
 
-	// Every branch below that reaches the child reads currentChild() after
-	// this, so one lazy respawn here covers requests, notifications and
-	// subscriptions/listen alike. A bare client response (!hasMethod) is
+	// One lazy respawn here covers requests, notifications and
+	// subscriptions/listen alike. The child is snapshotted right after:
+	// regular requests use that snapshot (admitModern may move it to a newer
+	// one), while notifications, client responses and subscriptions/listen
+	// read currentChild() again. A bare client response (!hasMethod) is
 	// left out: it answers the dead child's own request, which a fresh
 	// child never issued, so respawning for it would only resurrect a
 	// disabled service on a stray late reply.
 	if hasMethod {
 		b.ensureLiveChild(r.Context())
+	}
+
+	child, st := b.currentChildEra()
+	// A child known to take only modern requests is given nothing 2025-style:
+	// not initialize or any other request, nor a notification or a client
+	// response (this revision defines no client notifications over HTTP and
+	// forbids client responses). A dead child's verdict does not count: it
+	// gets the "not running" answer below.
+	if !modernShaped && (hasMethod || hasID) && !child.HasExited() && b.refuseLegacyRequest(w, parsed, st) {
+		return
+	}
+	if modernShaped && hasID {
+		var ok bool
+		if child, st, ok = b.admitModern(w, r, parsed, child, st); !ok {
+			return
+		}
+		if code, msg := modernRequestProblem(r, parsed); code != 0 {
+			writeJSON(w, http.StatusBadRequest, jsonRPCErrorBody(parsed["id"], code, msg, nil))
+			return
+		}
 	}
 
 	if method == "subscriptions/listen" {
@@ -965,7 +1345,14 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Request: has both id and method.
-	b.handleRegularRequest(w, r, parsed, sessionID, hasSession)
+	kind := kindLegacy
+	switch {
+	case modernShaped:
+		kind = kindModern
+	case method == "initialize":
+		kind = kindInitialize
+	}
+	b.handleRegularRequest(w, r, parsed, sessionID, hasSession, kind, child, st)
 }
 
 // admitAndMintID atomically checks the too-many-pending gate and mints an
@@ -984,7 +1371,15 @@ func (b *Bridge) admitAndMintID() (int64, bool) {
 	return id, true
 }
 
-func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, parsed map[string]any, sessionID string, hasSession bool) {
+type requestKind int
+
+const (
+	kindLegacy     requestKind = iota // 2025-style request
+	kindInitialize                    // 2025-style initialize
+	kindModern                        // modern-shaped request, child already judged modern
+)
+
+func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, parsed map[string]any, sessionID string, hasSession bool, kind requestKind, child *StdioChild, st *eraState) {
 	internalID, ok := b.admitAndMintID()
 	if !ok {
 		writeJSON(w, 503, map[string]any{"error": "too many in-flight requests"})
@@ -1006,17 +1401,24 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 		extraHeaders["Mcp-Session-Id"] = sessionID
 	}
 
+	// 2025-style requests open the SSE head at once, as ever. A modern
+	// request holds it (briefly) for the child's first message so a final
+	// error can still pick the HTTP status; initialize holds it so the
+	// session header can ride on it.
 	var sse *sseResponder
 	if wantsSSE {
-		for k, v := range extraHeaders {
-			w.Header().Set(k, v)
+		sse = newHeldSSEResponder(w, extraHeaders)
+		switch kind {
+		case kindModern:
+			sse.holdFor(b.headHold)
+		case kindInitialize:
+			sse.holdForInitialize(b.initHold, func() (map[string]string, bool) {
+				id, tracked := b.session.provisionalMint()
+				return map[string]string{"Mcp-Session-Id": id}, tracked
+			})
+		default:
+			sse.commit()
 		}
-		openSSEHeaders(w, "", false)
-		w.WriteHeader(200)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-		sse = newSSEResponder(w)
 	}
 
 	entry := &pendingEntry{
@@ -1026,10 +1428,16 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 		plain:         w,
 		extraHeaders:  extraHeaders,
 		done:          make(chan struct{}),
+		modern:        kind == kindModern,
+	}
+	if kind == kindInitialize {
+		entry.raw = make(chan map[string]any, 1)
+		entry.revoke = b.session.revoke
+		entry.era = st
 	}
 	entry.timer = time.AfterFunc(b.timeout, func() {
 		b.mu.Lock()
-		delete(b.pending, internalID)
+		b.dropPendingLocked(internalID, entry)
 		b.mu.Unlock()
 		b.addAbandoned(internalID)
 		entry.rejectWith(errUpstreamTimeout)
@@ -1038,6 +1446,15 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 	b.mu.Lock()
 	b.pending[internalID] = entry
 	b.mu.Unlock()
+	// Whatever way this handler exits (including a panic, which unwinds
+	// through here before handle's recover), the entry is claimed first, so
+	// no timer, notification or late answer writes to w afterwards.
+	defer func() {
+		b.mu.Lock()
+		delete(b.pending, internalID)
+		b.mu.Unlock()
+		entry.abandon()
+	}()
 
 	outgoing := cloneMsg(parsed)
 	outgoing["id"] = internalID
@@ -1049,42 +1466,49 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 		outgoing["params"] = p
 	}
 
-	child := b.currentChild()
 	if err := child.Send(outgoing); err != nil {
 		b.mu.Lock()
 		delete(b.pending, internalID)
 		b.mu.Unlock()
-		entry.timer.Stop()
 		b.log.Warn("failed to write request to stdio child", "server", b.name, "err", err)
-		if sse != nil {
-			sse.end()
-		} else {
-			writeJSON(w, 502, map[string]any{"error": "local server is not running"})
-		}
+		entry.rejectWith(errChildGone)
 		return
 	}
 
 	select {
 	case <-entry.done:
+	case raw := <-entry.raw: // nil unless initialize
+		b.completeInitialize(entry, raw)
 	case <-r.Context().Done():
-		b.mu.Lock()
-		_, still := b.pending[internalID]
-		delete(b.pending, internalID)
-		b.mu.Unlock()
-		if still {
-			entry.timer.Stop()
-			b.addAbandoned(internalID)
-			_ = child.Send(map[string]any{
-				"jsonrpc": "2.0", "method": "notifications/cancelled",
-				"params": map[string]any{"requestId": internalID},
-			})
-		} else {
-			// Already removed from b.pending by a concurrent
-			// resolveWith/rejectWith — wait for it to finish writing to w
-			// before this handler returns, or the two race on the same
-			// http.ResponseWriter.
-			<-entry.done
-		}
+		b.onRequestDisconnect(internalID, entry, child)
+	}
+}
+
+// dropPendingLocked removes a request whose client will not be answered by
+// its handler any more (timed out, or gone) from b.pending, reporting whether
+// it was still there. For an initialize it remembers the process, so the
+// child's late answer still reaches the era state.
+func (b *Bridge) dropPendingLocked(internalID int64, entry *pendingEntry) bool {
+	_, still := b.pending[internalID]
+	delete(b.pending, internalID)
+	if still && entry.era != nil {
+		b.abandonedInit[internalID] = entry.era
+	}
+	return still
+}
+
+// onRequestDisconnect handles the client going away mid-request. abandon
+// waits out a writer already inside the entry (a concurrent resolveWith or
+// rejectWith removed it from b.pending first), or claims the entry so a
+// racing timer or answer can no longer write to the ResponseWriter.
+func (b *Bridge) onRequestDisconnect(internalID int64, entry *pendingEntry, child *StdioChild) {
+	b.mu.Lock()
+	still := b.dropPendingLocked(internalID, entry)
+	b.mu.Unlock()
+	entry.abandon()
+	if still {
+		b.addAbandoned(internalID)
+		_ = child.Send(cancelledNotification(internalID))
 	}
 }
 
@@ -1168,6 +1592,7 @@ func (b *Bridge) CloseContext(ctx context.Context) error {
 	b.pending = make(map[int64]*pendingEntry)
 	subs := b.subscriptions
 	b.subscriptions = make(map[int64]*subscriptionEntry)
+	b.endEraLocked(b.era)
 	b.mu.Unlock()
 
 	b.pushHub.Close()

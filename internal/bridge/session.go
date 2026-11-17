@@ -46,6 +46,12 @@ type session struct {
 	currentID string
 	hasID     bool
 	newID     func() string
+	// provisional: currentID was minted ahead of the child's answer to an
+	// initialize whose SSE head had to go out first (see provisionalMint),
+	// held by `holders` such responses, and is not yet confirmed by a
+	// successful initialize.
+	provisional bool
+	holders     int
 }
 
 func newSession() *session {
@@ -62,6 +68,7 @@ func (s *session) check(method string, headerSessionID string, hasHeader bool) s
 			s.currentID = s.newID()
 			s.hasID = true
 		}
+		s.provisional = false
 		return sessionCheckResult{kind: sessionOK, sessionID: s.currentID, minted: minted}
 	}
 	if !hasHeader {
@@ -74,6 +81,40 @@ func (s *session) check(method string, headerSessionID string, hasHeader bool) s
 		return sessionCheckResult{kind: sessionOK, sessionID: s.currentID, minted: false}
 	}
 	return sessionCheckResult{kind: sessionUnknown}
+}
+
+// provisionalMint hands out a session id for an initialize response whose
+// head cannot wait for the child any longer. tracked reports whether the
+// caller now holds a claim that revoke must release if the initialize turns
+// out to be rejected; it is false when a confirmed session already existed.
+func (s *session) provisionalMint() (id string, tracked bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.hasID {
+		s.currentID = s.newID()
+		s.hasID = true
+		s.provisional = true
+	}
+	if s.provisional {
+		s.holders++
+		return s.currentID, true
+	}
+	return s.currentID, false
+}
+
+// revoke releases one provisionalMint claim; the session disappears once no
+// claim is left and no successful initialize has confirmed it.
+func (s *session) revoke() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.holders > 0 {
+		s.holders--
+	}
+	if s.provisional && s.holders == 0 {
+		s.hasID = false
+		s.provisional = false
+		s.currentID = ""
+	}
 }
 
 // rotate handles DELETE /mcp: mints a fresh id if headerSessionID matches

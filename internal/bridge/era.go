@@ -5,56 +5,47 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"math"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
 
 const (
-	// modernProtocolVersion is the first stateless MCP revision. Any
-	// supportedVersions entry that sorts before it (the revisions are
-	// YYYY-MM-DD) is a 2025-era, initialize-based version.
+	// modernProtocolVersion is the first MCP v2 revision. A version is modern
+	// if it is a YYYY-MM-DD revision that does not sort before it.
 	modernProtocolVersion = "2026-07-28"
 
 	protocolVersionMetaKey    = "io.modelcontextprotocol/protocolVersion"
 	clientCapabilitiesMetaKey = "io.modelcontextprotocol/clientCapabilities"
 	clientInfoMetaKey         = "io.modelcontextprotocol/clientInfo"
 
-	// probeIDPrefix marks the bridge-owned id of a server/discover probe.
-	// Client ids are always rewritten to integers before reaching the child,
-	// so a string id with this prefix can never be a client's.
-	probeIDPrefix = "mcpwarp-probe-"
+	// probeID is the id of the one server/discover the bridge writes to each
+	// process. Client ids are always rewritten to integers before reaching the
+	// child, so a string id can never be a client's.
+	probeID = "mcpwarp-probe"
 
-	// defaultProbeTimeout bounds the lazy server/discover probe. A cold
-	// stdio child can take a good while to start; giving up earlier would
-	// pin its first 2026 request on a legacy verdict. The wait belongs to
-	// the request itself (discover runs after ensureLiveChild has returned,
-	// with its own timer), not to ensureChildTimeout. A modern child slower
-	// than this is picked up by the late answer (no cancel is sent). It is
-	// also the base re-probe interval.
+	// defaultProbeTimeout bounds the wait for the answer to the probe written
+	// at spawn. A cold stdio child can take a good while to start; past this
+	// the process is served as v1 until it answers.
 	defaultProbeTimeout = 15 * time.Second
-	// reprobeBackoffFactor caps the re-probe interval's backoff at this many
-	// probe timeouts: 10 minutes at the default, and scaled along with a
-	// test's shorter probe timeout unless the test sets its own cap.
-	reprobeBackoffFactor = 40
 	// defaultHeadHold bounds how long a modern request's SSE head is held
 	// for the child's first message so an error can still pick the HTTP
 	// status. The relay forwarder in front of the bridge has a 30s
-	// response-header timeout; the probe plus this (17s), and ensureChild's
+	// response-header timeout; the verdict plus this (17s), and ensureChild's
 	// 5s before them when a respawn is needed, stay under it.
 	defaultHeadHold = 2 * time.Second
 	// defaultInitializeHold bounds how long a 2025-style initialize's SSE
-	// head is held so Mcp-Session-Id can still ride on it. Longer than
-	// defaultHeadHold because a cold stdio child can take a while to answer
-	// initialize, yet still under the forwarder's 30s.
+	// head is held so Mcp-Session-Id can still ride on it. It counts from the
+	// client's arrival, so the wait for ensureChild and the verdict (20s at
+	// most) is inside it, not added to it: the head goes out within 20s,
+	// under the forwarder's 30s.
 	defaultInitializeHold = 20 * time.Second
 
-	// maxOutstandingProbes caps how many timed-out, unanswered probe ids a
-	// process keeps as valid late answers; the oldest is dropped when full, so
-	// a child that never answers cannot grow it.
-	maxOutstandingProbes = 4
+	// maxRefusedNames caps the client names a process logs a refusal for.
+	maxRefusedNames = 16
 )
 
 // isModernShaped is the single place that decides which era a message
@@ -73,241 +64,263 @@ func isModernShaped(msg map[string]any) bool {
 	return has
 }
 
-// isLegacyVersion compares revision dates; callers pass only versions that
-// versionList accepted.
-func isLegacyVersion(v string) bool { return v < modernProtocolVersion }
-
-// versionList returns v as a list of protocol versions, or false if it is not
-// a JSON array of YYYY-MM-DD strings. Such a list is no evidence either way:
-// an entry that is not a date can neither be called modern nor legacy.
-func versionList(v any) ([]string, bool) {
-	arr, ok := v.([]any)
+// isModernVersion reports a YYYY-MM-DD revision on or after
+// modernProtocolVersion; "draft" or any other string is not one.
+func isModernVersion(v any) bool {
+	s, ok := v.(string)
 	if !ok {
-		return nil, false
-	}
-	var out []string
-	for _, e := range arr {
-		s, ok := e.(string)
-		if !ok {
-			return nil, false
-		}
-		if _, err := time.Parse("2006-01-02", s); err != nil {
-			return nil, false
-		}
-		out = append(out, s)
-	}
-	return out, true
-}
-
-func onlyModernVersions(supported []string) bool {
-	if len(supported) == 0 {
 		return false
 	}
-	for _, v := range supported {
-		if isLegacyVersion(v) {
-			return false
+	if _, err := time.Parse("2006-01-02", s); err != nil {
+		return false
+	}
+	return s >= modernProtocolVersion
+}
+
+// modernVersions returns the modern entries of a version list, nil if raw is
+// not a list or has none.
+func modernVersions(raw any) []string {
+	list, _ := raw.([]any)
+	var out []string
+	for _, v := range list {
+		if isModernVersion(v) {
+			out = append(out, v.(string))
 		}
 	}
-	return true
+	return out
 }
 
-// eraState is one child process's era: its machine, and what carries out the
-// machine's effects. One is created per process (StartBridge, ReplaceChild)
-// and never reused. Every field is guarded by Bridge.mu.
+// discoverVersions is the modern versions a probe answer names: from a
+// result's supportedVersions or a -32022 error's data.supported. nil means
+// the child is v1: any other error, a result without modern versions, or
+// anything else.
+func discoverVersions(msg map[string]any) []string {
+	if result, ok := isRecord(msg["result"]); ok {
+		return modernVersions(result["supportedVersions"])
+	}
+	errObj, _ := isRecord(msg["error"])
+	if code, _ := errObj["code"].(float64); code == -32022 {
+		data, _ := isRecord(errObj["data"])
+		return modernVersions(data["supported"])
+	}
+	return nil
+}
+
+// rejectionVersions is the list a rejected initialize names in data.supported
+// if that is a non-empty list of modern versions only, whatever the code; nil
+// otherwise. Only such a rejection says the child speaks v2 alone.
+func rejectionVersions(msg map[string]any) []string {
+	errObj, _ := isRecord(msg["error"])
+	data, _ := isRecord(errObj["data"])
+	list, _ := data["supported"].([]any)
+	if len(list) == 0 {
+		return nil
+	}
+	out := make([]string, len(list))
+	for i, v := range list {
+		if !isModernVersion(v) {
+			return nil
+		}
+		out[i] = v.(string)
+	}
+	return out
+}
+
+// eraState is one child process's version: its machine, and what carries out
+// the machine's effects. One is created per process (StartBridge,
+// ReplaceChild) and never reused. Every field but flushMu is guarded by
+// Bridge.mu.
 type eraState struct {
-	child *StdioChild
-	m     eraMachine
-	// wait holds the live probe's waiters and timer: non-nil exactly while
-	// m.probe is live, for the same id.
-	wait *probeWait
+	child   *StdioChild
+	m       eraMachine
+	decided chan struct{} // closed once, when m leaves phasePending
+	timer   *time.Timer   // the probe's timeout
+	// refused holds the clients whose refused initialize was logged: one
+	// entry per name, and one shared by every client without a string name.
+	refused map[refusedClient]bool
+	// queued is what the applied events and refusals leave to do outside
+	// Bridge.mu (log lines, closing the push stream), in the order they
+	// happened; flushEra runs it once Bridge.mu is released, under flushMu so
+	// that two flushes cannot reorder it.
+	queued  []func()
+	flushMu sync.Mutex
 }
 
-type probeWait struct {
-	id     string
-	done   chan struct{} // closed once, under Bridge.mu, when the probe settles
-	timer  *time.Timer
-	result eraAnswer // set before done is closed
+type refusedClient struct {
+	name     string
+	nameless bool
 }
 
-func (b *Bridge) newEraState(child *StdioChild) *eraState {
-	return &eraState{child: child, m: newEraMachine(b.probeTimeout, b.reprobeCap)}
+func newEraState(child *StdioChild) *eraState {
+	return &eraState{child: child, decided: make(chan struct{}), refused: map[refusedClient]bool{}}
+}
+
+// startProbe arms st's probe timer and writes the probe. The write runs on its
+// own goroutine: a child that does not read its stdin is the timer's to
+// decide. A failed write ends st through the child's error listener
+// (wireChild), or its exit.
+func (b *Bridge) startProbe(st *eraState) {
+	b.mu.Lock()
+	if st.m.ended {
+		b.mu.Unlock()
+		return
+	}
+	st.timer = time.AfterFunc(b.probeTimeout, func() {
+		b.mu.Lock()
+		b.applyEraLocked(st, eraEvent{kind: evTimeout})
+		b.mu.Unlock()
+		b.flushEra(st)
+	})
+	b.mu.Unlock()
+	go func() { _ = st.child.Send(probeRequest()) }()
 }
 
 // applyEraLocked feeds ev to st's machine and carries out its effects; it is
-// the only thing that changes era state. b.mu must be held.
-func (b *Bridge) applyEraLocked(st *eraState, ev eraEvent) eraEffects {
+// the only thing that changes era state. b.mu must be held. What cannot be
+// done under b.mu (the log, closing the push stream) is queued on st: the
+// caller runs flushEra(st) once b.mu is released.
+func (b *Bridge) applyEraLocked(st *eraState, ev eraEvent) {
+	counted := st.m.countsInits()
 	var eff eraEffects
 	st.m, eff = st.m.apply(ev)
-	if eff.release != answerNone {
-		w := st.wait
-		st.wait = nil
-		w.timer.Stop()
-		w.result = eff.release
-		close(w.done)
+	if eff.decided {
+		if st.timer != nil {
+			st.timer.Stop()
+		}
+		close(st.decided)
 	}
-	if eff.start != "" {
-		b.startProbeLocked(st, eff.start)
-		go b.writeProbe(st, eff.start)
+	if counted && !st.m.countsInits() {
+		b.dropAbandonedInitsLocked(st)
+	}
+	for _, line := range eff.log {
+		st.queued = append(st.queued, func() { b.log.Info(line, "server", b.name) })
 	}
 	if eff.ignored != "" {
-		msg := "era event ignored"
-		if ev.kind == evProbeAnswer {
-			msg = "late or unknown server/discover answer, dropping"
-		}
-		b.log.Debug(msg, "server", b.name, "event", ev.kind, "id", ev.id, "reason", eff.ignored)
+		st.queued = append(st.queued, func() {
+			b.log.Debug("era event ignored", "server", b.name, "event", ev.kind, "reason", eff.ignored)
+		})
 	}
-	return eff
+	if eff.toV2 {
+		st.queued = append(st.queued, func() { b.closePushStream(st) })
+	}
 }
 
-// startProbeLocked registers the waiters and timer of st's new probe id; the
-// caller writes it.
-func (b *Bridge) startProbeLocked(st *eraState, id string) {
-	w := &probeWait{id: id, done: make(chan struct{})}
-	w.timer = time.AfterFunc(time.Until(st.m.probe.deadline), func() { b.probeTimedOut(st, id) })
-	st.wait = w
-}
-
-// writeProbe writes probe id to st's child and reports how that went. It runs
-// on its own goroutine: a write blocked on a full stdin must not outlast the
-// probe's timer for the requests waiting on it.
-func (b *Bridge) writeProbe(st *eraState, id string) {
-	err := st.child.Send(probeRequest(id))
+// flushEra runs what st has queued, in the order it was queued. b.mu must not
+// be held.
+func (b *Bridge) flushEra(st *eraState) {
+	st.flushMu.Lock()
+	defer st.flushMu.Unlock()
 	b.mu.Lock()
-	b.applyEraLocked(st, eraEvent{kind: evWriteDone, id: id, failed: err != nil, now: time.Now()})
+	queued := st.queued
+	st.queued = nil
 	b.mu.Unlock()
-	if err != nil {
-		b.log.Debug("failed to send server/discover probe to stdio child", "server", b.name, "err", err)
+	for _, f := range queued {
+		f()
 	}
 }
 
-// probeTimedOut is a probe's timer. It treats the child as legacy for now.
-// The discover request is deliberately not cancelled: the cancellation would
-// sit in the child's stdin right behind it, and a slow-starting modern server
-// that honours it would never answer, leaving the process legacy for good.
-func (b *Bridge) probeTimedOut(st *eraState, id string) {
+// closePushStream ends the push stream of st, a process that turned v2. A
+// respawn that has already put another process in st's place owns the hub
+// now, so it is left alone.
+func (b *Bridge) closePushStream(st *eraState) {
 	b.mu.Lock()
-	eff := b.applyEraLocked(st, eraEvent{kind: evProbeTimer, id: id, now: time.Now()})
+	current := b.era == st
 	b.mu.Unlock()
-	if eff.release != answerNone {
-		b.log.Debug("server/discover probe timed out; treating the child as legacy for now", "server", b.name)
+	if current {
+		b.pushHub.Close()
 	}
 }
 
-// endEraLocked ends st's machine: the process exited or was replaced, or the
-// bridge is closing. Waiters on its probe get "gone".
+// endEraLocked ends st's machine: the process exited or was replaced, a write
+// to it failed, or the bridge is closing. Requests waiting for its verdict are
+// told it is not running.
 func (b *Bridge) endEraLocked(st *eraState) {
-	if st != nil {
-		b.applyEraLocked(st, eraEvent{kind: evGone})
-	}
+	b.applyEraLocked(st, eraEvent{kind: evGone})
 }
 
-func (b *Bridge) currentChildEra() (*StdioChild, *eraState) {
+// endDeadChild ends st and closes c, a child whose stdin can no longer be
+// written: requests get "not running", and its exit takes the host's usual
+// restart path. b.mu must not be held.
+func (b *Bridge) endDeadChild(c *StdioChild, st *eraState) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.child, b.era
-}
-
-// eraRefusesLegacy reports whether the bridge refuses 2025-style traffic for
-// the current process itself (eraMachine.refusesLegacy).
-func (b *Bridge) eraRefusesLegacy() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	_, refuses := b.era.m.refusesLegacy()
-	return refuses
-}
-
-// legacyRefusalVersions returns the versions to name in st's refusal of
-// 2025-style traffic, iff st refuses it.
-func (b *Bridge) legacyRefusalVersions(st *eraState) ([]string, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return st.m.refusesLegacy()
-}
-
-func (b *Bridge) legacyVersionOf(st *eraState) string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return st.m.legacyVersion
-}
-
-// discover returns st's era answer for a modern request. With a verdict it
-// answers at once (possibly starting a background probe); with none it joins
-// the live probe, or starts one, and waits. The probe runs independently of
-// any caller: a caller whose ctx ends just leaves. Its wait is bounded by the
-// probe's timer and by until, the point where this request stops waiting
-// whatever the probe does; a zero until sets no bound of its own. A request
-// that joined a probe from before the first initialize asks once more when it
-// settles, within a probe timeout of its start in all.
-func (b *Bridge) discover(ctx context.Context, st *eraState, until time.Time) eraAnswer {
-	start := time.Now()
-	ans, again := b.discoverOnce(ctx, st, until)
-	if again && ans != answerGone && ans != answerCancelled {
-		if until.IsZero() {
-			until = start.Add(b.probeTimeout)
-		}
-		ans, _ = b.discoverOnce(ctx, st, until)
-	}
-	return ans
-}
-
-func (b *Bridge) discoverOnce(ctx context.Context, st *eraState, until time.Time) (eraAnswer, bool) {
-	exited := st.child.HasExited()
-	b.mu.Lock()
-	if b.era != st {
-		b.mu.Unlock()
-		return answerGone, false
-	}
-	eff := b.applyEraLocked(st, eraEvent{kind: evModernRequest, now: time.Now(), exited: exited})
-	if !eff.wait {
-		b.mu.Unlock()
-		return eff.answer, false
-	}
-	w := st.wait
+	b.endEraLocked(st)
 	b.mu.Unlock()
-	return b.waitProbe(ctx, st, w, until), eff.again
+	b.flushEra(st)
+	go func() { _ = c.Close() }()
 }
 
-// waitProbe waits for w's probe to settle, until, or ctx.
-func (b *Bridge) waitProbe(ctx context.Context, st *eraState, w *probeWait, until time.Time) eraAnswer {
-	var expireC <-chan time.Time
+// snapshotEra returns the current process and its machine as they are now.
+func (b *Bridge) snapshotEra() (*StdioChild, *eraState, eraMachine) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.child, b.era, b.era.m
+}
+
+type waitOutcome int
+
+const (
+	waitDecided   waitOutcome = iota
+	waitGone                  // st is no longer live, or until passed first
+	waitCancelled             // ctx ended first
+)
+
+// waitVerdict waits until st has a verdict, and returns its machine. The wait
+// is bounded by the probe's timer, by ctx, and by until unless it is zero.
+func (b *Bridge) waitVerdict(ctx context.Context, st *eraState, until time.Time) (eraMachine, waitOutcome) {
+	var expire <-chan time.Time
 	if !until.IsZero() {
-		expire := time.NewTimer(time.Until(until))
-		defer expire.Stop()
-		expireC = expire.C
+		t := time.NewTimer(time.Until(until))
+		defer t.Stop()
+		expire = t.C
 	}
 	select {
-	case <-w.done:
-	case <-expireC:
-		b.mu.Lock()
-		defer b.mu.Unlock()
-		if b.era != st {
-			return answerGone
-		}
-		now := time.Now()
-		if st.wait == w && !now.Before(st.m.probe.deadline) {
-			// The timer is due but has not run: settle the probe here, so the
-			// answer returned and the verdict cached are the same.
-			b.applyEraLocked(st, eraEvent{kind: evProbeTimer, id: w.id, now: now})
-		}
-		if st.wait != w {
-			return w.result
-		}
-		return st.m.timeoutAnswer(now)
+	case <-st.decided:
+	case <-expire:
 	case <-ctx.Done():
-		return answerCancelled
+		return eraMachine{}, waitCancelled
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.era != st {
-		return answerGone
+	if b.era != st || st.m.ended || st.m.version() == versionUnknown {
+		return st.m, waitGone
 	}
-	return w.result
+	return st.m, waitDecided
 }
 
-func probeRequest(id string) map[string]any {
+// awaitVerdict waits for the verdict of st, the process a request found. A
+// respawn can land while it waits, so a process that is gone by then is
+// retried once against the current one; both waits share one deadline of a
+// probe timeout from the first.
+func (b *Bridge) awaitVerdict(ctx context.Context, child *StdioChild, st *eraState) (*StdioChild, *eraState, eraMachine, waitOutcome) {
+	start := time.Now()
+	m, out := b.waitVerdict(ctx, st, time.Time{})
+	if out == waitGone {
+		if child2, st2, _ := b.snapshotEra(); st2 != st {
+			child, st = child2, st2
+			m, out = b.waitVerdict(ctx, st, start.Add(b.probeTimeout))
+		}
+	}
+	return child, st, m, out
+}
+
+// admit waits for the verdict of the process a request found (awaitVerdict).
+// Unless it gets one, the request has already been answered (or, for a client
+// that went away, deliberately not).
+func (b *Bridge) admit(w http.ResponseWriter, r *http.Request, child *StdioChild, st *eraState) (*StdioChild, *eraState, eraMachine, bool) {
+	child, st, m, out := b.awaitVerdict(r.Context(), child, st)
+	switch out {
+	case waitDecided:
+		return child, st, m, true
+	case waitGone:
+		writeJSONFlush(w, 502, map[string]any{"error": "local server is not running"})
+	}
+	return nil, nil, eraMachine{}, false
+}
+
+func probeRequest() map[string]any {
 	return map[string]any{
 		"jsonrpc": "2.0",
-		"id":      id,
+		"id":      probeID,
 		"method":  "server/discover",
 		"params": map[string]any{"_meta": map[string]any{
 			protocolVersionMetaKey:    modernProtocolVersion,
@@ -317,67 +330,17 @@ func probeRequest(id string) map[string]any {
 	}
 }
 
-// handleProbeResponse feeds the child's answer to a probe id to st's machine,
-// which tells a live probe's answer from a late one.
-func (b *Bridge) handleProbeResponse(st *eraState, id string, msg map[string]any) {
-	outcome, versions := classifyProbe(msg)
+// handleProbeResponse feeds the child's answer to the probe to st's machine.
+func (b *Bridge) handleProbeResponse(st *eraState, msg map[string]any) {
 	b.mu.Lock()
-	eff := b.applyEraLocked(st, eraEvent{kind: evProbeAnswer, id: id, outcome: outcome, versions: versions, now: time.Now()})
+	b.applyEraLocked(st, eraEvent{kind: evAnswer, versions: discoverVersions(msg)})
 	b.mu.Unlock()
-	if eff.release == answerNone && eff.ignored == "" {
-		b.log.Debug("late server/discover answer applied", "server", b.name, "id", id, "outcome", outcome)
-	}
-}
-
-// classifyProbe sorts a probe's answer three ways. Modern: a DiscoverResult
-// with supportedVersions, or a recognised modern error (-32020, -32021,
-// -32022). Explicit legacy: -32601, or a result without supportedVersions
-// (null counts as absent).
-// Anything else is soft legacy: legacy for now, as a booting or uninitialised
-// child may answer. The versions are the child's list, nil when it gave none
-// or one versionList rejects (modern, but not provably modern-only).
-func classifyProbe(msg map[string]any) (probeOutcome, []string) {
-	if result, ok := isRecord(msg["result"]); ok {
-		raw := result["supportedVersions"]
-		if raw == nil {
-			return probeLegacy, nil
-		}
-		list, _ := versionList(raw)
-		return probeModern, list
-	}
-	errObj, _ := isRecord(msg["error"])
-	code, _ := eraErrorCode(errObj)
-	switch code {
-	case -32020, -32021:
-		return probeModern, nil
-	case -32022:
-		data, _ := isRecord(errObj["data"])
-		list, _ := versionList(data["supported"])
-		return probeModern, list
-	case -32601:
-		return probeLegacy, nil
-	}
-	return probeSoftLegacy, nil
+	b.flushEra(st)
 }
 
 func errorCode(errObj map[string]any) int {
 	code, _ := errObj["code"].(float64)
 	return int(code)
-}
-
-// eraErrorCode is an error's code compared as a number, for era
-// classification: -32601.0 is -32601, while a fractional or non-numeric code
-// is no code at all (ok false, and 0, which no rule matches).
-func eraErrorCode(errObj map[string]any) (int, bool) {
-	switch c := errObj["code"].(type) {
-	case float64:
-		if c == math.Trunc(c) && math.Abs(c) <= 1<<31 {
-			return int(c), true
-		}
-	case int:
-		return c, true
-	}
-	return 0, false
 }
 
 // modernErrorStatus maps a modern child's final error to the HTTP status
@@ -396,32 +359,6 @@ func modernErrorStatus(msg map[string]any) int {
 	return http.StatusOK
 }
 
-// legacyChildError is the 400 a modern-shaped request gets from a legacy
-// child. -32600 on purpose: a modern server's own answers (-32601, -32602,
-// -32020..-32022) would make a dual-era client stay modern instead of
-// falling back to initialize.
-func legacyChildError(id any, version string) map[string]any {
-	msg := "initialize is required: this server speaks the legacy MCP protocol"
-	if version != "" {
-		msg += " (version " + version + ")"
-	}
-	msg += "; send initialize first"
-	return jsonRPCErrorBody(id, -32600, msg, nil)
-}
-
-// legacyRequestRefusal is the 400 the bridge itself gives, without forwarding,
-// to any 2025-style request once it refuses 2025 traffic for the child; lead is what
-// the client asked for that is refused.
-func legacyRequestRefusal(id any, lead string, supported []string) map[string]any {
-	msg := lead + ": this server only speaks MCP protocol version(s) " +
-		strings.Join(supported, ", ") + "; send requests carrying _meta[\"" + protocolVersionMetaKey + "\"]"
-	list := make([]any, len(supported))
-	for i, v := range supported {
-		list[i] = v
-	}
-	return jsonRPCErrorBody(id, -32600, msg, map[string]any{"supported": list})
-}
-
 func jsonRPCErrorBody(id any, code int, message string, data any) map[string]any {
 	e := map[string]any{"code": code, "message": message}
 	if data != nil {
@@ -430,108 +367,101 @@ func jsonRPCErrorBody(id any, code int, message string, data any) map[string]any
 	return map[string]any{"jsonrpc": "2.0", "id": id, "error": e}
 }
 
-// refuseLegacyRequest answers a 2025-style request with the 400 refusal if
-// the bridge refuses 2025 traffic for this process (eraMachine.refusesLegacy),
-// and reports whether it did. Otherwise the request, initialize included, is
-// forwarded and the child's own answer decides.
-func (b *Bridge) refuseLegacyRequest(w http.ResponseWriter, parsed map[string]any, st *eraState) bool {
-	supported, only := b.legacyRefusalVersions(st)
-	if !only {
-		return false
+// refusalBody is the bridge's own error answering msg in its stead: it echoes
+// msg's id, and has no id member if msg has none (a notification).
+func refusalBody(msg map[string]any, code int, message string, data any) map[string]any {
+	body := jsonRPCErrorBody(msg["id"], code, message, data)
+	if _, hasID := msg["id"]; !hasID {
+		delete(body, "id")
 	}
-	method, _ := parsed["method"].(string)
-	lead := "2025-style " + method + " is not supported"
-	id := parsed["id"]
-	switch method {
-	case "initialize":
-		lead = "initialize is not supported"
-	case "":
-		// The id of a client response is in the server's id space, not a
-		// request of the client's to answer.
-		lead = "2025-style client responses are not supported"
-		id = nil
-	}
-	writeJSON(w, http.StatusBadRequest, legacyRequestRefusal(id, lead, supported))
-	b.noteLegacyRefused(st)
-	return true
+	return body
 }
 
-// refuseStatelessMethod answers GET or DELETE with 405 if the bridge refuses
-// 2025 traffic for the current process (the 2026-07-28 HTTP binding has no
-// standalone stream and no sessions to terminate), and reports whether it
-// did.
-func (b *Bridge) refuseStatelessMethod(w http.ResponseWriter) bool {
+// v1FallbackError is the 400 a modern-shaped message gets on a v1 process.
+// -32600 on purpose: a modern server's own answers (-32601, -32602,
+// -32020..-32022) would make a dual-era client stay modern instead of
+// falling back to initialize.
+func v1FallbackError(msg map[string]any) map[string]any {
+	return refusalBody(msg, -32600, v1Fallback, nil)
+}
+
+// refuseV1Message answers a 2025-style message other than initialize on a v2
+// process with the bridge's own 400; the child never sees it. versions are
+// the process's.
+func refuseV1Message(w http.ResponseWriter, parsed map[string]any, versions []string) {
+	writeJSON(w, http.StatusBadRequest, refusalBody(parsed, -32600, v2RequestRefusal(versions), map[string]any{"supported": versions}))
+}
+
+// refuseInitialize answers a 2025 initialize on a v2 process, and logs the
+// refused client once per name for the process, after the lines st's events
+// queued before it.
+func (b *Bridge) refuseInitialize(w http.ResponseWriter, parsed map[string]any, st *eraState, versions []string) {
+	params, _ := isRequestParams(parsed)
+	requested, _ := params["protocolVersion"].(string)
+	writeJSON(w, http.StatusBadRequest, jsonRPCErrorBody(parsed["id"], -32022, v2InitializeRefusal(versions),
+		map[string]any{"supported": versions, "requested": requested}))
+
+	info, _ := isRecord(params["clientInfo"])
+	name, isName := info["name"].(string)
+	key := refusedClient{name: name, nameless: !isName}
 	b.mu.Lock()
-	st := b.era
-	_, only := st.m.refusesLegacy()
-	b.mu.Unlock()
-	if !only {
-		return false
-	}
-	writeMethodNotAllowed(w)
-	b.noteLegacyRefused(st)
-	return true
-}
-
-// noteLegacyRefused tells st's machine that 2025-style traffic was refused
-// on its verdict, after the refusal is written.
-func (b *Bridge) noteLegacyRefused(st *eraState) {
-	b.mu.Lock()
-	b.applyEraLocked(st, eraEvent{kind: evLegacyRefused, now: time.Now()})
-	b.mu.Unlock()
-}
-
-// admitModern gates a modern-shaped request on the child's era. It reports
-// whether the request may be forwarded, and to which process: a respawn can
-// land between the caller's snapshot and the probe, so a stale snapshot is
-// retried once against the current child. Both attempts share one deadline of
-// a probe timeout from the first, so the retry gets only what is left; the
-// first attempt is bounded by the probe's own timer, which ends within that
-// timeout. Otherwise it has already answered (or, for a client that went away,
-// deliberately not).
-func (b *Bridge) admitModern(w http.ResponseWriter, r *http.Request, parsed map[string]any, child *StdioChild, st *eraState) (*StdioChild, *eraState, bool) {
-	start := time.Now()
-	v := b.discover(r.Context(), st, time.Time{})
-	if v == answerGone {
-		if child2, st2 := b.currentChildEra(); st2 != st {
-			child, st = child2, st2
-			v = b.discover(r.Context(), st, start.Add(b.probeTimeout))
+	if !st.refused[key] && len(st.refused) < maxRefusedNames {
+		st.refused[key] = true
+		line := logRefusedNamelessClient(versions)
+		if isName {
+			line = logRefusedClient(name, versions)
 		}
+		st.queued = append(st.queued, func() { b.log.Warn(line, "server", b.name) })
 	}
-	switch v {
-	case answerModern:
-		return child, st, true
-	case answerLegacy:
-		writeJSON(w, http.StatusBadRequest, legacyChildError(parsed["id"], b.legacyVersionOf(st)))
-	case answerGone:
-		writeJSONFlush(w, 502, map[string]any{"error": "local server is not running"})
-	}
-	return nil, nil, false
+	b.mu.Unlock()
+	b.flushEra(st)
 }
 
-// noteInitializeAnswer feeds the child's answer to an initialize to st's
-// machine. It runs on the child's pump for every initialize answer, whether
-// or not a handler is still waiting for it, so an abandoned initialize still
-// counts.
+// refuseStatelessMethod answers GET or DELETE with 405 once the current
+// process is v2 (the 2026-07-28 HTTP binding has no standalone stream and no
+// sessions to terminate), and reports whether the request is answered. A
+// request to a process that has already ended is not its to answer. Otherwise
+// it waits for the verdict, and gets "not running" if there is none by the
+// end of the wait.
+func (b *Bridge) refuseStatelessMethod(w http.ResponseWriter, r *http.Request) bool {
+	child, st, m := b.snapshotEra()
+	if m.ended {
+		return false
+	}
+	_, _, m, out := b.awaitVerdict(r.Context(), child, st)
+	switch {
+	case out == waitCancelled:
+		return true
+	case m.version() == versionUnknown:
+		writeJSONFlush(w, 502, map[string]any{"error": "local server is not running"})
+		return true
+	case out != waitDecided || m.version() != versionV2:
+		return false
+	}
+	w.Header().Set("Allow", "POST")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	_, _ = io.WriteString(w, v2NoSessions(m.versions))
+	return true
+}
+
+// noteInitializeAnswer feeds the child's answer to a forwarded initialize to
+// st's machine. It runs on the child's pump, before the handler sees the
+// answer.
 func (b *Bridge) noteInitializeAnswer(st *eraState, msg map[string]any) {
-	var ev eraEvent
-	if isResultMsg(msg) {
-		result, _ := isRecord(msg["result"])
-		v, has := result["protocolVersion"].(string)
-		ev = eraEvent{kind: evInitAccepted, version: v, hasVersion: has}
-	} else {
-		cls, versions := classifyInitializeRejection(msg)
-		ev = eraEvent{kind: evInitRejected, rejClass: cls, versions: versions, now: time.Now()}
+	ev := eraEvent{kind: evInitOK}
+	if !isResultMsg(msg) {
+		ev = eraEvent{kind: evInitFailed, versions: rejectionVersions(msg)}
 	}
 	b.mu.Lock()
 	b.applyEraLocked(st, ev)
 	b.mu.Unlock()
+	b.flushEra(st)
 }
 
 // completeInitialize answers a 2025-style initialize from the handler
 // goroutine, off the child's pump (which has already fed the answer to the
-// era state). A rejection is the child's own error in a 400, unchanged, never
-// waiting on a probe: pure 2025 traffic must not pay for era detection.
+// era state). A rejection is the child's own error in a 400, unchanged.
 func (b *Bridge) completeInitialize(entry *pendingEntry, msg map[string]any) {
 	if isResultMsg(msg) {
 		entry.resolveInitialized(msg, func() map[string]string {
@@ -542,35 +472,6 @@ func (b *Bridge) completeInitialize(entry *pendingEntry, msg map[string]any) {
 	entry.respond(http.StatusBadRequest, msg)
 }
 
-// classifyInitializeRejection sorts a rejected initialize. It looks modern
-// ("no initialize here") with code -32601 or -32022, or a data.supported array;
-// it is modern-only evidence only when data.supported is a non-empty list of
-// modern versions, returned as the second value. A valid list naming a
-// 2025-era version says the child does take initialize, whatever the code:
-// rejLegacyListed. The bridge never makes up a list.
-func classifyInitializeRejection(msg map[string]any) (rejectionClass, []string) {
-	errObj, _ := isRecord(msg["error"])
-	data, _ := isRecord(errObj["data"])
-	// Only an array counts as carrying a list; null or anything else leaves
-	// the rejection to its code.
-	raw, hasList := data["supported"].([]any)
-	code, _ := eraErrorCode(errObj)
-	switch {
-	case !hasList && code != -32601 && code != -32022:
-		return rejNotModern, nil
-	case !hasList:
-		return rejBare, nil
-	}
-	list, ok := versionList(raw)
-	switch {
-	case ok && onlyModernVersions(list):
-		return rejModernOnly, list
-	case ok && len(list) > 0:
-		return rejLegacyListed, nil
-	}
-	return rejMixed, nil
-}
-
 func isResultMsg(msg map[string]any) bool {
 	_, isErr := msg["error"]
 	_, hasResult := msg["result"]
@@ -578,9 +479,9 @@ func isResultMsg(msg map[string]any) bool {
 }
 
 // modernRequestProblem validates a modern-shaped request that is about to be
-// forwarded to a modern child: the standard request headers must match the
+// forwarded to a v2 child: the standard request headers must match the
 // body (-32020), and the per-request clientCapabilities must be present
-// (-32602). The caller has already established that the era is modern.
+// (-32602).
 func modernRequestProblem(r *http.Request, parsed map[string]any) (int, string) {
 	params, _ := isRequestParams(parsed)
 	meta, _ := getMeta(params)

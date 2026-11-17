@@ -4,11 +4,12 @@
 // test/fixtures/fake-mcp-stdio.mjs — see that file's header for the full
 // method-by-method behaviour this mirrors (initialize/ping/tools/list,
 // notifications/emit, server/request(-1), slow, with-progress,
-// subscriptions/listen+push+finish, notifications/cancelled +
-// debug/wasCancelled, hang, debug/crash, --crash-after-ms=<n>) — plus one
-// non-JSON banner line on stdout and one on stderr at startup, which the
-// bridge/stdio child must tolerate, and a Go-only debug/replyThenExit
-// case (blocker 1's os/exec Wait/pipe-race regression test).
+// subscriptions/listen, notifications/cancelled + debug/wasCancelled, hang,
+// debug/crash, --crash-after-ms=<n>) — plus one non-JSON banner line on
+// stdout and one on stderr at startup, which the bridge/stdio child must
+// tolerate, and a Go-only debug/replyThenExit case (blocker 1's os/exec
+// Wait/pipe-race regression test). It answers server/discover as an unknown
+// method, as a 2025-era server does.
 package main
 
 import (
@@ -93,30 +94,9 @@ func main() {
 				initializeDelay = time.Duration(n) * time.Millisecond
 			}
 		}
-		if n, ok := strings.CutPrefix(arg, "--discover-drop="); ok {
-			if v, err := strconv.Atoi(n); err == nil {
-				discoverDrop = v
-			}
-		}
-		if ms, ok := strings.CutPrefix(arg, "--startup-delay-ms="); ok {
-			if n, err := strconv.Atoi(ms); err == nil {
-				startupDelay = time.Duration(n) * time.Millisecond
-			}
-		}
-		if path, ok := strings.CutPrefix(arg, "--stdin-stall-until-file="); ok {
-			stdinStallFile = path
-		}
-		if spec, ok := strings.CutPrefix(arg, "--discover-error="); ok {
-			c, n, _ := strings.Cut(spec, ":")
-			code, err1 := strconv.Atoi(c)
-			count, err2 := strconv.Atoi(n)
-			if err1 == nil && err2 == nil {
-				discoverErrorCode, discoverErrorCount = code, count
-			}
-		}
-		if c, ok := strings.CutPrefix(arg, "--reject-code="); ok {
+		if c, ok := strings.CutPrefix(arg, "--discover-error="); ok {
 			if n, err := strconv.Atoi(c); err == nil {
-				rejectCode, rejectCodeSet = n, true
+				discoverErrorCode = n
 			}
 		}
 		switch arg {
@@ -124,16 +104,8 @@ func main() {
 			discoverHold = true
 		case "--initialize-hold":
 			initializeHold = true
-		case "--reject-modern-evidence":
-			rejectModernEvidence = true
-		case "--modern-bare-initialize-rejection":
-			modernBareInitializeRejection = true
 		case "--discover-no-versions":
 			discoverNoVersions = true
-		case "--discover-modern-version-only":
-			discoverModernOnly = true
-		case "--reject-legacy-list":
-			rejectLegacyList = true
 		case "--listen":
 			listenMode = true
 		case "--listen-no-ack":
@@ -154,60 +126,10 @@ func main() {
 		}
 	}
 
-	// A stall reads nothing at all, so the OS pipe fills and the writer blocks.
-	for stdinStallFile != "" {
-		if _, err := os.Stat(stdinStallFile); err == nil {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	lines := make(chan string, 4096)
-	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		sc.Buffer(make([]byte, 0, 64*1024), 32*1024*1024)
-		for sc.Scan() {
-			lines <- sc.Text()
-		}
-		close(lines)
-	}()
-	// A slow start reads nothing for a while; then, like a server draining
-	// its backlog, it learns of every cancellation in it before handling any
-	// request in it.
-	var backlog []string
-	if startupDelay > 0 {
-		time.Sleep(startupDelay)
-	drain:
-		for {
-			select {
-			case l, ok := <-lines:
-				if !ok {
-					break drain
-				}
-				backlog = append(backlog, l)
-			default:
-				break drain
-			}
-		}
-		for _, l := range backlog {
-			var m map[string]any
-			if json.Unmarshal([]byte(l), &m) == nil && m["method"] == "notifications/cancelled" {
-				p, _ := m["params"].(map[string]any)
-				stateMu.Lock()
-				cancelledRequestIDs[p["requestId"]] = true
-				stateMu.Unlock()
-			}
-		}
-	}
-	for {
-		var line string
-		if len(backlog) > 0 {
-			line, backlog = backlog[0], backlog[1:]
-		} else {
-			var ok bool
-			if line, ok = <-lines; !ok {
-				break
-			}
-		}
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 0, 64*1024), 32*1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
@@ -242,13 +164,7 @@ func main() {
 		case "initialize":
 			reply(id, map[string]any{"ok": true})
 		case "server/discover":
-			reply(id, map[string]any{
-				"resultType":        "complete",
-				"supportedVersions": []any{modernVersion, legacyVersion},
-				"capabilities":      map[string]any{"tools": map[string]any{}},
-				"ttlMs":             0,
-				"cacheScope":        "private",
-			})
+			replyError(id, -32601, "Method not found: server/discover", nil)
 		case "ping":
 			reply(id, "pong")
 		case "tools/list":
@@ -307,23 +223,6 @@ func main() {
 				}
 			}
 			notifyTagged("notifications/subscriptions/acknowledged", map[string]any{"notifications": notifications}, id)
-		case "subscriptions/push":
-			params, _ := msg["params"].(map[string]any)
-			subscriptionID := params["subscriptionId"]
-			notifyMethod, _ := params["notifyMethod"].(string)
-			notifyParams, _ := params["notifyParams"].(map[string]any)
-			if notifyParams == nil {
-				notifyParams = map[string]any{}
-			}
-			notifyTagged(notifyMethod, notifyParams, subscriptionID)
-		case "subscriptions/finish":
-			params, _ := msg["params"].(map[string]any)
-			subscriptionID := params["subscriptionId"]
-			result := params["result"]
-			if result == nil {
-				result = map[string]any{"resultType": "complete"}
-			}
-			reply(subscriptionID, result)
 		case "notifications/cancelled":
 			if params, ok := msg["params"].(map[string]any); ok {
 				stateMu.Lock()

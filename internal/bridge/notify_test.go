@@ -8,8 +8,9 @@ import (
 	"time"
 )
 
-// Client notifications: an enveloped one takes the era gate, and a cancel goes
-// only to the process its request was sent to.
+// Client notifications: an enveloped one waits for the verdict and reaches
+// only a v2 child, and a cancel goes only to the process its request was sent
+// to.
 
 const probeNote = "notifications/whatever"
 
@@ -43,7 +44,7 @@ func TestNotify_ModernShapedToALegacyChildIsRefused(t *testing.T) {
 	var m map[string]any
 	_ = json.Unmarshal([]byte(r.body), &m)
 	e, _ := m["error"].(map[string]any)
-	if v, hasID := m["id"]; r.status != 400 || e == nil || e["code"] != float64(-32600) || !hasID || v != nil {
+	if _, hasID := m["id"]; r.status != 400 || e == nil || e["code"] != float64(-32600) || hasID {
 		t.Fatalf("%d %s", r.status, r.body)
 	}
 	if indexOf(childReceived(t, b), probeNote) >= 0 {
@@ -51,11 +52,11 @@ func TestNotify_ModernShapedToALegacyChildIsRefused(t *testing.T) {
 	}
 }
 
-func TestNotify_WaitsBehindTheProbeThenFollowsIt(t *testing.T) {
-	b := startEraBridge(t, func(o *StartBridgeOptions) {
+func TestNotify_WaitsForTheVerdictThenFollowsTheProbe(t *testing.T) {
+	b := startEraBridgeCold(t, func(o *StartBridgeOptions) {
 		o.MaxPending = 1
 		o.MaxListens = 1
-	}, listenFakeDual, "--discover-hold")
+	}, listenFake, "--discover-hold")
 	b.mu.Lock()
 	idBefore := b.nextID
 	b.mu.Unlock()
@@ -68,7 +69,7 @@ func TestNotify_WaitsBehindTheProbeThenFollowsIt(t *testing.T) {
 		}
 		status <- code
 	}()
-	waitProbeInFlight(t, b)
+	time.Sleep(200 * time.Millisecond)
 	select {
 	case code := <-status:
 		t.Fatalf("answered %d while the probe was out", code)
@@ -81,20 +82,7 @@ func TestNotify_WaitsBehindTheProbeThenFollowsIt(t *testing.T) {
 	if idWaiting != idBefore || pending != 0 || listenCount(b) != 0 {
 		t.Fatalf("the waiting notification took state: next id %d -> %d, %d pending", idBefore, idWaiting, pending)
 	}
-	// 2025-style traffic never waits on the probe: with the one pending slot
-	// free, a request is answered while the notification is still waiting.
-	if r := eraPost(t, b, acceptJSON, map[string]any{"jsonrpc": "2.0", "id": 7, "method": "debug/requestCount"}, nil); r.status != 200 || !strings.Contains(r.body, `"count"`) {
-		t.Fatalf("a request beside the waiting notification: %d %s", r.status, r.body)
-	}
-	select {
-	case code := <-status:
-		t.Fatalf("the notification was answered (%d) before the probe was", code)
-	default:
-	}
-	if indexOf(childReceived(t, b), probeNote) >= 0 {
-		t.Fatal("forwarded while the probe was out")
-	}
-	releaseHeld(t, b)
+	releaseDirect(t, b)
 	select {
 	case code := <-status:
 		if code != 202 {
@@ -159,14 +147,11 @@ func TestNotify_ModernShapedSkipsHeaderValidation(t *testing.T) {
 	}
 }
 
-func TestNotify_Legacy2025ShapedIsNotGated(t *testing.T) {
-	b := startEraBridge(t, nil, listenFakeDual, "--discover-hold")
+func TestNotify_2025ShapedIsForwardedToAV1Child(t *testing.T) {
+	b := startEraBridge(t, nil, "--era=legacy")
 	body := map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"}
 	if r := eraPost(t, b, acceptJSON, body, nil); r.status != 202 {
 		t.Fatalf("%d %s", r.status, r.body)
-	}
-	if probeInFlight(b) {
-		t.Fatal("a 2025-shaped notification started a probe")
 	}
 	if indexOf(childReceived(t, b), "notifications/initialized") < 0 {
 		t.Fatal("not forwarded")
@@ -176,7 +161,7 @@ func TestNotify_Legacy2025ShapedIsNotGated(t *testing.T) {
 // An enveloped notifications/initialized is never forwarded; the 2025-shaped
 // one that follows a 2025 handshake still is.
 func TestNotify_EnvelopedInitializedIsNeverForwarded(t *testing.T) {
-	b := startEraBridge(t, nil, listenFakeDual)
+	b := startEraBridge(t, nil, "--era=legacy")
 	session := eraPost(t, b, acceptJSON, eraInitialize(1).body, nil).header.Get("Mcp-Session-Id")
 	hdr := map[string]string{"Mcp-Session-Id": session}
 
@@ -198,10 +183,10 @@ func TestNotify_EnvelopedInitializedIsNeverForwarded(t *testing.T) {
 
 // A client's cancel is written only to the process its request was sent to.
 func TestCancel_ClientCancelGoesOnlyToTheRequestsOwnProcess(t *testing.T) {
-	b := startEraBridge(t, nil, listenFakeDual)
+	b := startEraBridge(t, nil, "--era=legacy")
 	old := b.GetCurrentChild()
 	t.Cleanup(func() { _ = old.Close() })
-	next := newEraChild(t, listenFakeDual)
+	next := newEraChild(t, "--era=legacy")
 
 	addPending := func(id int64, clientID string, child *StdioChild) {
 		e := &pendingEntry{originalID: clientID, child: child, plain: httptest.NewRecorder(), timer: time.NewTimer(time.Hour), done: make(chan struct{})}

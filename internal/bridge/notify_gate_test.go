@@ -3,6 +3,7 @@ package bridge
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -19,11 +20,11 @@ func bareCancel(requestID any) map[string]any {
 		"params": map[string]any{"requestId": requestID}}
 }
 
-func TestNotify_RejectionDerivedVerdictAdmitsAModernNotification(t *testing.T) {
-	// The child rejects a forwarded initialize naming only 2026 versions, and
-	// its discover answer is held: the verdict is the rejection's.
-	b := startEraBridge(t, nil, "--era=modern", "--discover-hold")
-	if r := eraPost(t, b, acceptJSON, eraInitialize(1).body, nil); r.status != 400 {
+func TestNotify_FlippedProcessAdmitsAModernNotification(t *testing.T) {
+	// The child's discover answer is held past the timeout, and it rejects a
+	// forwarded initialize naming only 2026 versions: the process flips to v2.
+	b := startTimedOut(t, nil, "--era=modern", "--discover-hold")
+	if r := eraPost(t, b, acceptJSON, eraInitialize(1).body, nil); r.status != 400 || versionOf(b) != versionV2 {
 		t.Fatalf("setup: initialize %d %s", r.status, r.body)
 	}
 	if r := eraPost(t, b, acceptJSON, modernNotification(), nil); r.status != 202 {
@@ -40,7 +41,7 @@ func TestNotify_ModernCancelToALegacyChildIsRefused(t *testing.T) {
 	var m map[string]any
 	_ = json.Unmarshal([]byte(r.body), &m)
 	e, _ := m["error"].(map[string]any)
-	if v, hasID := m["id"]; r.status != 400 || e == nil || e["code"] != float64(-32600) || !hasID || v != nil {
+	if _, hasID := m["id"]; r.status != 400 || e == nil || e["code"] != float64(-32600) || hasID {
 		t.Fatalf("%d %s", r.status, r.body)
 	}
 	if indexOf(childReceived(t, b), "notifications/cancelled") >= 0 {
@@ -48,14 +49,11 @@ func TestNotify_ModernCancelToALegacyChildIsRefused(t *testing.T) {
 	}
 }
 
-// pendingModernOnModernChild holds a modern request with client id 1 on a
-// modern child whose verdict is cached, and returns its bridge id.
+// pendingModernOnModernChild holds a modern request with client id 1 on a v2
+// process and returns its bridge id.
 func pendingModernOnModernChild(t *testing.T) (*Bridge, int64) {
 	t.Helper()
 	b := startEraBridge(t, nil, listenFake)
-	if r := eraPost(t, b, acceptJSON, modernCall(1), nil); r.status != 200 {
-		t.Fatalf("setup: %d %s", r.status, r.body)
-	}
 	_, id := holdModernRequest(t, b)
 	return b, id
 }
@@ -72,34 +70,42 @@ func TestNotify_ModernCancelIsForwardedRewrittenWithItsEnvelope(t *testing.T) {
 	}
 }
 
-func TestNotify_BareCancelForAModernRequestIsForwardedBare(t *testing.T) {
+// A 2025-shaped cancel on a v2 process is refused; a 2026 client cancels by
+// closing its stream.
+func TestNotify_BareCancelOnV2IsRefused(t *testing.T) {
 	b, id := pendingModernOnModernChild(t)
-	if r := eraPost(t, b, acceptJSON, bareCancel(float64(1)), nil); r.status != 202 {
+	r := eraPost(t, b, acceptJSON, bareCancel(float64(1)), nil)
+	var m map[string]any
+	_ = json.Unmarshal([]byte(r.body), &m)
+	if _, hasID := m["id"]; r.status != 400 || hasID || !strings.Contains(r.body, "does not accept older MCP v1 requests") {
 		t.Fatalf("%d %s", r.status, r.body)
 	}
-	waitFor(t, "the cancel", func() bool { return childCancelCount(t, b, id) == 1 })
-	if has, meta := cancelMeta(t, b, id); has {
-		t.Fatalf("an envelope was added: %v", meta)
+	if n := childCancelCount(t, b, id); n != 0 {
+		t.Fatalf("the child got %d cancels", n)
 	}
 }
 
-func TestNotify_EnvelopedInitializedWithoutAVerdictStartsNoProbe(t *testing.T) {
-	b := startEraBridge(t, nil, listenFakeDual, "--discover-hold")
+// An enveloped notifications/initialized is answered without waiting for
+// the verdict, and never forwarded.
+func TestNotify_EnvelopedInitializedIsAnsweredWithoutWaiting(t *testing.T) {
+	b := startEraBridgeCold(t, nil, listenFake, "--discover-hold")
 	body := map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized", "params": map[string]any{"_meta": eraMeta(eraTestVersion)}}
-	if r := eraPost(t, b, acceptJSON, body, nil); r.status != 202 {
-		t.Fatalf("%d %s", r.status, r.body)
+	if r := eraPost(t, b, acceptJSON, body, nil); r.status != 202 || r.elapsed > 5*time.Second {
+		t.Fatalf("%d after %s: %s", r.status, r.elapsed, r.body)
 	}
-	if probeInFlight(b) {
-		t.Fatal("a probe was started")
+	if versionOf(b) != versionUnknown {
+		t.Fatal("setup: the verdict came before the notification was answered")
 	}
-	if got := childReceived(t, b); len(got) != 0 {
+	releaseDirect(t, b)
+	waitForVerdict(t, b)
+	if got := childReceived(t, b); indexOf(got, "notifications/initialized") >= 0 {
 		t.Fatalf("the child received %q", got)
 	}
 }
 
-func TestNotify_SoftLegacyVerdictRefusesAModernNotification(t *testing.T) {
+func TestNotify_ErrorAnswerRefusesAModernNotification(t *testing.T) {
 	for _, code := range []string{"-32602", "-32603"} {
-		b := startEraBridge(t, nil, "--era=modern", "--discover-error="+code+":5")
+		b := startEraBridge(t, nil, "--era=modern", "--discover-error="+code)
 		if r := eraPost(t, b, acceptJSON, modernNotification(), nil); r.status != 400 {
 			t.Fatalf("discover error %s: %d %s", code, r.status, r.body)
 		}
@@ -112,7 +118,7 @@ func TestNotify_SoftLegacyVerdictRefusesAModernNotification(t *testing.T) {
 // A request whose process has exited without being replaced: the cancel is
 // dropped and answered 202, and nothing is written.
 func TestCancel_ClientCancelForAnExitedProcessIsDropped(t *testing.T) {
-	b := startEraBridge(t, nil, listenFakeDual)
+	b := startEraBridge(t, nil, "--era=legacy")
 	live := b.GetCurrentChild()
 	dead := newBareChild()
 	dead.exited = true

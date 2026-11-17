@@ -277,8 +277,8 @@ func (b *Bridge) admitListen(l *listenEntry) (id int64, refusal string) {
 	return id, ""
 }
 
-// handleSubscriptionsListen serves a modern-shaped subscriptions/listen that
-// has passed the era gate against child. It is answered only as a stream, kept
+// handleSubscriptionsListen serves a modern-shaped subscriptions/listen on
+// child, a v2 process. It is answered only as a stream, kept
 // open until the child, the client or the bridge ends it.
 func (b *Bridge) handleSubscriptionsListen(w http.ResponseWriter, r *http.Request, parsed map[string]any, child *StdioChild) {
 	if !acceptsEventStream(r.Header.Values("Accept")) {

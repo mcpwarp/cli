@@ -14,10 +14,11 @@ import (
 	"time"
 )
 
-// This file pins how the bridge treats MCP protocol eras: a 2025-style
-// client (initialize, then Mcp-Session-Id) and a 2026-07-28-style client
+// This file pins how the bridge serves each child's MCP version: a 2025-style
+// client (initialize, then Mcp-Session-Id), a 2026-07-28-style client
 // (stateless _meta plus MCP-Protocol-Version/Mcp-Method/Mcp-Name headers, no
-// session) against fakemcp's --era modes, in both response forms.
+// session) and a dual-era client against fakemcp's --era modes, in both
+// response forms.
 // Expectations live in eraWant (era_matrix_want_test.go); when the bridge
 // changes on purpose, that table is the diff.
 //
@@ -34,7 +35,9 @@ const (
 	metaInfo    = "io.modelcontextprotocol/clientInfo"
 )
 
-var eraModes = []string{"legacy", "legacy-silent", "modern", "dual"}
+// eraModes are the child modes of the matrix: discover-error is a modern
+// child that answers server/discover with -32603, and so is served as v1.
+var eraModes = []string{"legacy", "legacy-silent", "discover-error", "modern"}
 
 var eraForms = []struct{ name, accept string }{
 	{"sse", "application/json, text/event-stream"},
@@ -144,6 +147,44 @@ func (c *eraCase) step(name string, req eraReq, extra map[string]string) eraExpe
 	}
 	c.last = got
 	return got
+}
+
+// stepMethod is step for a GET (asking for an SSE stream) or a DELETE,
+// carrying the session if there is one. A stream's body is "(stream)" and
+// is not read; a 405 names its Allow header.
+func (c *eraCase) stepMethod(name, method string) {
+	c.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), eraHangBound)
+	defer cancel()
+	hr, _ := http.NewRequestWithContext(ctx, method, c.url, nil)
+	hr.Header.Set("Accept", "text/event-stream")
+	if c.session != "" {
+		hr.Header.Set("Mcp-Session-Id", c.session)
+	}
+	resp, err := c.http.Do(hr)
+	if err != nil {
+		c.t.Fatalf("%s: %v", method, err)
+	}
+	defer resp.Body.Close()
+	got := eraExpect{status: resp.StatusCode, session: resp.Header.Get("Mcp-Session-Id") != "", body: "(empty)", outcome: eraOutcome(resp.StatusCode, nil)}
+	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		got.body, got.outcome = "(stream)", "stream"
+	} else if buf, _ := io.ReadAll(resp.Body); len(buf) > 0 {
+		got.body = string(buf)
+	}
+	if allow := resp.Header.Get("Allow"); allow != "" {
+		got.body += " (Allow: " + allow + ")"
+	}
+	key := strings.Join([]string{c.scenario, c.client, c.mode, c.form, name}, "|")
+	eraRowsMu.Lock()
+	eraRows = append(eraRows, eraRow{key: key, scenario: c.scenario, client: c.client, mode: c.mode, form: c.form, step: name, got: got})
+	eraSeen[key] = true
+	eraRowsMu.Unlock()
+	if want, ok := eraWant[key]; !ok {
+		c.t.Errorf("no expectation for %q; observed: %s", key, eraLiteral(key, got))
+	} else if want != got {
+		c.t.Errorf("%s\n  want %+v\n  got  %+v", key, want, got)
+	}
 }
 
 func eraNoDecision(e eraExpect) eraExpect {
@@ -277,15 +318,19 @@ func eraDiscoverDecision(g eraExpect) string {
 	return "fallback"
 }
 
-// runEra runs fn against a fresh bridge in front of fakemcp --era=<mode>,
-// as a parallel subtest, one per (mode, form). A silent child is the one
-// case that needs the probe to give up, so it gets a short probe timeout.
+// runEra runs fn against a fresh bridge in front of the fakemcp of mode, as
+// a parallel subtest, one per (mode, form). A silent child is the one case
+// that needs the probe to give up, so it gets a short probe timeout.
 func runEra(t *testing.T, scenario, client, mode string, formIdx int, fn func(c *eraCase)) {
 	var opts []func(*StartBridgeOptions)
-	if mode == "legacy-silent" {
+	args := []string{"--era=" + mode}
+	switch mode {
+	case "legacy-silent":
 		opts = append(opts, func(o *StartBridgeOptions) { o.ProbeTimeout = 500 * time.Millisecond })
+	case "discover-error":
+		args = []string{"--era=modern", "--discover-error=-32603"}
 	}
-	runEraWith(t, scenario, client, mode, []string{"--era=" + mode}, formIdx, fn, opts...)
+	runEraWith(t, scenario, client, mode, args, formIdx, fn, opts...)
 }
 
 // runEraWith is runEra with a free-form child: label is the "child mode"
@@ -313,7 +358,6 @@ func runEraWith(t *testing.T, scenario, client, mode string, args []string, form
 		t.Cleanup(func() { _ = b.Close() })
 		tr := &http.Transport{DisableKeepAlives: true}
 		t.Cleanup(tr.CloseIdleConnections)
-		warmUpFakeMCP(t, b)
 		fn(&eraCase{
 			t: t, scenario: scenario, client: client, mode: mode,
 			form: form.name, accept: form.accept, url: b.URL(), http: &http.Client{Transport: tr},
@@ -322,7 +366,8 @@ func runEraWith(t *testing.T, scenario, client, mode string, args []string, form
 }
 
 // releaseHeld makes a --discover-hold child send its held answers; they have
-// been handled by the bridge by the time this returns.
+// been handled by the bridge by the time this returns. It is a 2025-style
+// request, so only for a process served as v1.
 func (c *eraCase) releaseHeld() {
 	c.t.Helper()
 	got := c.do(eraReq{nil, map[string]any{"jsonrpc": "2.0", "id": 0, "method": "debug/release"}}, nil)
@@ -355,9 +400,13 @@ func TestEraMatrix(t *testing.T) {
 				runEra(t, "matrix", "2025", mode, fi, func(c *eraCase) {
 					c.step("initialize", eraInitialize(1), nil)
 					c.step("tools/call with session", eraLegacyToolsCall(2), sessionHdr(c))
+					c.stepMethod("GET stream", http.MethodGet)
+					c.stepMethod("DELETE session", http.MethodDelete)
 				})
 				runEra(t, "matrix", "2026", mode, fi, func(c *eraCase) {
 					c.step("tools/call stateless", eraToolsCall(1), nil)
+					c.step("notification", eraReq{nil, map[string]any{"jsonrpc": "2.0", "method": "notifications/message",
+						"params": map[string]any{"_meta": eraMeta("2026-07-28")}}}, nil)
 				})
 				runEra(t, "matrix", "dual-era", mode, fi, func(c *eraCase) {
 					probe := c.step("server/discover probe", eraModernReq(1, "server/discover", nil, "2026-07-28"), nil)
@@ -370,36 +419,21 @@ func TestEraMatrix(t *testing.T) {
 					c.step("fallback initialize", eraInitialize(2), nil)
 					c.step("tools/call with session", eraLegacyToolsCall(3), sessionHdr(c))
 				})
-
-				// A 2026-style request while the shared child is
-				// uninitialized, then a 2025 client initializing it, then the
-				// same 2026-style request again.
-				runEra(t, "shared-child", "2026+2025", mode, fi, func(c *eraCase) {
-					c.step("1 stateless before initialize", eraToolsCall(1), nil)
-					c.step("2 initialize by 2025 client", eraInitialize(2), nil)
-					c.step("3 stateless after initialize, no session", eraToolsCall(3), nil)
-					c.step("4 stateless after initialize, live session", eraToolsCall(4), sessionHdr(c))
-				})
 			}
 		}
 
 		for fi := range eraForms {
-			runEra(t, "failed-initialize", "2025", "modern", fi, func(c *eraCase) {
-				c.step("1 initialize rejected by child", eraInitialize(1), nil)
-				c.step("2 initialize again", eraInitialize(2), nil)
-			})
-			runEra(t, "failed-initialize", "2026", "modern", fi, func(c *eraCase) {
-				c.step("1 initialize rejected by child", eraInitialize(1), nil)
-				c.step("2 stateless tools/call afterwards", eraToolsCall(2), nil)
-			})
-
 			bogus := map[string]string{"Mcp-Session-Id": "no-such-session"}
 			runEra(t, "unknown-session", "2026", "modern", fi, func(c *eraCase) {
 				c.step("stateless with unknown Mcp-Session-Id, none minted", eraToolsCall(1), bogus)
 			})
-			runEra(t, "unknown-session", "2026", "dual", fi, func(c *eraCase) {
-				c.step("1 initialize by 2025 client", eraInitialize(1), nil)
-				c.step("2 stateless with unknown Mcp-Session-Id", eraToolsCall(2), bogus)
+			// A 2025 client holding a session from before a restart.
+			runEra(t, "stale-session", "2025", "modern", fi, func(c *eraCase) {
+				c.step("tools/call with an unknown session", eraLegacyToolsCall(1), bogus)
+			})
+			runEra(t, "stale-session", "2025", "legacy", fi, func(c *eraCase) {
+				c.step("1 initialize", eraInitialize(1), nil)
+				c.step("2 tools/call with an unknown session", eraLegacyToolsCall(2), bogus)
 			})
 
 			runEra(t, "headers", "2026", "modern", fi, func(c *eraCase) {
@@ -416,8 +450,7 @@ func TestEraMatrix(t *testing.T) {
 				c.step("1 bad MCP-Protocol-Version on a legacy child", eraToolsCall(1), map[string]string{"MCP-Protocol-Version": "1900-01-01"})
 			})
 
-			// A legacy child rejecting a single initialize is not mistaken
-			// for a modern-only one.
+			// A v1 child rejecting a single initialize is not locked out.
 			runEraWith(t, "bad-initialize", "2025", "legacy (rejects first initialize)", []string{"--era=legacy", "--reject-initialize=1"}, fi, func(c *eraCase) {
 				c.step("1 initialize rejected", eraInitialize(1), nil)
 				c.step("2 initialize again", eraInitialize(2), nil)
@@ -432,7 +465,7 @@ func TestEraMatrix(t *testing.T) {
 					c.step("2 initialize again", eraInitialize(2), nil)
 				}, func(o *StartBridgeOptions) { o.InitializeHoldTimeout = 300 * time.Millisecond })
 			// A modern child slower to answer discover than the probe
-			// timeout reads as legacy until its late answer arrives (held
+			// timeout is v1 for now until its late answer arrives (held
 			// here until released, so the order is not left to timing).
 			runEraWith(t, "late-probe", "2026", "modern (slow discover)", []string{"--era=modern", "--discover-hold"}, fi, func(c *eraCase) {
 				c.step("1 probe times out", eraToolsCall(1), nil)
@@ -440,12 +473,10 @@ func TestEraMatrix(t *testing.T) {
 				c.step("2 after the late answer", eraToolsCall(2), nil)
 			}, func(o *StartBridgeOptions) { o.ProbeTimeout = 500 * time.Millisecond })
 
-			for _, mode := range []string{"modern", "dual"} {
-				runEra(t, "modern-errors", "2026", mode, fi, func(c *eraCase) {
-					c.step("unknown method", eraModernReq(1, "foo/bar", nil, "2026-07-28"), nil)
-					c.step("unsupported protocol version", eraModernReq(2, "tools/list", nil, "1900-01-01"), nil)
-				})
-			}
+			runEra(t, "modern-errors", "2026", "modern", fi, func(c *eraCase) {
+				c.step("unknown method", eraModernReq(1, "foo/bar", nil, "2026-07-28"), nil)
+				c.step("unsupported protocol version", eraModernReq(2, "tools/list", nil, "1900-01-01"), nil)
+			})
 		}
 	})
 

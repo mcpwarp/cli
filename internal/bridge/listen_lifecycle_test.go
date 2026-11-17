@@ -41,16 +41,11 @@ func listenIDs(b *Bridge) []int64 {
 }
 
 func TestListen_TaggedChildCancelEndsTheStreamAndLeaksNothing(t *testing.T) {
-	b := startEraBridge(t, nil, listenFakeDual, "--listen")
-	get := openGet(t, b)
+	b := startEraBridge(t, nil, listenFake, "--listen")
 	c, s, id := openListen(t, b, "L1")
-	rawLines(t, b, taggedCancelLine(t, id, id), plainNotification(t, "x/marker"))
+	rawLines(t, b, taggedCancelLine(t, id, id))
 	if rest := s.drain(t); len(rest) != 0 {
 		t.Fatalf("the cancel was queued as a frame: %q", rest)
-	}
-	get.waitFor(t, "x/marker")
-	if get.sawAny("notifications/cancelled") {
-		t.Fatal("the tagged cancel reached the GET stream")
 	}
 	if s.sawAny(strconv.FormatInt(id, 10)) {
 		t.Fatalf("the bridge id reached the client: %q", s.seen)
@@ -65,21 +60,15 @@ func TestListen_TaggedChildCancelEndsTheStreamAndLeaksNothing(t *testing.T) {
 }
 
 func TestListen_TaggedCancelAfterTheResultIsSwallowed(t *testing.T) {
-	b := startEraBridge(t, nil, listenFakeDual, "--listen")
-	get := openGet(t, b)
+	b := startEraBridge(t, nil, listenFake, "--listen")
 	_, s, id := openListen(t, b, "L1")
 	rawLines(t, b,
 		childResultLine(t, id, map[string]any{"resultType": "complete"}),
 		taggedCancelLine(t, id, id),
-		plainNotification(t, "x/marker"),
 	)
 	rest := s.drain(t)
 	if len(rest) != 2 || strings.Contains(strings.Join(rest, "\n"), "notifications/cancelled") {
 		t.Fatalf("stream after the result: %q", rest)
-	}
-	get.waitFor(t, "x/marker")
-	if get.sawAny("notifications/cancelled") {
-		t.Fatal("the later tagged cancel leaked to the GET stream")
 	}
 	if n := childCancelCount(t, b, id); n != 0 {
 		t.Fatalf("the bridge cancelled a listen the child had answered %d times", n)

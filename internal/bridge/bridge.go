@@ -151,18 +151,15 @@ type StartBridgeOptions struct {
 	MaxListens      int
 	ListenBudget    int
 	ListenKeepalive time.Duration
-	// ProbeTimeout bounds the lazy server/discover probe (0 ->
-	// defaultProbeTimeout); HeadHoldTimeout bounds how long a modern
-	// request's SSE head waits for the child's first message (0 ->
-	// defaultHeadHold); InitializeHoldTimeout is the same for a 2025-style
-	// initialize, which waits so Mcp-Session-Id can ride on the head (0 ->
-	// defaultInitializeHold). MaxReprobeInterval caps the re-probe backoff
-	// (0 -> reprobeBackoffFactor probe timeouts). Test seams, like
-	// RequestTimeout.
+	// ProbeTimeout bounds the wait for the answer to the server/discover
+	// written at spawn (0 -> defaultProbeTimeout); HeadHoldTimeout bounds how
+	// long a modern request's SSE head waits for the child's first message
+	// (0 -> defaultHeadHold); InitializeHoldTimeout is the same for a
+	// 2025-style initialize, which waits so Mcp-Session-Id can ride on the
+	// head (0 -> defaultInitializeHold). Test seams, like RequestTimeout.
 	ProbeTimeout          time.Duration
 	HeadHoldTimeout       time.Duration
 	InitializeHoldTimeout time.Duration
-	MaxReprobeInterval    time.Duration
 	// Bus, if non-nil, is passed to NewStdioChildWithBus so this bridge's
 	// initial child publishes its stderr lines as eventbus.LogLine
 	// telemetry (DESIGN.md §3) — the same wiring a supervisor's own
@@ -200,7 +197,6 @@ type pendingEntry struct {
 	child         *StdioChild   // the process the request was sent to; fixed at creation
 	progressToken any           // nil if the request carried none
 	version       any           // the protocol version the request carried, nil if none
-	discover      bool          // a client's server/discover, forwarded like any request
 	sse           *sseResponder // non-nil iff Accept: text/event-stream
 	plain         http.ResponseWriter
 	extraHeaders  map[string]string
@@ -217,8 +213,8 @@ type pendingEntry struct {
 	// revoke releases a provisional session handed out with a held
 	// initialize head; set only for initialize.
 	revoke func()
-	// era, set only for initialize, is the process the child's answer
-	// reports on, whether or not the handler is still waiting for it.
+	// era, set only for an initialize its process counted (eraMachine.inits),
+	// is the process the child's answer reports on.
 	era *eraState
 }
 
@@ -356,7 +352,6 @@ type Bridge struct {
 	writeGrace   time.Duration
 	ensureChild  func(ctx context.Context) error
 	probeTimeout time.Duration
-	reprobeCap   time.Duration
 	headHold     time.Duration
 	initHold     time.Duration
 
@@ -381,10 +376,6 @@ type Bridge struct {
 	listens       map[int64]*listenEntry
 	abandoned     map[int64]struct{}
 	abandonedFIFO []int64
-	// abandonedInit maps an abandoned initialize's id to its process, so the
-	// child's late answer still reaches the era state; its ids are a subset
-	// of abandoned's and are evicted with them.
-	abandonedInit map[int64]*eraState
 	nextID        int64
 
 	wg sync.WaitGroup
@@ -430,10 +421,6 @@ func StartBridge(opts StartBridgeOptions) (*Bridge, error) {
 	if probeTimeout == 0 {
 		probeTimeout = defaultProbeTimeout
 	}
-	reprobeCap := opts.MaxReprobeInterval
-	if reprobeCap == 0 {
-		reprobeCap = reprobeBackoffFactor * probeTimeout
-	}
 	headHold := opts.HeadHoldTimeout
 	if headHold == 0 {
 		headHold = defaultHeadHold
@@ -449,30 +436,29 @@ func StartBridge(opts StartBridgeOptions) (*Bridge, error) {
 	}
 
 	b := &Bridge{
-		name:          opts.Name,
-		log:           log,
-		timeout:       timeout,
-		maxPending:    maxPending,
-		maxListens:    maxListens,
-		listenBudget:  listenBudget,
-		keepalive:     keepalive,
-		writeGrace:    defaultListenWriteGrace,
-		ensureChild:   opts.EnsureChild,
-		probeTimeout:  probeTimeout,
-		reprobeCap:    reprobeCap,
-		headHold:      headHold,
-		initHold:      initHold,
-		child:         child,
-		session:       newSession(),
-		pushHub:       newPushStreamHub(log.With("server", opts.Name)),
-		pending:       make(map[int64]*pendingEntry),
-		listens:       make(map[int64]*listenEntry),
-		abandoned:     make(map[int64]struct{}),
-		abandonedInit: make(map[int64]*eraState),
-		nextID:        firstBridgeID,
+		name:         opts.Name,
+		log:          log,
+		timeout:      timeout,
+		maxPending:   maxPending,
+		maxListens:   maxListens,
+		listenBudget: listenBudget,
+		keepalive:    keepalive,
+		writeGrace:   defaultListenWriteGrace,
+		ensureChild:  opts.EnsureChild,
+		probeTimeout: probeTimeout,
+		headHold:     headHold,
+		initHold:     initHold,
+		child:        child,
+		session:      newSession(),
+		pushHub:      newPushStreamHub(log.With("server", opts.Name)),
+		pending:      make(map[int64]*pendingEntry),
+		listens:      make(map[int64]*listenEntry),
+		abandoned:    make(map[int64]struct{}),
+		nextID:       firstBridgeID,
 	}
-	b.era = b.newEraState(child)
+	b.era = newEraState(child)
 	b.wireChild(child, b.era)
+	b.startProbe(b.era)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -510,28 +496,23 @@ func (b *Bridge) GetCurrentChild() *StdioChild {
 
 // ReplaceChild swaps in a freshly spawned child after a supervisor
 // restart. The listener/port/session are untouched; only routing wiring
-// moves to the new child, which starts with a fresh era state (the old
-// process's discover result says nothing about it). Clears a
-// previously-latched MarkFailed.
+// moves to the new child, which is probed afresh (the old process's verdict
+// says nothing about it). Clears a previously-latched MarkFailed.
 func (b *Bridge) ReplaceChild(child *StdioChild) {
-	st := b.newEraState(child)
+	st := newEraState(child)
 	b.mu.Lock()
 	b.child = child
-	b.endEraLocked(b.era)
-	// The old process's late initialize answers can only reach its ended
-	// state; drop them rather than pin it until FIFO eviction.
-	for id, old := range b.abandonedInit {
-		if old == b.era {
-			delete(b.abandonedInit, id)
-		}
-	}
+	old := b.era
+	b.endEraLocked(old)
 	b.era = st
 	b.hasFailed = false
 	b.failed = ""
 	gone := b.takeListensLocked(func(l *listenEntry) bool { return l.child != child })
 	b.mu.Unlock()
+	b.flushEra(old)
 	endListens(gone, listenChildGone)
 	b.wireChild(child, st)
+	b.startProbe(st)
 }
 
 // MarkFailed latches a permanent-failure response for every new request
@@ -580,7 +561,6 @@ func (b *Bridge) addAbandonedLocked(id int64) {
 			oldest := b.abandonedFIFO[0]
 			b.abandonedFIFO = b.abandonedFIFO[1:]
 			delete(b.abandoned, oldest)
-			delete(b.abandonedInit, oldest)
 		}
 	}
 }
@@ -630,20 +610,12 @@ func (b *Bridge) handleChildResponse(id int64, msg map[string]any) {
 		}
 	}
 	abandoned := b.isAbandonedLocked(id)
-	var initEra *eraState
-	switch {
-	case entry != nil:
-		initEra = entry.era
-	case !hasListen:
-		initEra = b.abandonedInit[id]
-		delete(b.abandonedInit, id)
-	}
 	b.mu.Unlock()
 
-	// An initialize answer reaches the era state here, before any handler
-	// sees it, so it counts even if nobody is waiting for it any more.
-	if initEra != nil {
-		b.noteInitializeAnswer(initEra, msg)
+	// An initialize answer reaches the era state here, before its handler
+	// sees it.
+	if entry != nil && entry.era != nil {
+		b.noteInitializeAnswer(entry.era, msg)
 	}
 
 	if hasListen {
@@ -707,7 +679,7 @@ func subscriptionTag(params map[string]any) (tag any, present bool) {
 	return tag, present
 }
 
-func (b *Bridge) handleChildNotification(msg map[string]any) {
+func (b *Bridge) handleChildNotification(st *eraState, msg map[string]any) {
 	method, _ := msg["method"].(string)
 	params, _ := isRequestParams(msg)
 
@@ -795,6 +767,19 @@ func (b *Bridge) handleChildNotification(msg map[string]any) {
 		b.enqueueListen(id, listen, rewriteListenTag(msg, id, listen.originalID))
 		return
 	}
+	b.dispatchPush(st, msg)
+}
+
+// dispatchPush hands a message no request or listen owns to the GET push
+// stream. A v2 process has no push stream: there the message is dropped.
+func (b *Bridge) dispatchPush(st *eraState, msg map[string]any) {
+	b.mu.Lock()
+	v2 := st.m.version() == versionV2
+	b.mu.Unlock()
+	if v2 {
+		b.log.Debug("message from an MCP v2 child for no request or listen, dropping", "server", b.name)
+		return
+	}
 	b.pushHub.Dispatch(msg)
 }
 
@@ -830,8 +815,8 @@ func (b *Bridge) wireChild(c *StdioChild, st *eraState) {
 
 		switch {
 		case hasID && !hasMethod:
-			if s, isProbe := idVal.(string); isProbe && strings.HasPrefix(s, probeIDPrefix) {
-				b.handleProbeResponse(st, s, msg)
+			if idVal == probeID {
+				b.handleProbeResponse(st, msg)
 				return
 			}
 			id, ok := bridgeIDFrom(idVal)
@@ -842,11 +827,12 @@ func (b *Bridge) wireChild(c *StdioChild, st *eraState) {
 			b.handleChildResponse(id, msg)
 		case hasID && hasMethod:
 			// Server-initiated request (legacy, <=2025-11-25 only) — shape
-			// alone routes this to the legacy push stream, never the
-			// pending/listens maps, even on an id collision.
-			b.pushHub.Dispatch(msg)
+			// alone sends this to dispatchPush, never the pending/listens
+			// maps, even on an id collision: the legacy push stream, or
+			// dropped on a v2 process.
+			b.dispatchPush(st, msg)
 		case !hasID && hasMethod:
-			b.handleChildNotification(msg)
+			b.handleChildNotification(st, msg)
 		default:
 			// no id, no method: not a valid JSON-RPC message.
 		}
@@ -860,6 +846,7 @@ func (b *Bridge) wireChild(c *StdioChild, st *eraState) {
 		gone := b.takeListensLocked(func(l *listenEntry) bool { return l.child == c })
 		b.endEraLocked(st)
 		b.mu.Unlock()
+		b.flushEra(st)
 
 		for _, entry := range pending {
 			entry.rejectWith(errChildRestarted)
@@ -868,8 +855,11 @@ func (b *Bridge) wireChild(c *StdioChild, st *eraState) {
 		b.pushHub.Close()
 	})
 
+	// The only errors are failed writes to stdin: a child that no longer
+	// reads it is dead.
 	c.OnError(func(err error) {
 		b.log.Error("stdio child error", "server", b.name, "err", err)
+		b.endDeadChild(c, st)
 	})
 }
 
@@ -1256,6 +1246,13 @@ func (b *Bridge) handle(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		b.handleDelete(tw, r)
 	default:
+		allow := "GET, POST, DELETE"
+		b.mu.Lock()
+		if !b.era.m.ended && b.era.m.version() == versionV2 {
+			allow = "POST"
+		}
+		b.mu.Unlock()
+		tw.Header().Set("Allow", allow)
 		writeJSON(tw, 405, map[string]any{"error": "method not allowed"})
 	}
 }
@@ -1274,20 +1271,12 @@ func (b *Bridge) acquireRequestSlot() bool {
 	return true
 }
 
-// writeMethodNotAllowed answers GET/DELETE when the bridge refuses 2025
-// traffic for the child: the 2026-07-28 HTTP binding has no standalone
-// stream and no sessions to terminate.
-func writeMethodNotAllowed(w http.ResponseWriter) {
-	w.Header().Set("Allow", "POST")
-	writeJSON(w, 405, map[string]any{"error": "method not allowed"})
-}
-
 func (b *Bridge) handleGet(w http.ResponseWriter, r *http.Request) {
-	if !strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
-		writeJSON(w, 405, map[string]any{"error": "method not allowed"})
+	if b.refuseStatelessMethod(w, r) {
 		return
 	}
-	if b.refuseStatelessMethod(w) {
+	if !strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		writeJSON(w, 405, map[string]any{"error": "method not allowed"})
 		return
 	}
 	headerSessionID, hasHeader := firstHeader(r.Header, "Mcp-Session-Id")
@@ -1309,6 +1298,12 @@ func (b *Bridge) handleGet(w http.ResponseWriter, r *http.Request) {
 	done := r.Context().Done()
 	sink := newPushSinkAdapter(res, done)
 	b.pushHub.Open(sink)
+	// A process that turned v2 since this request was let through may have
+	// closed the hub before the Open above.
+	if _, _, m := b.snapshotEra(); !m.ended && m.version() == versionV2 {
+		b.pushHub.CloseCurrent(sink)
+		return
+	}
 	// Unblock on whichever comes first: the client disconnecting, or the
 	// hub ending this sink server-side (e.g. pushHub.Close() on child
 	// exit) — without the latter, a legacy GET stream left open past a
@@ -1325,7 +1320,7 @@ func (b *Bridge) handleGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Bridge) handleDelete(w http.ResponseWriter, r *http.Request) {
-	if b.refuseStatelessMethod(w) {
+	if b.refuseStatelessMethod(w, r) {
 		return
 	}
 	headerSessionID, hasHeader := firstHeader(r.Header, "Mcp-Session-Id")
@@ -1338,6 +1333,7 @@ func (b *Bridge) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
+	arrived := time.Now()
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	bodyBuf, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -1352,14 +1348,13 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 		jsonRPCError(w, 400, -32700, "parse error: request body is not valid JSON")
 		return
 	}
+	// malformed is the answer to a body that is not one JSON-RPC message.
+	var malformed string
+	parsed, isObject := isRecord(parsedAny)
 	if _, isArr := parsedAny.([]any); isArr {
-		jsonRPCError(w, 400, -32600, "batch requests are not supported")
-		return
-	}
-	parsed, ok := isRecord(parsedAny)
-	if !ok {
-		jsonRPCError(w, 400, -32600, "invalid request: body must be a JSON object")
-		return
+		malformed = "batch requests are not supported"
+	} else if !isObject {
+		malformed = "invalid request: body must be a JSON object"
 	}
 
 	methodVal, hasMethodRaw := parsed["method"]
@@ -1373,58 +1368,35 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	// whenever hasOwnProperty is.
 	_, hasID := parsed["id"]
 
-	// A modern-shaped message is stateless: any Mcp-Session-Id on it is
-	// ignored (no gate, no 404, never echoed). A 2025-style initialize
-	// skips the gate too; its session is minted only once the child has
-	// answered it successfully.
 	modernShaped := hasMethod && isModernShaped(parsed)
-	// Once the bridge refuses 2025 traffic for a live child, it refuses
-	// 2025-style requests before any session gate: there are no sessions to
-	// be unknown.
-	if !modernShaped && (hasMethod || hasID) {
-		if c, st := b.currentChildEra(); !c.HasExited() && b.refuseLegacyRequest(w, parsed, st) {
+	nullModernID := modernShaped && hasID && parsed["id"] == nil
+
+	// What is not a JSON-RPC message at all is answered at once, without
+	// waiting for a verdict; a live v2 process words it its own way, and so
+	// does any process for a modern-shaped message whose id is null. A body
+	// with neither a method nor an id meets the session gate first.
+	if malformed != "" || (!hasMethod && !hasID) || nullModernID {
+		if _, _, m := b.snapshotEra(); nullModernID || (!m.ended && m.version() == versionV2) {
+			jsonRPCError(w, http.StatusBadRequest, -32600, "Invalid Request")
 			return
 		}
-	}
-	var sessionID string
-	var hasSession bool
-	if !modernShaped && method != "initialize" {
-		headerSessionID, hasHeader := firstHeader(r.Header, "Mcp-Session-Id")
-		check := b.session.check(method, headerSessionID, hasHeader)
-		switch check.kind {
-		case sessionUnknown:
-			writeJSON(w, 404, map[string]any{"error": "unknown session"})
-			return
-		case sessionMissing:
-			jsonRPCError(w, 400, -32600, "invalid request: Mcp-Session-Id header is required once a session has been established")
+		if malformed == "" {
+			if _, _, ok := b.sessionGate(w, r, ""); ok {
+				jsonRPCError(w, 400, -32600, "invalid request: body must have a method, an id, or both")
+			}
 			return
 		}
-		hasSession = check.kind == sessionOK
-		if hasSession {
-			sessionID = check.sessionID
-		}
+		jsonRPCError(w, 400, -32600, malformed)
+		return
 	}
 
 	// One lazy respawn here covers requests, notifications and
-	// subscriptions/listen alike. The child is snapshotted right after:
-	// requests, listens and modern-shaped notifications use that snapshot
-	// (admitModern may move it to a newer one), while 2025-shaped
-	// notifications and client responses read currentChild() again. A bare
-	// client response (!hasMethod) is left out: it answers the dead child's
-	// own request, which a fresh child never issued, so respawning for it
-	// would only resurrect a disabled service on a stray late reply.
+	// subscriptions/listen alike. A bare client response (!hasMethod) is left
+	// out: it answers the dead child's own request, which a fresh child never
+	// issued, so respawning for it would only resurrect a disabled service on
+	// a stray late reply.
 	if hasMethod {
 		b.ensureLiveChild(r.Context())
-	}
-
-	child, st := b.currentChildEra()
-	// Once the bridge refuses 2025 traffic for the child, the child is given
-	// nothing 2025-style: not initialize or any other request, nor a
-	// notification or a client response (this revision defines no client
-	// notifications over HTTP and forbids client responses). A dead child's
-	// verdict does not count: it gets the "not running" answer below.
-	if !modernShaped && (hasMethod || hasID) && !child.HasExited() && b.refuseLegacyRequest(w, parsed, st) {
-		return
 	}
 	// notifications/initialized means nothing in the 2026 protocol, and the
 	// child must not read an enveloped one as the end of a 2025 handshake.
@@ -1432,14 +1404,53 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 		writeEmpty(w, 202, nil)
 		return
 	}
-	if modernShaped {
-		// A modern-shaped notification takes the same era gate as a request:
-		// a child that has not answered a discover must not be the first to
-		// read an enveloped line from us. Only requests are validated further.
-		var ok bool
-		if child, st, ok = b.admitModern(w, r, parsed, child, st); !ok {
+
+	// A modern-shaped message is stateless: any Mcp-Session-Id on it is
+	// ignored (no gate, no 404, never echoed). A 2025-style initialize
+	// skips the gate too; its session is minted only once the child has
+	// answered it successfully.
+	gated := !modernShaped && method != "initialize"
+	var sessionID string
+	var hasSession, ok bool
+
+	// Everything else waits for the process's verdict, except at a process
+	// that has already ended without becoming v2: there the session gate
+	// comes first. A v2 process is given nothing 2025-style, and refuses it
+	// before any session gate: there are no sessions to be unknown. A v1
+	// process is given nothing 2026-style.
+	child, st, m := b.snapshotEra()
+	if gated && m.ended && m.version() != versionV2 {
+		if sessionID, hasSession, ok = b.sessionGate(w, r, method); !ok {
 			return
 		}
+		gated = false
+	}
+	child, st, m, ok = b.admit(w, r, child, st)
+	if !ok {
+		return
+	}
+	switch v := m.version(); {
+	case v == versionV2 && !wellFormed(parsed):
+		jsonRPCError(w, http.StatusBadRequest, -32600, "Invalid Request")
+		return
+	case v == versionV2 && method == "initialize" && hasID:
+		b.refuseInitialize(w, parsed, st, m.versions)
+		return
+	case v == versionV2 && !modernShaped:
+		refuseV1Message(w, parsed, m.versions)
+		return
+	case v != versionV2 && modernShaped:
+		writeJSON(w, http.StatusBadRequest, v1FallbackError(parsed))
+		return
+	}
+	if gated {
+		if sessionID, hasSession, ok = b.sessionGate(w, r, method); !ok {
+			return
+		}
+	}
+
+	if modernShaped {
+		// Only requests are validated further.
 		if hasID {
 			if code, msg := modernRequestProblem(r, parsed); code != 0 {
 				writeJSON(w, http.StatusBadRequest, jsonRPCErrorBody(parsed["id"], code, msg, nil))
@@ -1458,10 +1469,7 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	if hasMethod && !hasID {
 		// Notification.
 		outgoing := parsed
-		target := b.currentChild()
-		if modernShaped {
-			target = child
-		}
+		target := child
 		if method == "notifications/cancelled" {
 			// The client names a request by its own id; one that matches no
 			// pending request is not the child's to see, since the child only
@@ -1494,17 +1502,12 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	if !hasMethod && hasID {
 		// Client answering a server-initiated request — its id is in the
 		// child's own id space, never rewritten.
-		child := b.currentChild()
 		if err := child.Send(parsed); err != nil {
 			b.log.Warn("failed to write response to stdio child", "server", b.name, "err", err)
 			writeJSON(w, 502, map[string]any{"error": "local server is not running"})
 			return
 		}
 		writeEmpty(w, 202, nil)
-		return
-	}
-	if !hasMethod && !hasID {
-		jsonRPCError(w, 400, -32600, "invalid request: body must have a method, an id, or both")
 		return
 	}
 
@@ -1516,7 +1519,41 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	case method == "initialize":
 		kind = kindInitialize
 	}
-	b.handleRegularRequest(w, r, parsed, sessionID, hasSession, kind, child, st)
+	b.handleRegularRequest(w, r, parsed, sessionID, hasSession, kind, child, st, arrived)
+}
+
+// sessionGate checks a 2025-style message's Mcp-Session-Id against the
+// session, answering 404 or 400 itself if it does not pass. It returns the
+// session to echo, if any.
+func (b *Bridge) sessionGate(w http.ResponseWriter, r *http.Request, method string) (sessionID string, hasSession, ok bool) {
+	headerSessionID, hasHeader := firstHeader(r.Header, "Mcp-Session-Id")
+	check := b.session.check(method, headerSessionID, hasHeader)
+	switch check.kind {
+	case sessionUnknown:
+		writeJSON(w, 404, map[string]any{"error": "unknown session"})
+		return "", false, false
+	case sessionMissing:
+		jsonRPCError(w, 400, -32600, "invalid request: Mcp-Session-Id header is required once a session has been established")
+		return "", false, false
+	}
+	if check.kind == sessionOK {
+		return check.sessionID, true, true
+	}
+	return "", false, true
+}
+
+// wellFormed reports whether msg is a JSON-RPC message at all: a request or
+// notification has a non-empty string method, and a message without a method
+// is a response, with an id and a result or an error.
+func wellFormed(msg map[string]any) bool {
+	if raw, has := msg["method"]; has {
+		method, ok := raw.(string)
+		return ok && method != ""
+	}
+	_, hasID := msg["id"]
+	_, hasResult := msg["result"]
+	_, hasError := msg["error"]
+	return hasID && (hasResult || hasError)
 }
 
 // admitAndMintID atomically checks the too-many-pending gate and mints an
@@ -1524,13 +1561,13 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 // two separate lock acquisitions left a window where more callers than
 // maxPending could all pass the check before any of them landed in
 // b.pending.
-func (b *Bridge) admitAndMintID() (int64, bool) {
+func (b *Bridge) admitAndMintID() (id int64, full bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if len(b.pending) >= b.maxPending {
-		return 0, false
+		return 0, true
 	}
-	return b.mintIDLocked(), true
+	return b.mintIDLocked(), false
 }
 
 // mintIDLocked hands out the next bridge id. Past maxBridgeID the counter
@@ -1557,12 +1594,12 @@ type requestKind int
 const (
 	kindLegacy     requestKind = iota // 2025-style request
 	kindInitialize                    // 2025-style initialize
-	kindModern                        // modern-shaped request, child already judged modern
+	kindModern                        // modern-shaped request to a v2 process
 )
 
-func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, parsed map[string]any, sessionID string, hasSession bool, kind requestKind, child *StdioChild, st *eraState) {
-	internalID, ok := b.admitAndMintID()
-	if !ok {
+func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, parsed map[string]any, sessionID string, hasSession bool, kind requestKind, child *StdioChild, st *eraState, arrived time.Time) {
+	internalID, full := b.admitAndMintID()
+	if full {
 		writeJSON(w, 503, map[string]any{"error": "too many in-flight requests"})
 		return
 	}
@@ -1577,24 +1614,9 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 		extraHeaders["Mcp-Session-Id"] = sessionID
 	}
 
-	// 2025-style requests open the SSE head at once, as ever. A modern
-	// request holds it (briefly) for the child's first message so a final
-	// error can still pick the HTTP status; initialize holds it so the
-	// session header can ride on it.
 	var sse *sseResponder
 	if wantsSSE {
 		sse = newHeldSSEResponder(w, extraHeaders)
-		switch kind {
-		case kindModern:
-			sse.holdFor(b.headHold)
-		case kindInitialize:
-			sse.holdForInitialize(b.initHold, func() (map[string]string, bool) {
-				id, tracked := b.session.provisionalMint()
-				return map[string]string{"Mcp-Session-Id": id}, tracked
-			})
-		default:
-			sse.commit()
-		}
 	}
 
 	entry := &pendingEntry{
@@ -1602,7 +1624,6 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 		child:         child,
 		progressToken: progressToken,
 		version:       requestProtocolVersion(parsed),
-		discover:      parsed["method"] == "server/discover",
 		sse:           sse,
 		plain:         w,
 		extraHeaders:  extraHeaders,
@@ -1612,7 +1633,6 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 	if kind == kindInitialize {
 		entry.raw = make(chan map[string]any, 1)
 		entry.revoke = b.session.revoke
-		entry.era = st
 	}
 	entry.timer = time.AfterFunc(b.timeout, func() {
 		b.mu.Lock()
@@ -1622,20 +1642,62 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 		entry.rejectWith(errUpstreamTimeout)
 	})
 
+	// An initialize arriving after the process turned v2 is refused.
 	b.mu.Lock()
+	if kind == kindInitialize && st.m.version() == versionV2 {
+		versions := st.m.versions
+		b.mu.Unlock()
+		entry.timer.Stop()
+		b.refuseInitialize(w, parsed, st, versions)
+		return
+	}
 	b.pending[internalID] = entry
 	b.mu.Unlock()
 	// Whatever way this handler exits (including a panic, which unwinds
 	// through here before handle's recover), the entry is claimed first, so
-	// no timer, notification or late answer writes to w afterwards.
+	// no timer, notification or late answer writes to w afterwards, and only
+	// then leaves b.pending: an initialize still kept there is let go once
+	// its process stops counting it (dropAbandonedInitsLocked).
 	defer func() {
-		b.mu.Lock()
-		delete(b.pending, internalID)
-		b.mu.Unlock()
 		entry.abandon()
+		b.mu.Lock()
+		b.dropPendingLocked(internalID, entry)
+		b.mu.Unlock()
 	}()
 
+	// 2025-style requests open the SSE head at once, as ever. A modern
+	// request holds it (briefly) for the child's first message so a final
+	// error can still pick the HTTP status; initialize holds it, counted from
+	// the client's arrival, so the session header can ride on it.
+	if sse != nil {
+		switch kind {
+		case kindModern:
+			sse.holdFor(b.headHold)
+		case kindInitialize:
+			sse.holdForInitialize(max(b.initHold-time.Since(arrived), 0), func() (map[string]string, bool) {
+				id, tracked := b.session.provisionalMint()
+				return map[string]string{"Mcp-Session-Id": id}, tracked
+			})
+		default:
+			sse.commit()
+		}
+	}
+
+	// An initialize still pending joins st's count of initializes in flight
+	// right before its write, while the child's answer to it can still change
+	// st's version (it is then the entry's era).
+	if kind == kindInitialize {
+		b.mu.Lock()
+		if b.pending[internalID] == entry && st.m.countsInits() {
+			entry.era = st
+			b.applyEraLocked(st, eraEvent{kind: evInitSent})
+		}
+		b.mu.Unlock()
+		b.flushEra(st)
+	}
 	if err := child.Send(forwardedRequest(parsed, internalID, progressToken)); err != nil {
+		// A failed write ends the process (the child's error listener), and
+		// with it whatever it counted.
 		b.mu.Lock()
 		delete(b.pending, internalID)
 		b.mu.Unlock()
@@ -1654,16 +1716,36 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 }
 
 // dropPendingLocked removes a request whose client will not be answered by
-// its handler any more (timed out, or gone) from b.pending, reporting whether
-// it was still there. For an initialize it remembers the process, so the
-// child's late answer still reaches the era state.
+// the child's answer (timed out or gone) from b.pending, reporting whether it
+// was still there. An initialize its process counted stays while the child's
+// answer to it can still change that process's version: it leaves b.pending
+// with that answer, or when the answer stops mattering
+// (dropAbandonedInitsLocked).
 func (b *Bridge) dropPendingLocked(internalID int64, entry *pendingEntry) bool {
 	_, still := b.pending[internalID]
-	delete(b.pending, internalID)
-	if still && entry.era != nil {
-		b.abandonedInit[internalID] = entry.era
+	if still && entry.era != nil && entry.era.m.countsInits() {
+		return true
 	}
+	delete(b.pending, internalID)
 	return still
+}
+
+// dropAbandonedInitsLocked runs when st stops counting initializes (one
+// succeeded, its version is settled, or it ended): the initializes that
+// dropPendingLocked kept for st after their handlers left are abandoned now
+// like any other request, so a late answer to one is dropped quietly.
+func (b *Bridge) dropAbandonedInitsLocked(st *eraState) {
+	for id, entry := range b.pending {
+		if entry.era != st {
+			continue
+		}
+		select {
+		case <-entry.done:
+			delete(b.pending, id)
+			b.addAbandonedLocked(id)
+		default:
+		}
+	}
 }
 
 // onRequestDisconnect handles the client going away mid-request. abandon
@@ -1675,14 +1757,13 @@ func (b *Bridge) onRequestDisconnect(internalID int64, entry *pendingEntry, chil
 	still := b.dropPendingLocked(internalID, entry)
 	b.mu.Unlock()
 	entry.abandon()
-	if still {
-		b.addAbandoned(internalID)
-		// A forwarded server/discover is never cancelled: a child that picks
-		// its era from the first message other than discover must not be
-		// handed one this way.
-		if !entry.discover {
-			_ = child.Send(bridgeCancel(internalID, cancelReasonDisconnect, entry.version))
-		}
+	if !still {
+		return
+	}
+	b.addAbandoned(internalID)
+	// An initialize must not be cancelled (raw marks one).
+	if entry.raw == nil {
+		_ = child.Send(bridgeCancel(internalID, cancelReasonDisconnect, entry.version))
 	}
 }
 
@@ -1706,8 +1787,10 @@ func (b *Bridge) CloseContext(ctx context.Context) error {
 	pending := b.pending
 	b.pending = make(map[int64]*pendingEntry)
 	gone := b.takeListensLocked(func(*listenEntry) bool { return true })
-	b.endEraLocked(b.era)
+	st := b.era
+	b.endEraLocked(st)
 	b.mu.Unlock()
+	b.flushEra(st)
 
 	b.pushHub.Close()
 

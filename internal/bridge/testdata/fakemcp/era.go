@@ -13,13 +13,9 @@ import (
 //	legacy         2025-era: requests before initialize get a JSON-RPC error,
 //	               server/discover is -32601.
 //	legacy-silent  2025-era: nothing received before initialize is answered.
-//	modern         2026-07-28 only: stateless, server/discover, no initialize.
-//	dual           both: initialize selects legacy semantics for the process,
-//	               a request carrying modern _meta is served statelessly.
-//
-// server/discover honours notifications/cancelled: a request cancelled before
-// its answer is due is never answered. --startup-delay-ms models a slow start
-// (stdin unread, then the backlog's cancellations learned first).
+//	modern         2026-07-28 only: stateless, server/discover; initialize is
+//	               rejected with -32022 naming the supported and requested
+//	               versions.
 
 const (
 	metaVersionKey = "io.modelcontextprotocol/protocolVersion"
@@ -33,9 +29,9 @@ var (
 	era            string
 	legacyInitDone bool
 
-	// discoverDelay (--discover-delay-ms) delays the answer to a modern
-	// server/discover; discoverCount counts those requests (guarded by
-	// stateMu).
+	// discoverDelay (--discover-delay-ms) delays a legacy child's -32601
+	// answer to server/discover; discoverCount counts a modern child's
+	// server/discover requests (guarded by stateMu).
 	discoverDelay time.Duration
 	discoverCount int
 	// initializeDelay (--initialize-delay-ms) delays a legacy initialize
@@ -44,20 +40,6 @@ var (
 	// rejectInitialize (--reject-initialize=N) makes the next N legacy
 	// initialize requests fail with -32602, then behave normally.
 	rejectInitialize int
-	// startupDelay (--startup-delay-ms) is a slow start: stdin is not read
-	// for that long (see main).
-	startupDelay time.Duration
-	// stdinStallFile (--stdin-stall-until-file=<path>) leaves stdin entirely
-	// unread until that file exists.
-	stdinStallFile string
-	// rejectCode (--reject-code=N) is the code a rejected legacy initialize
-	// fails with (default -32602).
-	rejectCode    = -32602
-	rejectCodeSet bool
-	// modernBareInitializeRejection (--modern-bare-initialize-rejection)
-	// makes a modern child reject initialize with -32601 (or --reject-code,
-	// when given) and no data.
-	modernBareInitializeRejection bool
 	// discoverHold (--discover-hold) and initializeHold (--initialize-hold)
 	// queue those answers, and debug/delayedError, debug/progressThenError
 	// and debug/heldError (with "hold": true) queue theirs, until
@@ -66,28 +48,12 @@ var (
 	discoverHold   bool
 	initializeHold bool
 	held           []func()
-	// rejectModernEvidence (--reject-modern-evidence) makes a rejected
-	// initialize carry error.data.supported = the modern version.
-	rejectModernEvidence bool
-	// discoverDrop (--discover-drop=N) leaves the first N modern
-	// server/discover requests unanswered, as a child still booting would.
-	discoverDrop int
-	// discoverErrorCode/discoverErrorCount (--discover-error=CODE:N) answer
-	// the first N modern server/discover requests with error CODE, as a
-	// booting or confused child would. discoverNoVersions
+	// discoverErrorCode (--discover-error=CODE) answers a modern
+	// server/discover with error CODE. discoverNoVersions
 	// (--discover-no-versions) leaves supportedVersions out of the
 	// DiscoverResult.
 	discoverErrorCode  int
-	discoverErrorCount int
 	discoverNoVersions bool
-	// discoverModernOnly (--discover-modern-version-only) lists only the
-	// modern version in the DiscoverResult, as dual-era servers that have
-	// not locked their era do; initialize is still accepted under --era=dual.
-	discoverModernOnly bool
-	// rejectLegacyList (--reject-legacy-list) makes a rejected initialize
-	// carry data.supported naming a 2025-era version too, as a 2025 server's
-	// unsupported-version error does.
-	rejectLegacyList bool
 	// requestCount counts the requests handled under an era mode, minus
 	// server/discover and debug/* (guarded by stateMu).
 	requestCount int
@@ -121,25 +87,6 @@ func replyError(id any, code int, message string, data any) {
 		e["data"] = data
 	}
 	writeLine(map[string]any{"jsonrpc": "2.0", "id": id, "error": e})
-}
-
-func supportedVersions() []any {
-	switch era {
-	case "modern":
-		return []any{modernVersion}
-	case "dual":
-		return []any{modernVersion, legacyVersion}
-	}
-	return nil
-}
-
-func hasVersion(v string) bool {
-	for _, s := range supportedVersions() {
-		if s == v {
-			return true
-		}
-	}
-	return false
 }
 
 // handleEra answers one parsed stdin message under the selected era mode.
@@ -186,16 +133,6 @@ func handleEra(msg map[string]any, method string, id any, hasID bool) {
 		handleLegacy(method, id, params)
 	case "modern":
 		handleModern(method, id, params, meta, modernShaped)
-	case "dual":
-		if method == "initialize" || (legacyInitDone && !modernShaped) {
-			handleLegacy(method, id, params)
-			return
-		}
-		if !modernShaped {
-			replyError(id, -32600, "Server not initialized", nil)
-			return
-		}
-		handleModern(method, id, params, meta, modernShaped)
 	}
 }
 
@@ -204,9 +141,6 @@ func handleLegacy(method string, id any, params map[string]any) {
 		return
 	}
 	if method == "server/discover" {
-		stateMu.Lock()
-		discoverCount++
-		stateMu.Unlock()
 		if discoverDelay > 0 {
 			go func() {
 				time.Sleep(discoverDelay)
@@ -225,14 +159,7 @@ func handleLegacy(method string, id any, params map[string]any) {
 		var answer func()
 		if rejectInitialize > 0 {
 			rejectInitialize--
-			var data any
-			if rejectModernEvidence {
-				data = map[string]any{"supported": []any{modernVersion}}
-			}
-			if rejectLegacyList {
-				data = map[string]any{"supported": []any{"2025-06-18", modernVersion}, "requested": params["protocolVersion"]}
-			}
-			answer = func() { replyError(id, rejectCode, "Invalid params: bad initialize", data) }
+			answer = func() { replyError(id, -32602, "Invalid params: bad initialize", nil) }
 		} else {
 			legacyInitDone = true
 			result := map[string]any{
@@ -273,16 +200,10 @@ func handleLegacy(method string, id any, params map[string]any) {
 
 func handleModern(method string, id any, params, meta map[string]any, modernShaped bool) {
 	if method == "initialize" {
-		if modernBareInitializeRejection {
-			code := -32601
-			if rejectCodeSet {
-				code = rejectCode
-			}
-			replyError(id, code, "Method not found: initialize", nil)
-			return
-		}
-		replyError(id, -32601, "Method not found: initialize. This server supports protocol versions: "+modernVersion,
-			map[string]any{"supported": supportedVersions()})
+		replyError(id, -32022, "Unsupported protocol version", map[string]any{
+			"supported": []any{modernVersion},
+			"requested": params["protocolVersion"],
+		})
 		return
 	}
 	if !modernShaped {
@@ -290,9 +211,9 @@ func handleModern(method string, id any, params, meta map[string]any, modernShap
 		return
 	}
 	requested, _ := meta[metaVersionKey].(string)
-	if !hasVersion(requested) {
+	if requested != modernVersion {
 		replyError(id, -32022, "Unsupported protocol version", map[string]any{
-			"supported": supportedVersions(),
+			"supported": []any{modernVersion},
 			"requested": requested,
 		})
 		return
@@ -305,19 +226,8 @@ func handleModern(method string, id any, params, meta map[string]any, modernShap
 	case "server/discover":
 		stateMu.Lock()
 		discoverCount++
-		drop := discoverDrop > 0
-		if drop {
-			discoverDrop--
-		}
-		fail := !drop && discoverErrorCount > 0
-		if fail {
-			discoverErrorCount--
-		}
 		stateMu.Unlock()
-		if drop {
-			return
-		}
-		if fail {
+		if discoverErrorCode != 0 {
 			replyError(id, discoverErrorCode, "discover failed", nil)
 			return
 		}
@@ -325,21 +235,11 @@ func handleModern(method string, id any, params, meta map[string]any, modernShap
 		if discoverNoVersions {
 			delete(result, "supportedVersions")
 		}
-		if discoverModernOnly {
-			result["supportedVersions"] = []any{modernVersion}
-		}
 		if discoverHold {
-			hold(func() { replyUnlessCancelled(id, result) })
+			hold(func() { reply(id, result) })
 			return
 		}
-		if discoverDelay > 0 {
-			go func() {
-				time.Sleep(discoverDelay)
-				replyUnlessCancelled(id, result)
-			}()
-			return
-		}
-		replyUnlessCancelled(id, result)
+		reply(id, result)
 	case "tools/list":
 		reply(id, map[string]any{"resultType": "complete", "tools": []any{}, "ttlMs": 0, "cacheScope": "private"})
 	case "tools/call":
@@ -371,21 +271,10 @@ func handleModern(method string, id any, params, meta map[string]any, modernShap
 	}
 }
 
-// replyUnlessCancelled is how server/discover honours notifications/cancelled:
-// a request cancelled before its answer is due is never answered.
-func replyUnlessCancelled(id any, result any) {
-	stateMu.Lock()
-	cancelled := cancelledRequestIDs[id]
-	stateMu.Unlock()
-	if !cancelled {
-		reply(id, result)
-	}
-}
-
 func discoverResult() map[string]any {
 	return map[string]any{
 		"resultType":        "complete",
-		"supportedVersions": supportedVersions(),
+		"supportedVersions": []any{modernVersion},
 		"capabilities":      map[string]any{"tools": map[string]any{}},
 		"ttlMs":             0,
 		"cacheScope":        "private",

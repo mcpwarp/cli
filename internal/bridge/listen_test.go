@@ -14,8 +14,8 @@ import (
 	"time"
 )
 
-// subscriptions/listen: the era gate, the held head, the per-listen queue and
-// how the child ends one. They run against fakemcp --era=<mode> --listen; the
+// subscriptions/listen: the held head, the per-listen queue and how the child
+// ends one. They run against fakemcp --era=modern --listen, a v2 process; the
 // fake's debug/raw writes the child's side of a scenario in a chosen order.
 
 const listenWait = 10 * time.Second
@@ -257,7 +257,14 @@ func childResultLine(t *testing.T, id any, result map[string]any) string {
 	return jsonLine(t, map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
 }
 
-const listenFake, listenFakeDual = "--era=modern", "--era=dual"
+const listenFake = "--era=modern"
+
+// pushBacklog is how many messages wait for a GET push stream.
+func pushBacklog(b *Bridge) int {
+	b.pushHub.mu.Lock()
+	defer b.pushHub.mu.Unlock()
+	return len(b.pushHub.backlog)
+}
 
 func TestListen_ChildWithoutListenSupportIs404(t *testing.T) {
 	b := startEraBridge(t, nil, listenFake)
@@ -431,8 +438,8 @@ func TestListen_PendingRequestsDoNotCountAgainstTheListenCap(t *testing.T) {
 	startListen(t, b, "A", nil).stream(t)
 }
 
-func TestListen_WaitingBehindTheProbeIsNotCounted(t *testing.T) {
-	b := startEraBridge(t, func(o *StartBridgeOptions) { o.MaxListens = 1 }, listenFakeDual, "--listen", "--discover-hold")
+func TestListen_WaitingForTheVerdictIsNotCounted(t *testing.T) {
+	b := startEraBridgeCold(t, func(o *StartBridgeOptions) { o.MaxListens = 1 }, listenFake, "--listen", "--discover-hold")
 	// The cap is already full, as an earlier listen would leave it.
 	occupant := &listenEntry{originalID: "occupant", child: b.GetCurrentChild(), budget: 1, wake: make(chan struct{}, 1)}
 	b.mu.Lock()
@@ -444,37 +451,18 @@ func TestListen_WaitingBehindTheProbeIsNotCounted(t *testing.T) {
 		b.mu.Unlock()
 	})
 
-	c := startListen(t, b, "W1", nil)
-	// The request starts the probe itself, so a probe in flight means it has
-	// reached the era gate; a cap checked before the gate would have refused
-	// it there and no probe would ever start.
-	waitProbeInFlight(t, b)
-	select {
-	case <-c.head:
-		t.Fatal("the listen was answered before the probe was")
-	default:
-	}
-	releaseHeld(t, b)
-	if got := c.response(t).StatusCode; got != 503 {
-		t.Fatalf("after the probe: %d, want 503 from the full cap", got)
+	// A cap checked before the verdict would answer at once.
+	w := waitingPost(t, b, context.Background(), acceptSSE, modernBody("W1", "subscriptions/listen", nil, nil))
+	releaseDirect(t, b)
+	if got := w.response(t).Code; got != 503 {
+		t.Fatalf("after the verdict: %d, want 503 from the full cap", got)
 	}
 }
 
-func TestListen_OpenListensDoNotBlockInitialize(t *testing.T) {
-	b := startEraBridge(t, func(o *StartBridgeOptions) {
-		o.MaxPending = 1
-		o.MaxListens = 1
-	}, listenFakeDual, "--listen")
-	openListen(t, b, "A")
-	r := eraPost(t, b, acceptJSON, eraInitialize(5).body, nil)
-	if r.status != 200 || r.header.Get("Mcp-Session-Id") == "" {
-		t.Fatalf("initialize beside a listen: %d %s", r.status, r.body)
-	}
-}
-
+// Messages no open listen owns never reach a listen; a v2 process has no push
+// stream either (TestEra_V2HasNoPushStream).
 func TestListen_UnroutableChildMessagesAreDroppedNotPushed(t *testing.T) {
-	b := startEraBridge(t, nil, listenFakeDual, "--listen")
-	get := openGet(t, b)
+	b := startEraBridge(t, nil, listenFake, "--listen")
 	_, s, id := openListen(t, b, "L1")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -496,31 +484,20 @@ func TestListen_UnroutableChildMessagesAreDroppedNotPushed(t *testing.T) {
 		jsonLine(t, map[string]any{"jsonrpc": "2.0", "id": "str-1", "result": map[string]any{}}),
 		plainNotification(t, "x/ok"),
 	)
-	get.waitFor(t, "x/ok")
-	for _, leaked := range []string{"x/orphan", "x/plain", "x/string", "x/fraction", "x/small", "x/null", "str-1"} {
-		if get.sawAny(leaked) {
-			t.Errorf("%s reached the GET stream", leaked)
-		}
-	}
 	rawLines(t, b, taggedLine(t, "x/event", id, nil))
 	s.waitFor(t, "x/event")
-	if s.sawAny("x/orphan") || s.sawAny("x/string") || s.sawAny("x/fraction") {
+	if s.sawAny("x/orphan") || s.sawAny("x/string") || s.sawAny("x/fraction") || s.sawAny("x/ok") {
 		t.Errorf("an unroutable message reached the listen: %q", s.seen)
 	}
 }
 
-// A child's cancel for a listen ends its stream and stays off the GET stream.
-func TestListen_ChildCancelEndsTheStreamAndIsNotRelayed(t *testing.T) {
-	b := startEraBridge(t, nil, listenFakeDual, "--listen")
-	get := openGet(t, b)
+// A child's cancel for a listen ends its stream.
+func TestListen_ChildCancelEndsTheStream(t *testing.T) {
+	b := startEraBridge(t, nil, listenFake, "--listen")
 	_, s, id := openListen(t, b, "L1")
-	rawLines(t, b, childCancelLine(t, id), plainNotification(t, "x/marker"))
+	rawLines(t, b, childCancelLine(t, id))
 	if rest := s.drain(t); len(rest) != 0 {
 		t.Fatalf("lines after the cancel: %q", rest)
-	}
-	get.waitFor(t, "x/marker")
-	if get.sawAny("notifications/cancelled") {
-		t.Fatal("the cancel was relayed to the GET stream")
 	}
 	if childWasCancelled(t, b, float64(id)) {
 		t.Fatal("the bridge cancelled a listen the child had ended")
@@ -531,13 +508,11 @@ func TestListen_ChildCancelEndsTheStreamAndIsNotRelayed(t *testing.T) {
 }
 
 func TestListen_ResultThenCancelKeepsTheResult(t *testing.T) {
-	b := startEraBridge(t, nil, listenFakeDual, "--listen")
-	get := openGet(t, b)
+	b := startEraBridge(t, nil, listenFake, "--listen")
 	_, s, id := openListen(t, b, "L1")
 	rawLines(t, b,
 		childResultLine(t, id, map[string]any{"resultType": "complete"}),
 		childCancelLine(t, id),
-		plainNotification(t, "x/marker"),
 	)
 	rest := s.drain(t)
 	if len(rest) != 2 || !strings.HasPrefix(rest[1], "data: ") {
@@ -547,30 +522,20 @@ func TestListen_ResultThenCancelKeepsTheResult(t *testing.T) {
 	if final["id"] != "L1" || final["result"] == nil {
 		t.Fatalf("final: %v", final)
 	}
-	get.waitFor(t, "x/marker")
-	if get.sawAny("notifications/cancelled") {
-		t.Fatal("the later cancel leaked to the GET stream")
-	}
 	if childWasCancelled(t, b, float64(id)) {
 		t.Fatal("the bridge cancelled a listen the child had answered")
 	}
 }
 
 func TestListen_CancelThenResultEndsWithoutTheResult(t *testing.T) {
-	b := startEraBridge(t, nil, listenFakeDual, "--listen")
-	get := openGet(t, b)
+	b := startEraBridge(t, nil, listenFake, "--listen")
 	_, s, id := openListen(t, b, "L1")
 	rawLines(t, b,
 		childCancelLine(t, id),
 		childResultLine(t, id, map[string]any{"resultType": "complete"}),
-		plainNotification(t, "x/marker"),
 	)
 	if rest := s.drain(t); len(rest) != 0 {
 		t.Fatalf("the stream carried %q after the cancel", rest)
-	}
-	get.waitFor(t, "x/marker")
-	if get.sawAny("resultType") {
-		t.Fatal("the late result leaked to the GET stream")
 	}
 }
 
@@ -588,7 +553,7 @@ func TestListen_ClientClosingTheStreamCancelsAtTheChild(t *testing.T) {
 
 func TestListen_Legacy2025ShapedListenIsOrdinaryTraffic(t *testing.T) {
 	t.Run("answered like any request", func(t *testing.T) {
-		b := startEraBridge(t, nil, listenFakeDual)
+		b := startEraBridge(t, nil, "--era=legacy")
 		session := eraPost(t, b, acceptJSON, eraInitialize(1).body, nil).header.Get("Mcp-Session-Id")
 		r := eraPost(t, b, acceptJSON, map[string]any{"jsonrpc": "2.0", "id": "L1", "method": "subscriptions/listen", "params": map[string]any{}},
 			map[string]string{"Mcp-Session-Id": session})
@@ -758,23 +723,20 @@ func TestListen_FloatFormIDsAreRoutedAndRewritten(t *testing.T) {
 }
 
 func TestListen_ChildMintedSmallIDsDoNotTouchOpenListens(t *testing.T) {
-	b := startEraBridge(t, nil, listenFakeDual, "--listen")
-	get := openGet(t, b)
+	b := startEraBridge(t, nil, listenFake, "--listen")
 	_, s, id := openListen(t, b, "L1")
 	rawLines(t, b,
 		jsonLine(t, map[string]any{"jsonrpc": "2.0", "id": 5, "method": "server/ping", "params": map[string]any{}}),
 		childCancelLine(t, 5),
-		plainNotification(t, "x/marker"),
 	)
-	get.waitFor(t, "x/marker")
-	if !get.sawAny(`"method":"server/ping"`) || !get.sawAny(`"requestId":5`) {
-		t.Fatalf("the child's own request or its cancel missed the GET stream: %q", get.seen)
-	}
 	if listenCount(b) != 1 {
 		t.Fatal("the child's cancel for its own request closed the listen")
 	}
 	rawLines(t, b, taggedLine(t, "x/still", id, nil))
 	s.waitFor(t, "x/still")
+	if s.sawAny("server/ping") || s.sawAny(`"requestId":5`) {
+		t.Fatalf("the child's own request or its cancel reached the listen: %q", s.seen)
+	}
 }
 
 func TestListenEntry_EnqueueOverBudget(t *testing.T) {
@@ -913,15 +875,10 @@ func TestBridge_UnmatchedClientCancelIsNotForwarded(t *testing.T) {
 }
 
 func TestListen_ClientCancelDoesNotMatchAListen(t *testing.T) {
-	b := startEraBridge(t, nil, listenFakeDual, "--listen")
+	b := startEraBridge(t, nil, listenFake, "--listen")
 	_, _, id := openListen(t, b, "L1")
-	resp := postJSON(t, b.URL(), map[string]any{
-		"jsonrpc": "2.0", "method": "notifications/cancelled",
-		"params": map[string]any{"requestId": "L1"},
-	}, nil)
-	resp.Body.Close()
-	if resp.StatusCode != 202 {
-		t.Fatalf("cancel: %d", resp.StatusCode)
+	if r := eraPost(t, b, acceptJSON, modernCancel("L1"), nil); r.status != 202 {
+		t.Fatalf("cancel: %d %s", r.status, r.body)
 	}
 	if childWasCancelled(t, b, "L1") || childWasCancelled(t, b, float64(id)) {
 		t.Fatal("a client's cancel reached the child for a listen")

@@ -665,61 +665,6 @@ func TestBridge_LegacyGETStream_EndsClientSideAfterChildExit(t *testing.T) {
 	}
 }
 
-// TestBridge_SubscriptionsListenPushFinishRewritesTagToClientID exercises
-// the listens map end to end: acknowledge, a pushed notification,
-// and the final response are all tagged/addressed in the *client's* id
-// space, even though subscriptions/push and subscriptions/finish below
-// address the subscription by the bridge-minted internal id.
-func TestBridge_SubscriptionsListenPushFinishRewritesTagToClientID(t *testing.T) {
-	b := startTestBridge(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	resp, _, err := eraSend(ctx, b.URL(), "text/event-stream", modernBody("client-sub", "subscriptions/listen", nil, nil), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d", resp.StatusCode)
-	}
-	reader := bufio.NewReader(resp.Body)
-	listenID := waitListenID(t, b, "client-sub")
-
-	ack := readSSELineContaining(t, reader, "notifications/subscriptions/acknowledged")
-	if !strings.Contains(ack, `"io.modelcontextprotocol/subscriptionId":"client-sub"`) {
-		t.Fatalf("ack not tagged with the client's own subscription id: %s", ack)
-	}
-
-	pushResp := postJSON(t, b.URL(), map[string]any{
-		"jsonrpc": "2.0", "method": "subscriptions/push",
-		"params": map[string]any{"subscriptionId": listenID, "notifyMethod": "sub/event", "notifyParams": map[string]any{"n": 7}},
-	}, nil)
-	if pushResp.StatusCode != 202 {
-		t.Fatalf("push notification status = %d", pushResp.StatusCode)
-	}
-	pushResp.Body.Close()
-
-	pushed := readSSELineContaining(t, reader, "sub/event")
-	if !strings.Contains(pushed, `"io.modelcontextprotocol/subscriptionId":"client-sub"`) {
-		t.Fatalf("pushed notification not rewritten to the client's subscription id: %s", pushed)
-	}
-
-	finishResp := postJSON(t, b.URL(), map[string]any{
-		"jsonrpc": "2.0", "method": "subscriptions/finish",
-		"params": map[string]any{"subscriptionId": listenID, "result": map[string]any{"resultType": "complete"}},
-	}, nil)
-	if finishResp.StatusCode != 202 {
-		t.Fatalf("finish notification status = %d", finishResp.StatusCode)
-	}
-	finishResp.Body.Close()
-
-	final := readSSELineContaining(t, reader, `"id":"client-sub"`)
-	if !strings.Contains(final, `"resultType":"complete"`) {
-		t.Fatalf("expected the final subscription response, got: %s", final)
-	}
-}
-
 // TestBridge_ServerInitiatedRequestRoutedByShapeEvenOnIDCollision proves
 // server-initiated requests are routed to the legacy push stream by
 // shape (has both id and method) rather than by id, even when the

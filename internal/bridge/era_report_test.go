@@ -119,7 +119,7 @@ func TestEraReport_TimeoutThenLateModernAnswer(t *testing.T) {
 	if got := nextVersion(t, bus); got != eventbus.VersionV1 {
 		t.Fatalf("at the timeout: reported %q", got)
 	}
-	releaseDirect(t, b)
+	releaseProbe(t, b)
 	if got := nextVersion(t, bus); got != eventbus.VersionV2 {
 		t.Fatalf("after the late answer: reported %q", got)
 	}

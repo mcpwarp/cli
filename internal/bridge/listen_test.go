@@ -453,7 +453,7 @@ func TestListen_WaitingForTheVerdictIsNotCounted(t *testing.T) {
 
 	// A cap checked before the verdict would answer at once.
 	w := waitingPost(t, b, context.Background(), acceptSSE, modernBody("W1", "subscriptions/listen", nil, nil))
-	releaseDirect(t, b)
+	releaseProbe(t, b)
 	if got := w.response(t).Code; got != 503 {
 		t.Fatalf("after the verdict: %d, want 503 from the full cap", got)
 	}

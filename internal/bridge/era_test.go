@@ -315,13 +315,29 @@ func releaseHeld(t *testing.T, b *Bridge) {
 	debugCall(t, b, "debug/release", nil)
 }
 
-// releaseDirect makes the fake send its held answers without an HTTP round
-// trip, which a bridge still waiting for its verdict could not give.
-func releaseDirect(t *testing.T, b *Bridge) {
+// releaseDirect makes the fake child c send its held answers, writing to its
+// stdin without an HTTP round trip, which a bridge still waiting for its
+// verdict could not give, and asks again until done holds: a release the
+// child reads before the line it is to answer finds nothing held. The probe
+// is such a line, written on a goroutine of its own.
+func releaseDirect(t *testing.T, c *StdioChild, done func() bool) {
 	t.Helper()
-	if err := b.GetCurrentChild().Send(map[string]any{"jsonrpc": "2.0", "id": 9001, "method": "debug/release"}); err != nil {
-		t.Fatal(err)
-	}
+	waitFor(t, "the held answers to be released", func() bool {
+		if done() {
+			return true
+		}
+		if err := c.Send(map[string]any{"jsonrpc": "2.0", "id": 9001, "method": "debug/release"}); err != nil {
+			t.Fatal(err)
+		}
+		return false
+	})
+}
+
+// releaseProbe is releaseDirect for a modern child holding its answer to the
+// probe: it returns once that answer has made the process v2.
+func releaseProbe(t *testing.T, b *Bridge) {
+	t.Helper()
+	releaseDirect(t, b.GetCurrentChild(), func() bool { return versionOf(b) == versionV2 })
 }
 
 func childWasCancelled(t *testing.T, b *Bridge, requestID any) bool {
@@ -532,7 +548,7 @@ func TestEra_RequestsWaitForTheVerdict(t *testing.T) {
 			t.Fatalf("answered before the verdict: %d %s", w.rec.Code, w.rec.Body)
 		}
 	}
-	releaseDirect(t, b)
+	releaseProbe(t, b)
 	for _, w := range modern {
 		if r := w.response(t); r.Code != 200 {
 			t.Errorf("modern request: %d %s", r.Code, r.Body)
@@ -568,7 +584,7 @@ func TestEra_InitializeAndModernRequestWaitingGetTheVerdictsAnswer(t *testing.T)
 	t.Run("v2", func(t *testing.T) {
 		b := startEraBridgeCold(t, nil, "--era=modern", "--discover-hold")
 		initialize, modern := waitBoth(t, b)
-		releaseDirect(t, b)
+		releaseProbe(t, b)
 		r := initialize.response(t)
 		var m struct {
 			Error struct {
@@ -687,10 +703,7 @@ func TestEra_ReplaceChildRetargetsWaitersAndDropsStaleAnswer(t *testing.T) {
 	}
 
 	ignoredBefore := logs.count("era event ignored")
-	if err := old.Send(map[string]any{"jsonrpc": "2.0", "id": 9001, "method": "debug/release"}); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, "the stale probe answer to be dropped", func() bool { return logs.count("era event ignored") > ignoredBefore })
+	releaseDirect(t, old, func() bool { return logs.count("era event ignored") > ignoredBefore })
 	if got := phaseOf(b); got != phaseV1 {
 		t.Fatalf("stale probe answer reached the new process: %s", describe(mach(got)))
 	}
@@ -732,8 +745,7 @@ func TestEra_ClientDisconnectWhileWaiting(t *testing.T) {
 	if rec := w.response(t); rec.Body.Len() != 0 {
 		t.Fatalf("the handler answered a client that had left: %d %s", rec.Code, rec.Body)
 	}
-	releaseDirect(t, b)
-	waitForVerdict(t, b)
+	releaseProbe(t, b)
 	if r := eraPost(t, b, acceptJSON, modernCall(2), nil); r.status != 200 {
 		t.Fatalf("after the verdict: %d %s", r.status, r.body)
 	}

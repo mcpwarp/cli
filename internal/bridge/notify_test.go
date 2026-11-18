@@ -82,7 +82,7 @@ func TestNotify_WaitsForTheVerdictThenFollowsTheProbe(t *testing.T) {
 	if idWaiting != idBefore || pending != 0 || listenCount(b) != 0 {
 		t.Fatalf("the waiting notification took state: next id %d -> %d, %d pending", idBefore, idWaiting, pending)
 	}
-	releaseDirect(t, b)
+	releaseProbe(t, b)
 	select {
 	case code := <-status:
 		if code != 202 {

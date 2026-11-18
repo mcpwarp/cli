@@ -93,7 +93,7 @@ func TestNotify_EnvelopedInitializedWaitsForTheVerdict(t *testing.T) {
 	if w.answered() {
 		t.Fatal("answered while the probe was out")
 	}
-	releaseDirect(t, b)
+	releaseProbe(t, b)
 	if r := w.response(t); r.Code != 202 || r.Body.Len() != 0 {
 		t.Fatalf("%d %s", r.Code, r.Body)
 	}

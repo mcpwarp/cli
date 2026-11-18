@@ -366,14 +366,23 @@ func runEraWith(t *testing.T, scenario, client, mode string, args []string, form
 }
 
 // releaseHeld makes a --discover-hold child send its held answers; they have
-// been handled by the bridge by the time this returns. It is a 2025-style
-// request, so only for a process served as v1.
+// been handled by the bridge by the time this returns. It asks again until
+// one has gone out: a release the child reads before the probe finds nothing
+// held. It is a 2025-style request, so only for a process served as v1.
 func (c *eraCase) releaseHeld() {
 	c.t.Helper()
-	got := c.do(eraReq{nil, map[string]any{"jsonrpc": "2.0", "id": 0, "method": "debug/release"}}, nil)
-	if got.status != 200 {
-		c.t.Fatalf("debug/release: %+v", got)
-	}
+	waitFor(c.t, "a held answer to be released", func() bool {
+		got := c.do(eraReq{nil, map[string]any{"jsonrpc": "2.0", "id": 0, "method": "debug/release"}}, nil)
+		var m struct {
+			Result struct {
+				Released int `json:"released"`
+			} `json:"result"`
+		}
+		if got.status != 200 || json.Unmarshal([]byte(got.body), &m) != nil {
+			c.t.Fatalf("debug/release: %+v", got)
+		}
+		return m.Result.Released > 0
+	})
 }
 
 func sessionHdr(c *eraCase) map[string]string {

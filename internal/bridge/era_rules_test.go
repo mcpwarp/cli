@@ -17,7 +17,8 @@ import (
 // client sees.
 
 // startTimedOut starts a bridge whose child never answers the probe and waits
-// until it is v1 for now.
+// until it is v1 for now and the child has read the probe, which is written
+// on a goroutine of its own and so may still be on its way at the timeout.
 func startTimedOut(t *testing.T, log *slog.Logger, args ...string) *Bridge {
 	t.Helper()
 	b := startEraBridge(t, func(o *StartBridgeOptions) {
@@ -29,6 +30,9 @@ func startTimedOut(t *testing.T, log *slog.Logger, args ...string) *Bridge {
 	if got := phaseOf(b); got != phaseTimeout {
 		t.Fatalf("setup: phase %s, want timeout", describe(mach(got)))
 	}
+	waitFor(t, "the child to read the probe", func() bool {
+		return indexOf(childReceived(t, b), "server/discover") >= 0
+	})
 	return b
 }
 
@@ -504,8 +508,7 @@ func TestEra_AbandonedInitializeIsNotCancelled(t *testing.T) {
 		if n := childCancelCount(t, b, float64(id)); n != 0 {
 			t.Fatalf("the child got %d cancels for the initialize", n)
 		}
-		releaseDirect(t, b)
-		waitFor(t, "the child's answer to take it", func() bool { return pending(b) == 0 })
+		releaseDirect(t, b.GetCurrentChild(), func() bool { return pending(b) == 0 })
 	})
 	t.Run("timeout, another initialize succeeds while it waits", func(t *testing.T) {
 		b := startTimedOut(t, nil, "--era=legacy-silent", "--initialize-hold")

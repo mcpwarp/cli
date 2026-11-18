@@ -515,7 +515,7 @@ func (b *Bridge) ReplaceChild(child *StdioChild) {
 	b.era = st
 	b.hasFailed = false
 	b.failed = ""
-	gone := b.takeListensLocked(func(l *listenEntry) bool { return l.child != child })
+	gone := b.takeListensLocked(func(*listenEntry) bool { return true })
 	b.mu.Unlock()
 	b.flushEra(old)
 	endListens(gone, listenChildGone)
@@ -580,20 +580,21 @@ func (b *Bridge) isAbandoned(id int64) bool {
 	return ok
 }
 
-// findInternalIDForOriginalID resolves a legacy client's own
-// notifications/cancelled requestId (in the client's id space) back to the
+// findInternalIDForOriginalID resolves the requestId of a client's
+// notifications/cancelled (in the client's id space) back to the
 // bridge-minted internal id, with the process that request was sent to. Picks
 // the most recently issued match if more than one pending request happens to
 // share the original id. An initialize is never matched: it cannot be
-// cancelled.
-func (b *Bridge) findInternalIDForOriginalID(originalID any) (int64, *StdioChild, bool) {
+// cancelled. Nor is a request of the other era: an enveloped cancel (modern)
+// names only an enveloped request, a bare one only a bare request.
+func (b *Bridge) findInternalIDForOriginalID(originalID any, modern bool) (int64, *StdioChild, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	found := int64(0)
 	var child *StdioChild
 	ok := false
 	for internalID, entry := range b.pending {
-		if entry.raw == nil && entry.originalID == originalID {
+		if entry.raw == nil && entry.modern == modern && entry.originalID == originalID {
 			if !ok || internalID > found {
 				found, child = internalID, entry.child
 				ok = true
@@ -1290,7 +1291,7 @@ func (b *Bridge) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	headerSessionID, hasHeader := firstHeader(r.Header, "Mcp-Session-Id")
-	check := b.session.check("", headerSessionID, hasHeader)
+	check := b.session.check(headerSessionID, hasHeader)
 	switch check.kind {
 	case sessionUnknown:
 		writeJSON(w, 404, map[string]any{"error": "unknown session"})
@@ -1391,7 +1392,7 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if malformed == "" {
-			if _, _, ok := b.sessionGate(w, r, ""); ok {
+			if _, _, ok := b.sessionGate(w, r); ok {
 				jsonRPCError(w, 400, -32600, "invalid request: body must have a method, an id, or both")
 			}
 			return
@@ -1407,12 +1408,6 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	// a stray late reply.
 	if hasMethod {
 		b.ensureLiveChild(r.Context())
-	}
-	// notifications/initialized means nothing in the 2026 protocol, and the
-	// child must not read an enveloped one as the end of a 2025 handshake.
-	if modernShaped && !hasID && method == "notifications/initialized" {
-		writeEmpty(w, 202, nil)
-		return
 	}
 
 	// A modern-shaped message is stateless: any Mcp-Session-Id on it is
@@ -1430,7 +1425,7 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	// process is given nothing 2026-style.
 	child, st, m := b.snapshotEra()
 	if gated && m.ended && m.version() != versionV2 {
-		if sessionID, hasSession, ok = b.sessionGate(w, r, method); !ok {
+		if sessionID, hasSession, ok = b.sessionGate(w, r); !ok {
 			return
 		}
 		gated = false
@@ -1444,7 +1439,7 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 		jsonRPCError(w, http.StatusBadRequest, -32600, "Invalid Request")
 		return
 	case v == versionV2 && method == "initialize" && hasID:
-		b.refuseInitialize(w, parsed, st, m.versions)
+		writeJSON(w, http.StatusBadRequest, b.refuseInitialize(parsed, st, m.versions))
 		return
 	case v == versionV2 && !modernShaped:
 		refuseV1Message(w, parsed, m.versions)
@@ -1454,7 +1449,7 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if gated {
-		if sessionID, hasSession, ok = b.sessionGate(w, r, method); !ok {
+		if sessionID, hasSession, ok = b.sessionGate(w, r); !ok {
 			return
 		}
 	}
@@ -1477,7 +1472,13 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if hasMethod && !hasID {
-		// Notification.
+		// Notification. notifications/initialized is written only as the end
+		// of a 2025 handshake, so only with a valid session: never on a v2
+		// process, which has no sessions.
+		if method == "notifications/initialized" && !hasSession {
+			writeEmpty(w, 202, nil)
+			return
+		}
 		outgoing := parsed
 		target := child
 		if method == "notifications/cancelled" {
@@ -1490,7 +1491,7 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 			reqID, ok := cancelParams["requestId"]
 			internalID, found := int64(0), false
 			if ok && isJSONID(reqID) {
-				internalID, target, found = b.findInternalIDForOriginalID(reqID)
+				internalID, target, found = b.findInternalIDForOriginalID(reqID, modernShaped)
 			}
 			if !found || target.HasExited() || target != b.currentChild() {
 				writeEmpty(w, 202, nil)
@@ -1535,9 +1536,9 @@ func (b *Bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 // sessionGate checks a 2025-style message's Mcp-Session-Id against the
 // session, answering 404 or 400 itself if it does not pass. It returns the
 // session to echo, if any.
-func (b *Bridge) sessionGate(w http.ResponseWriter, r *http.Request, method string) (sessionID string, hasSession, ok bool) {
+func (b *Bridge) sessionGate(w http.ResponseWriter, r *http.Request) (sessionID string, hasSession, ok bool) {
 	headerSessionID, hasHeader := firstHeader(r.Header, "Mcp-Session-Id")
-	check := b.session.check(method, headerSessionID, hasHeader)
+	check := b.session.check(headerSessionID, hasHeader)
 	switch check.kind {
 	case sessionUnknown:
 		writeJSON(w, 404, map[string]any{"error": "unknown session"})
@@ -1658,7 +1659,7 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 		versions := st.m.versions
 		b.mu.Unlock()
 		entry.timer.Stop()
-		b.refuseInitialize(w, parsed, st, versions)
+		writeJSON(w, http.StatusBadRequest, b.refuseInitialize(parsed, st, versions))
 		return
 	}
 	b.pending[internalID] = entry
@@ -1719,7 +1720,7 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 	select {
 	case <-entry.done:
 	case raw := <-entry.raw: // nil unless initialize
-		b.completeInitialize(entry, raw)
+		b.completeInitialize(entry, parsed, st, raw)
 	case <-r.Context().Done():
 		b.onRequestDisconnect(internalID, entry, child)
 	}

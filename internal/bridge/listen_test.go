@@ -788,38 +788,19 @@ func TestListen_ChildExitEndsTheStreamWithoutAnError(t *testing.T) {
 	}
 }
 
-func TestListen_ReplaceChildEndsOnlyTheOldChildsListens(t *testing.T) {
+func TestListen_ReplaceChildEndsTheOldListens(t *testing.T) {
 	b := startEraBridge(t, nil, listenFake, "--listen")
 	_, old, _ := openListen(t, b, "old")
 	previous := b.GetCurrentChild()
 	t.Cleanup(func() { _ = previous.Close() })
-	next := newEraChild(t, listenFake, "--listen")
-	// A listen already bound to the new child, as one admitted while the
-	// swap was landing would be.
-	keep := &listenEntry{originalID: "keep", child: next, budget: 1, wake: make(chan struct{}, 1)}
-	b.mu.Lock()
-	b.listens[firstBridgeID+500] = keep
-	b.mu.Unlock()
 
-	b.ReplaceChild(next)
+	b.ReplaceChild(newEraChild(t, listenFake, "--listen"))
 	if rest := old.drain(t); len(rest) != 0 {
 		t.Fatalf("lines after the replace: %q", rest)
 	}
-	b.mu.Lock()
-	_, kept := b.listens[firstBridgeID+500]
-	b.mu.Unlock()
-	if !kept || listenCount(b) != 1 {
-		t.Fatalf("the new child's listen was ended (kept=%v, %d open)", kept, listenCount(b))
+	if n := listenCount(b); n != 0 {
+		t.Fatalf("%d listens still open after the replace", n)
 	}
-	keep.mu.Lock()
-	reason := keep.reason
-	keep.mu.Unlock()
-	if reason != listenOpen {
-		t.Fatalf("the new child's listen was ended: %v", reason)
-	}
-	b.mu.Lock()
-	delete(b.listens, firstBridgeID+500)
-	b.mu.Unlock()
 }
 
 func TestListen_CloseEndsListensWithinTheShutdownBarrier(t *testing.T) {

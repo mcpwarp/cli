@@ -242,6 +242,90 @@ func TestEra_QualifyingRejectionLeavesAnAnsweredV1Alone(t *testing.T) {
 	}
 }
 
+// An initialize the child accepts after another initialize's rejection has
+// turned the process v2 gets the bridge's v2 refusal instead of the child's
+// result, and no session, whether or not its head has already gone out.
+func TestEra_InitializeAcceptedAfterTheFlipIsRefused(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		accept  string
+		headOut bool
+	}{
+		{"json", acceptJSON, false},
+		{"sse, head held", acceptSSE, false},
+		{"sse, head out", acceptSSE, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b := startEraBridge(t, func(o *StartBridgeOptions) {
+				shortProbe(o)
+				if c.headOut {
+					o.InitializeHoldTimeout = 150 * time.Millisecond
+				}
+			}, "--era=legacy-silent", "--initialize-hold")
+			if got := phaseOf(b); got != phaseTimeout {
+				t.Fatalf("setup: phase %s, want timeout", describe(mach(got)))
+			}
+			first := heldInitialize(t, b, context.Background())
+			firstID := firstPendingID(t, b)
+
+			second := make(chan eraResponse, 1)
+			var head *http.Response
+			if c.headOut {
+				head = sendHeadOnly(t, b, c.accept, eraInitialize(2).body)
+				if head.StatusCode != 200 || head.Header.Get("Mcp-Session-Id") == "" {
+					t.Fatalf("setup: head %d, session %q; want a 200 with a provisional session", head.StatusCode, head.Header.Get("Mcp-Session-Id"))
+				}
+			} else {
+				go func() { second <- eraPost(t, b, c.accept, eraInitialize(2).body, nil) }()
+			}
+			waitFor(t, "the second initialize to be in flight", func() bool {
+				b.mu.Lock()
+				defer b.mu.Unlock()
+				return b.era.m.inits == 2
+			})
+
+			// The child rejects the first as 2026-only while it holds its
+			// acceptance of the second.
+			rawLines(t, b, jsonLine(t, map[string]any{"jsonrpc": "2.0", "id": firstID, "error": map[string]any{
+				"code": -32022, "message": "Unsupported protocol version",
+				"data": map[string]any{"supported": []any{eraTestVersion}},
+			}}))
+			if r := <-first; r.status != 400 || !strings.Contains(r.body, "Unsupported protocol version") {
+				t.Fatalf("first initialize: %d %s", r.status, r.body)
+			}
+			if got := versionOf(b); got != versionV2 {
+				t.Fatalf("version %d after the rejection", got)
+			}
+			releaseUntil(t, b, 2)
+
+			// With its head out, the refusal is a frame in the 200 stream.
+			status, wantStatus, body := 0, 400, ""
+			if c.headOut {
+				raw, _ := io.ReadAll(head.Body)
+				status, wantStatus, body = head.StatusCode, 200, string(raw)
+			} else {
+				r := <-second
+				if sid := r.header.Get("Mcp-Session-Id"); sid != "" {
+					t.Fatalf("the refusal carries session %q", sid)
+				}
+				status, body = r.status, r.body
+			}
+			for _, want := range []string{`"id":2`, `"code":-32022`, v2InitializeRefusal([]string{eraTestVersion}),
+				`"supported":["` + eraTestVersion + `"]`, `"requested":"2025-11-25"`} {
+				if !strings.Contains(body, want) {
+					t.Fatalf("second initialize: %d %s; missing %s", status, body, want)
+				}
+			}
+			if status != wantStatus || strings.Contains(body, "serverInfo") {
+				t.Fatalf("second initialize: %d %s", status, body)
+			}
+			if sessionMinted(b) {
+				t.Fatal("a session was minted on a v2 process")
+			}
+		})
+	}
+}
+
 // The first successful initialize settles a silent child as v1, with its
 // verdict line; a modern answer after it is one more line.
 func TestEra_LateModernAnswerAfterAV1ClientIsALogLine(t *testing.T) {

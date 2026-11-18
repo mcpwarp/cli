@@ -85,21 +85,33 @@ func TestNotify_BareCancelOnV2IsRefused(t *testing.T) {
 	}
 }
 
-// An enveloped notifications/initialized is answered without waiting for
-// the verdict, and never forwarded.
-func TestNotify_EnvelopedInitializedIsAnsweredWithoutWaiting(t *testing.T) {
+// An enveloped notifications/initialized waits for the verdict like any
+// enveloped notification, then follows it: on v2, 202 and not forwarded.
+func TestNotify_EnvelopedInitializedWaitsForTheVerdict(t *testing.T) {
 	b := startEraBridgeCold(t, nil, listenFake, "--discover-hold")
-	body := map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized", "params": map[string]any{"_meta": eraMeta(eraTestVersion)}}
-	if r := eraPost(t, b, acceptJSON, body, nil); r.status != 202 || r.elapsed > 5*time.Second {
-		t.Fatalf("%d after %s: %s", r.status, r.elapsed, r.body)
-	}
-	if versionOf(b) != versionUnknown {
-		t.Fatal("setup: the verdict came before the notification was answered")
+	w := waitingPost(t, b, t.Context(), acceptJSON, envelopedInitialized())
+	if w.answered() {
+		t.Fatal("answered while the probe was out")
 	}
 	releaseDirect(t, b)
-	waitForVerdict(t, b)
+	if r := w.response(t); r.Code != 202 || r.Body.Len() != 0 {
+		t.Fatalf("%d %s", r.Code, r.Body)
+	}
 	if got := childReceived(t, b); indexOf(got, "notifications/initialized") >= 0 {
 		t.Fatalf("the child received %q", got)
+	}
+}
+
+func TestNotify_EnvelopedInitializedToADeadChildIsNotRunning(t *testing.T) {
+	for _, mode := range []string{"--era=legacy", listenFake} {
+		b := startEraBridge(t, nil, mode)
+		handled := exitHandled(b.GetCurrentChild())
+		killCurrentChild(t, b)
+		waitExitHandled(t, handled)
+		r := eraPost(t, b, acceptJSON, envelopedInitialized(), nil)
+		if r.status != 502 || !strings.Contains(r.body, "local server is not running") {
+			t.Fatalf("%s: %d %s", mode, r.status, r.body)
+		}
 	}
 }
 
@@ -112,6 +124,33 @@ func TestNotify_ErrorAnswerRefusesAModernNotification(t *testing.T) {
 		if indexOf(childReceived(t, b), probeNote) >= 0 {
 			t.Fatalf("discover error %s: forwarded", code)
 		}
+	}
+}
+
+// A client's cancel names only a request of its own era. Once a silent server
+// has turned out to be v2, an enveloped cancel naming the id of a 2025 request
+// still pending matches nothing: it is answered 202 and written nowhere, and
+// the request still gets its answer.
+func TestCancel_EnvelopedCancelNeverNamesA2025Request(t *testing.T) {
+	b := startTimedOut(t, nil, "--era=modern", "--discover-hold")
+	res := make(chan eraResponse, 1)
+	go func() {
+		res <- eraPost(t, b, acceptJSON, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "debug/heldError",
+			"params": map[string]any{"code": -32000}}, nil)
+	}()
+	id := firstPendingID(t, b)
+	if r := eraPost(t, b, acceptJSON, eraInitialize(2).body, nil); r.status != 400 || versionOf(b) != versionV2 {
+		t.Fatalf("setup: initialize %d %s", r.status, r.body)
+	}
+	if r := eraPost(t, b, acceptJSON, modernCancel(float64(1)), nil); r.status != 202 || r.body != "" {
+		t.Fatalf("cancel: %d %s", r.status, r.body)
+	}
+	if n := childCancelCount(t, b, id); n != 0 {
+		t.Fatalf("the child got %d cancels for the 2025 request", n)
+	}
+	releaseHeld(t, b)
+	if r := <-res; r.status != 200 || !strings.Contains(r.body, `"code":-32000`) {
+		t.Fatalf("2025 request: %d %s", r.status, r.body)
 	}
 }
 

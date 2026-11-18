@@ -433,15 +433,12 @@ func refuseV1Message(w http.ResponseWriter, parsed map[string]any, versions []st
 	writeJSON(w, http.StatusBadRequest, refusalBody(parsed, -32600, v2RequestRefusal(versions), map[string]any{"supported": versions}))
 }
 
-// refuseInitialize answers a 2025 initialize on a v2 process, and logs the
-// refused client once per name for the process, after the lines st's events
-// queued before it.
-func (b *Bridge) refuseInitialize(w http.ResponseWriter, parsed map[string]any, st *eraState, versions []string) {
+// refuseInitialize is the 400 body answering a 2025 initialize on a v2
+// process. It logs the refused client once per name for the process, after the
+// lines st's events queued before it.
+func (b *Bridge) refuseInitialize(parsed map[string]any, st *eraState, versions []string) map[string]any {
 	params, _ := isRequestParams(parsed)
 	requested, _ := params["protocolVersion"].(string)
-	writeJSON(w, http.StatusBadRequest, jsonRPCErrorBody(parsed["id"], -32022, v2InitializeRefusal(versions),
-		map[string]any{"supported": versions, "requested": requested}))
-
 	info, _ := isRecord(params["clientInfo"])
 	name, isName := info["name"].(string)
 	key := refusedClient{name: name, nameless: !isName}
@@ -456,6 +453,8 @@ func (b *Bridge) refuseInitialize(w http.ResponseWriter, parsed map[string]any, 
 	}
 	b.mu.Unlock()
 	b.flushEra(st)
+	return jsonRPCErrorBody(parsed["id"], -32022, v2InitializeRefusal(versions),
+		map[string]any{"supported": versions, "requested": requested})
 }
 
 // refuseStatelessMethod answers GET or DELETE with 405 once the current
@@ -502,15 +501,27 @@ func (b *Bridge) noteInitializeAnswer(st *eraState, msg map[string]any) {
 
 // completeInitialize answers a 2025-style initialize from the handler
 // goroutine, off the child's pump (which has already fed the answer to the
-// era state). A rejection is the child's own error in a 400, unchanged.
-func (b *Bridge) completeInitialize(entry *pendingEntry, msg map[string]any) {
-	if isResultMsg(msg) {
-		entry.resolveInitialized(msg, func() map[string]string {
-			return map[string]string{"Mcp-Session-Id": b.session.check("initialize", "", false).sessionID}
-		})
+// era state). A rejection is the child's own error in a 400, unchanged. st is
+// the process the initialize was sent to. If another initialize's rejection
+// turned it v2 while this one was in flight, the child's acceptance is
+// dropped and the client refused as on any v2 process, with no session: a
+// process cannot turn v2 once its child has accepted an initialize, so its
+// version now is its version when the acceptance arrived.
+func (b *Bridge) completeInitialize(entry *pendingEntry, parsed map[string]any, st *eraState, msg map[string]any) {
+	if !isResultMsg(msg) {
+		entry.respond(http.StatusBadRequest, msg)
 		return
 	}
-	entry.respond(http.StatusBadRequest, msg)
+	b.mu.Lock()
+	v2, versions := st.m.version() == versionV2, st.m.versions
+	b.mu.Unlock()
+	if v2 {
+		entry.respond(http.StatusBadRequest, b.refuseInitialize(parsed, st, versions))
+		return
+	}
+	entry.resolveInitialized(msg, func() map[string]string {
+		return map[string]string{"Mcp-Session-Id": b.session.initialize()}
+	})
 }
 
 func isResultMsg(msg map[string]any) bool {

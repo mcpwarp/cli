@@ -149,36 +149,75 @@ func TestNotify_ModernShapedSkipsHeaderValidation(t *testing.T) {
 
 func TestNotify_2025ShapedIsForwardedToAV1Child(t *testing.T) {
 	b := startEraBridge(t, nil, "--era=legacy")
-	body := map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"}
+	body := map[string]any{"jsonrpc": "2.0", "method": probeNote}
 	if r := eraPost(t, b, acceptJSON, body, nil); r.status != 202 {
 		t.Fatalf("%d %s", r.status, r.body)
 	}
-	if indexOf(childReceived(t, b), "notifications/initialized") < 0 {
+	if indexOf(childReceived(t, b), probeNote) < 0 {
 		t.Fatal("not forwarded")
 	}
 }
 
-// An enveloped notifications/initialized is never forwarded; the 2025-shaped
-// one that follows a 2025 handshake still is.
-func TestNotify_EnvelopedInitializedIsNeverForwarded(t *testing.T) {
-	b := startEraBridge(t, nil, "--era=legacy")
-	session := eraPost(t, b, acceptJSON, eraInitialize(1).body, nil).header.Get("Mcp-Session-Id")
-	hdr := map[string]string{"Mcp-Session-Id": session}
+func envelopedInitialized() map[string]any {
+	return map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized", "params": map[string]any{"_meta": eraMeta(eraTestVersion)}}
+}
 
-	enveloped := map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized", "params": map[string]any{"_meta": eraMeta(eraTestVersion)}}
-	if r := eraPost(t, b, acceptJSON, enveloped, hdr); r.status != 202 {
-		t.Fatalf("enveloped: %d %s", r.status, r.body)
+// assertV1Fallback checks the 400 a modern-shaped notification gets on a v1
+// process: -32600, and no id member.
+func assertV1Fallback(t *testing.T, r eraResponse) {
+	t.Helper()
+	var m map[string]any
+	_ = json.Unmarshal([]byte(r.body), &m)
+	e, _ := m["error"].(map[string]any)
+	if _, hasID := m["id"]; r.status != 400 || e == nil || e["code"] != float64(-32600) || e["message"] != v1Fallback || hasID {
+		t.Fatalf("%d %s", r.status, r.body)
 	}
-	if indexOf(childReceived(t, b), "notifications/initialized") >= 0 {
-		t.Fatal("the enveloped notifications/initialized reached the child")
-	}
+}
+
+// notifications/initialized reaches the child only as the end of a 2025
+// handshake: bare, on a v1 process, with that handshake's session. An
+// enveloped one gets the v1 fallback on a v1 process, answered or not, and
+// leaves the 2025 client's own to complete its handshake; on a v2 process it
+// is accepted and dropped.
+func TestNotify_InitializedReachesTheChildOnlyToEndA2025Handshake(t *testing.T) {
 	plain := map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"}
-	if r := eraPost(t, b, acceptJSON, plain, hdr); r.status != 202 {
-		t.Fatalf("2025-shaped: %d %s", r.status, r.body)
-	}
-	if indexOf(childReceived(t, b), "notifications/initialized") < 0 {
-		t.Fatal("the 2025-shaped notifications/initialized was not forwarded")
-	}
+	t.Run("answered v1", func(t *testing.T) {
+		b := startEraBridge(t, nil, "--era=legacy")
+		if r := eraPost(t, b, acceptJSON, plain, nil); r.status != 202 || r.body != "" {
+			t.Fatalf("bare, before any session: %d %s", r.status, r.body)
+		}
+		if indexOf(childReceived(t, b), "notifications/initialized") >= 0 {
+			t.Fatal("a notifications/initialized with no handshake reached the child")
+		}
+		session := eraPost(t, b, acceptJSON, eraInitialize(1).body, nil).header.Get("Mcp-Session-Id")
+		hdr := map[string]string{"Mcp-Session-Id": session}
+		assertV1Fallback(t, eraPost(t, b, acceptJSON, envelopedInitialized(), hdr))
+		if indexOf(childReceived(t, b), "notifications/initialized") >= 0 {
+			t.Fatal("the enveloped notifications/initialized reached the child")
+		}
+		if r := eraPost(t, b, acceptJSON, plain, hdr); r.status != 202 {
+			t.Fatalf("2025-shaped: %d %s", r.status, r.body)
+		}
+		if indexOf(childReceived(t, b), "notifications/initialized") < 0 {
+			t.Fatal("the 2025-shaped notifications/initialized was not forwarded")
+		}
+	})
+	t.Run("timeout", func(t *testing.T) {
+		b := startTimedOut(t, nil, "--era=legacy-silent")
+		assertV1Fallback(t, eraPost(t, b, acceptJSON, envelopedInitialized(), nil))
+		if indexOf(childReceived(t, b), "notifications/initialized") >= 0 {
+			t.Fatal("the enveloped notifications/initialized reached the child")
+		}
+	})
+	t.Run("v2", func(t *testing.T) {
+		b := startEraBridge(t, nil, listenFake)
+		if r := eraPost(t, b, acceptJSON, envelopedInitialized(), nil); r.status != 202 || r.body != "" {
+			t.Fatalf("%d %s", r.status, r.body)
+		}
+		if indexOf(childReceived(t, b), "notifications/initialized") >= 0 {
+			t.Fatal("the enveloped notifications/initialized reached a v2 child")
+		}
+	})
 }
 
 // A client's cancel is written only to the process its request was sent to.

@@ -22,7 +22,7 @@ func newSessionID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// sessionCheckKind is the result shape of Session.Check — ported from
+// sessionCheckKind is the result shape of session.check — ported from
 // session.ts's SessionCheckResult.
 type sessionCheckKind int
 
@@ -36,7 +36,6 @@ const (
 type sessionCheckResult struct {
 	kind      sessionCheckKind
 	sessionID string
-	minted    bool
 }
 
 // session is minimal per-bridge session state: one child, one session.
@@ -58,19 +57,23 @@ func newSession() *session {
 	return &session{newID: newSessionID}
 }
 
-func (s *session) check(method string, headerSessionID string, hasHeader bool) sessionCheckResult {
+// initialize confirms the session for a successful initialize, minting it if
+// there is none yet.
+func (s *session) initialize() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.hasID {
+		s.currentID = s.newID()
+		s.hasID = true
+	}
+	s.provisional = false
+	return s.currentID
+}
+
+func (s *session) check(headerSessionID string, hasHeader bool) sessionCheckResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if method == "initialize" {
-		minted := !s.hasID
-		if minted {
-			s.currentID = s.newID()
-			s.hasID = true
-		}
-		s.provisional = false
-		return sessionCheckResult{kind: sessionOK, sessionID: s.currentID, minted: minted}
-	}
 	if !hasHeader {
 		if s.hasID {
 			return sessionCheckResult{kind: sessionMissing}
@@ -78,7 +81,7 @@ func (s *session) check(method string, headerSessionID string, hasHeader bool) s
 		return sessionCheckResult{kind: sessionStateless}
 	}
 	if s.hasID && headerSessionID == s.currentID {
-		return sessionCheckResult{kind: sessionOK, sessionID: s.currentID, minted: false}
+		return sessionCheckResult{kind: sessionOK, sessionID: s.currentID}
 	}
 	return sessionCheckResult{kind: sessionUnknown}
 }

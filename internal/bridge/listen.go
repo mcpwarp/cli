@@ -167,12 +167,12 @@ func (l *listenEntry) release() {
 	l.mu.Unlock()
 }
 
-// takeListensLocked removes and returns the listens keep selects. b.mu must be
+// takeListensLocked removes and returns the listens take selects. b.mu must be
 // held.
-func (b *Bridge) takeListensLocked(keep func(*listenEntry) bool) []*listenEntry {
+func (b *Bridge) takeListensLocked(take func(*listenEntry) bool) []*listenEntry {
 	var taken []*listenEntry
 	for id, l := range b.listens {
-		if keep(l) {
+		if take(l) {
 			delete(b.listens, id)
 			taken = append(taken, l)
 		}

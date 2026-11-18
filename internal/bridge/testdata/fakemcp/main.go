@@ -4,8 +4,9 @@
 // test/fixtures/fake-mcp-stdio.mjs — see that file's header for the full
 // method-by-method behaviour this mirrors (initialize/ping/tools/list,
 // notifications/emit, server/request(-1), slow, with-progress,
-// subscriptions/listen, notifications/cancelled + debug/wasCancelled, hang,
-// debug/crash, --crash-after-ms=<n>) — plus one non-JSON banner line on
+// notifications/cancelled + debug/wasCancelled, hang (and
+// subscriptions/listen, likewise never answered), debug/crash,
+// --crash-after-ms=<n>) — plus one non-JSON banner line on
 // stdout and one on stderr at startup, which the bridge/stdio child must
 // tolerate, and a Go-only debug/replyThenExit case (blocker 1's os/exec
 // Wait/pipe-race regression test). It answers server/discover as an unknown
@@ -215,14 +216,6 @@ func main() {
 			}
 			notify("notifications/progress", map[string]any{"progressToken": token, "progress": 1, "total": 1})
 			reply(id, map[string]any{"ok": true})
-		case "subscriptions/listen":
-			var notifications any = map[string]any{}
-			if params, ok := msg["params"].(map[string]any); ok {
-				if n, ok := params["notifications"]; ok {
-					notifications = n
-				}
-			}
-			notifyTagged("notifications/subscriptions/acknowledged", map[string]any{"notifications": notifications}, id)
 		case "notifications/cancelled":
 			if params, ok := msg["params"].(map[string]any); ok {
 				stateMu.Lock()
@@ -238,7 +231,7 @@ func main() {
 			cancelled := cancelledRequestIDs[requestID]
 			stateMu.Unlock()
 			reply(id, map[string]any{"cancelled": cancelled})
-		case "hang":
+		case "hang", "subscriptions/listen":
 			// intentionally never replies
 		case "debug/replyThenExit":
 			reply(id, map[string]any{"ok": true})

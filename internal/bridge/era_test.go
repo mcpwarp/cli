@@ -1283,7 +1283,7 @@ func TestEra_InitializeHeadHeldForSessionThenReleased(t *testing.T) {
 	}
 	// The head left with a provisional session id, which the successful
 	// answer confirmed.
-	if b.session.check("ping", sid, true).kind != sessionOK {
+	if b.session.check(sid, true).kind != sessionOK {
 		t.Fatal("the confirmed session id was refused")
 	}
 }
@@ -1328,7 +1328,7 @@ func TestEra_ProgressFrameOnHeldInitializeCarriesProvisionalSession(t *testing.T
 		if !strings.Contains(string(body), `"progressToken":"p1"`) || !strings.Contains(string(body), `"protocolVersion"`) {
 			t.Fatalf("stream: %s", body)
 		}
-		if b.session.check("ping", sid, true).kind != sessionOK {
+		if b.session.check(sid, true).kind != sessionOK {
 			t.Fatal("the session the client holds is not the one the bridge confirmed")
 		}
 	})
@@ -1399,7 +1399,7 @@ func TestEra_ConcurrentInitializesWithDifferentOutcomes(t *testing.T) {
 			if a.status != 200 || a.sid == "" || c.status != 400 || c.sid != "" {
 				t.Fatalf("outcomes %+v and %+v", a, c)
 			}
-			if b.session.check("ping", a.sid, true).kind != sessionOK {
+			if b.session.check(a.sid, true).kind != sessionOK {
 				t.Fatal("the accepted initialize's session is not the bridge's")
 			}
 		})
@@ -1422,7 +1422,7 @@ func TestEra_ProvisionalSessionSurvivesWhileAnotherHolderIsPending(t *testing.T)
 		t.Fatal("not revoked once every holder released")
 	}
 	s.provisionalMint()
-	s.check("initialize", "", false)
+	s.initialize()
 	s.revoke()
 	if !s.hasID {
 		t.Fatal("a confirmed session was revoked")

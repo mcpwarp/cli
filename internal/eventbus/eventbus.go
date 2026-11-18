@@ -17,6 +17,22 @@ type ServerStateChanged struct {
 	Restarts int
 }
 
+// ServerVersionChanged is the MCP version a stdio server's bridge serves its
+// current process as (DESIGN.md §7), published by internal/bridge once per
+// change. Version is VersionV2, VersionV1, or "" while no process runs or its
+// version is not known yet. A process the bridge serves as v1 because it did
+// not answer in time can still change to VersionV2 once.
+type ServerVersionChanged struct {
+	Name    string
+	Version string
+}
+
+// ServerVersionChanged.Version values.
+const (
+	VersionV1 = "v1" // protocol 2025-11-25 and earlier
+	VersionV2 = "v2" // protocol 2026-07-28
+)
+
 // LogLine is a piece of telemetry (e.g. a child's stderr line), drop-oldest
 // under backpressure like the rest of the telemetry channel (DESIGN.md §3).
 type LogLine struct {

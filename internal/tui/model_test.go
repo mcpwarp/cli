@@ -458,6 +458,41 @@ func TestServiceChangedUnknownNameAddsRow(t *testing.T) {
 	}
 }
 
+// TestServerVersionChangedSetsAndClearsVersion: the bridge's report sets its
+// row's Version and an empty one clears it; a name not in the table adds no
+// row, and a SnapshotMsg leaves Version alone.
+func TestServerVersionChangedSetsAndClearsVersion(t *testing.T) {
+	m := newTestModel([]Server{{Name: "fs", Kind: "stdio", State: "healthy"}}, nil)
+	next, _ := m.Update(controlEventMsg{evt: eventbus.ServerVersionChanged{Name: "fs", Version: eventbus.VersionV1}})
+	m = next.(Model)
+	if got := m.servers[0].Version; got != eventbus.VersionV1 {
+		t.Fatalf("Version = %q after v1, want v1", got)
+	}
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ServerVersionChanged{Name: "fs", Version: eventbus.VersionV2}})
+	m = next.(Model)
+	if got := m.servers[0].Version; got != eventbus.VersionV2 {
+		t.Fatalf("Version = %q after v2, want v2", got)
+	}
+
+	next, _ = m.Update(SnapshotMsg{Servers: []Server{{Name: "fs", Kind: "stdio", URL: "https://fs.example/mcp"}}})
+	m = next.(Model)
+	if got := m.servers[0].Version; got != eventbus.VersionV2 {
+		t.Fatalf("Version = %q after a snapshot, want it kept as v2", got)
+	}
+
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ServerVersionChanged{Name: "fs", Version: ""}})
+	m = next.(Model)
+	if got := m.servers[0].Version; got != "" {
+		t.Fatalf("Version = %q after the clear, want empty", got)
+	}
+
+	next, _ = m.Update(controlEventMsg{evt: eventbus.ServerVersionChanged{Name: "ghost", Version: eventbus.VersionV1}})
+	m = next.(Model)
+	if len(m.servers) != 1 {
+		t.Fatalf("a report for an unknown name added a row: %+v", m.servers)
+	}
+}
+
 // TestBackgroundColorPicksSecondaryGray: the terminal's background reply
 // swaps the secondary-text gray, and neither variant is the theme-defined
 // ANSI 8 that vanished on a mid-gray background.

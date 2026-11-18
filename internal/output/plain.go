@@ -73,6 +73,9 @@ func writeControlLine(w io.Writer, color bool, evt any) {
 		glyph, style := glyphFor(serverStateSeverity(e.State))
 		fmt.Fprintf(w, "%s %s: %s (restarts=%d)\n", colorize(color, style, glyph), e.Name, displayState(e.State), e.Restarts)
 
+	case eventbus.ServerVersionChanged:
+		writeVersionLine(w, color, e)
+
 	case eventbus.ServiceChanged:
 		writeServiceLine(w, color, e)
 
@@ -100,6 +103,25 @@ func writeControlLine(w io.Writer, color bool, evt any) {
 	default:
 		fmt.Fprintf(w, "%s unknown event %#v\n", colorize(color, colorYellow, "!"), evt)
 	}
+}
+
+// writeVersionLine prints the MCP version a stdio server is now served as:
+//
+//	· fs: MCP v1 (2025-11-25 and earlier)
+//	· fs: MCP v2 (2026-07-28)
+//
+// A version that is no longer known (the process ended) prints nothing.
+func writeVersionLine(w io.Writer, color bool, e eventbus.ServerVersionChanged) {
+	var label string
+	switch e.Version {
+	case eventbus.VersionV1:
+		label = "MCP v1 (2025-11-25 and earlier)"
+	case eventbus.VersionV2:
+		label = "MCP v2 (2026-07-28)"
+	default:
+		return
+	}
+	fmt.Fprintf(w, "%s %s: %s\n", colorize(color, colorDim, "·"), e.Name, label)
 }
 
 // writeServiceLine prints one registration transition (DESIGN.md §9's STATE

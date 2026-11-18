@@ -163,7 +163,12 @@ type StartBridgeOptions struct {
 	// Bus, if non-nil, is passed to NewStdioChildWithBus so this bridge's
 	// initial child publishes its stderr lines as eventbus.LogLine
 	// telemetry (DESIGN.md §3) — the same wiring a supervisor's own
-	// respawned children get via supervisor.Deps.Spawn.
+	// respawned children get via supervisor.Deps.Spawn. The bridge also
+	// publishes eventbus.ServerVersionChanged on it whenever the MCP version
+	// it serves the current process as changes, "" once a process whose
+	// version it published has ended. Once Close has begun it publishes
+	// nothing more, except a report already past its closing check, which
+	// can still land after Close returns.
 	Bus *eventbus.Bus
 	// EnsureChild, if non-nil, is the lazy-respawn safety net (DESIGN.md
 	// §7): when a POST carrying a method (a request, a notification or
@@ -340,6 +345,7 @@ var (
 type Bridge struct {
 	name string
 	log  *slog.Logger
+	bus  *eventbus.Bus
 
 	timeout      time.Duration
 	maxPending   int
@@ -367,6 +373,7 @@ type Bridge struct {
 	mu        sync.Mutex
 	child     *StdioChild
 	era       *eraState
+	reported  mcpVersion // the version last queued as a ServerVersionChanged
 	closing   bool
 	failed    string
 	hasFailed bool
@@ -438,6 +445,7 @@ func StartBridge(opts StartBridgeOptions) (*Bridge, error) {
 	b := &Bridge{
 		name:         opts.Name,
 		log:          log,
+		bus:          opts.Bus,
 		timeout:      timeout,
 		maxPending:   maxPending,
 		maxListens:   maxListens,
@@ -846,13 +854,15 @@ func (b *Bridge) wireChild(c *StdioChild, st *eraState) {
 		gone := b.takeListensLocked(func(l *listenEntry) bool { return l.child == c })
 		b.endEraLocked(st)
 		b.mu.Unlock()
-		b.flushEra(st)
 
+		// The requests and listens are answered first: the flush can block
+		// on the bus (a version report) until a consumer reads it.
 		for _, entry := range pending {
 			entry.rejectWith(errChildRestarted)
 		}
 		endListens(gone, listenChildGone)
 		b.pushHub.Close()
+		b.flushEra(st)
 	})
 
 	// The only errors are failed writes to stdin: a child that no longer
@@ -1790,7 +1800,18 @@ func (b *Bridge) CloseContext(ctx context.Context) error {
 	st := b.era
 	b.endEraLocked(st)
 	b.mu.Unlock()
-	b.flushEra(st)
+	// Another flush of st can hold it while blocked on the bus (a version
+	// report). This one still runs once that ends, to write what st queued,
+	// but close waits for it only as long as ctx allows.
+	flushed := make(chan struct{})
+	go func() {
+		b.flushEra(st)
+		close(flushed)
+	}()
+	select {
+	case <-flushed:
+	case <-ctx.Done():
+	}
 
 	b.pushHub.Close()
 

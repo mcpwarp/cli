@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mcpwarp/cli/internal/bridge"
+	"github.com/mcpwarp/cli/internal/eventbus"
 	"github.com/mcpwarp/cli/internal/supervisor"
 	"github.com/mcpwarp/cli/internal/tui"
 )
@@ -84,6 +85,54 @@ func startStdioCharacterization(t *testing.T) (*charHarness, *bridge.Bridge, *su
 	})
 	h.waitRow("fs", "fs active", charActive)
 	return h, br.Load(), sv.Load()
+}
+
+// TestUpCharacterization_StdioVersionLine: the bridge reports the default
+// fakemcp, which answers server/discover with an error, as MCP v1, and plain
+// mode prints it dated.
+func TestUpCharacterization_StdioVersionLine(t *testing.T) {
+	h, _, _ := startStdioCharacterization(t)
+	h.waitPlain("· fs: MCP v1 (2025-11-25 and earlier)")
+}
+
+// TestUpCharacterization_StdioVersionFollowsTheProcess: fs's VERSION is
+// cleared whenever its process ends and reported again for the next one,
+// across a local `d` then `e`, an `r`, and a lazy respawn.
+func TestUpCharacterization_StdioVersionFollowsTheProcess(t *testing.T) {
+	h, _, sv := startStdioCharacterization(t)
+	const v1 = eventbus.VersionV1
+	var want []string
+	expect := func(what string, next ...string) {
+		t.Helper()
+		want = append(want, next...)
+		h.waitFor(what, func() bool { return len(h.serverVersions("fs")) >= len(want) })
+		if got := h.serverVersions("fs"); !slices.Equal(got, want) {
+			t.Fatalf("%s: fs versions = %q, want %q", what, got, want)
+		}
+		if r, _ := h.row("fs"); r.Version != want[len(want)-1] {
+			t.Fatalf("%s: fs row = %+v, want Version %q", what, r, want[len(want)-1])
+		}
+	}
+	expect("the verdict", v1)
+
+	registered := len(h.serviceChanges("fs"))
+	h.controller().Disable("fs")
+	expect("d", "")
+	h.controller().Enable("fs")
+	expect("e", v1)
+	h.waitService("fs", "active", registered)
+
+	h.controller().Restart("fs")
+	expect("r", "", v1)
+
+	sv.Disable()
+	expect("the supervisor's disable", "")
+	resp := openHTTPStream(t, h.edge, "fs.example", "/mcp", []byte(charPing))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("relayed ping = %d, want 200 from a respawned child", resp.StatusCode)
+	}
+	expect("the lazy respawn", v1)
 }
 
 const charPing = `{"jsonrpc":"2.0","id":1,"method":"ping"}`

@@ -8,14 +8,17 @@
 package tui
 
 // Server is a snapshot of one configured server for the dashboard table
-// (NAME | KIND | STATE | RESTARTS | URL, with aggregate streams/bytes in the
-// header — StreamOpened/StreamClosed carry a stream ID but no server name,
-// so a per-server streams column isn't derivable from the bus). Name/Kind
-// come from the caller's initial snapshot; Registration and URL are kept
-// current by eventbus.ServiceChanged (or a SnapshotMsg, for a caller that
-// sends one); State/Restarts are normally kept current by
+// (NAME | KIND | STATE | RESTARTS | VERSION | URL, with aggregate
+// streams/bytes in the header — StreamOpened/StreamClosed carry a stream ID
+// but no server name, so a per-server streams column isn't derivable from
+// the bus). Name/Kind come from the caller's initial snapshot; Registration
+// and URL are kept current by eventbus.ServiceChanged (or a SnapshotMsg, for
+// a caller that sends one); State/Restarts are normally kept current by
 // eventbus.ServerStateChanged, falling back to the snapshot's own values
-// until the first one arrives.
+// until the first one arrives. Version is the MCP version a stdio row's
+// bridge serves its process as (eventbus.VersionV1, VersionV2, or "" while
+// none runs or it is not known), kept current by eventbus.ServerVersionChanged
+// only.
 //
 // Registration is the tunnel's side of the row (one of the Registration*
 // values below), kept apart from State because a stdio row has two
@@ -31,6 +34,7 @@ type Server struct {
 	State        string
 	Restarts     int
 	Registration string
+	Version      string
 }
 
 // Registration values (DESIGN.md §9's STATE column). "active" and

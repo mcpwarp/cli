@@ -480,7 +480,15 @@ func (d upDeps) resolve() upDeps {
 		d.BlockForever = func(ctx context.Context) { <-ctx.Done() }
 	}
 	if d.Bus == nil {
-		d.Bus = eventbus.New(64)
+		// Nothing drains Control before the renderer starts or after a TUI
+		// quit, and Publish blocks on a full one. Before the renderer starts
+		// each server can add its tunnel ServiceChanged, and a stdio one also
+		// its verdict and its one change to v2; after a quit each server can
+		// add a ServiceChanged from a reply still in flight, and a stdio one
+		// also its clear and its supervisor's stopped. 4 per server covers the
+		// worst of these at config.MaxServers so no publisher blocks there; 64
+		// for the rest.
+		d.Bus = eventbus.New(64 + 4*config.MaxServers)
 	}
 	if d.IsTTY == nil {
 		d.IsTTY = defaultUpIsTTY

@@ -205,7 +205,20 @@ func (m Model) renderNotice() string {
 	return labelStyle.Render(label) + styleBold.Render(truncateWidth(m.notice.text, m.width-lipgloss.Width(label)))
 }
 
-var tableCols = []string{"NAME", "KIND", "STATE", "RESTARTS", "URL"}
+var tableCols = []string{"NAME", "KIND", "STATE", "RESTARTS", "VERSION", "URL"}
+
+// versionLabel is the VERSION cell for a Server.Version: blank while no
+// process runs or its version is not known, and for an http row, which never
+// has one.
+func versionLabel(v string) string {
+	switch v {
+	case eventbus.VersionV1:
+		return "MCP v1"
+	case eventbus.VersionV2:
+		return "MCP v2"
+	}
+	return ""
+}
 
 // displayState maps a row to what the STATE column shows. The supervisor's
 // "healthy" and an http row's registry-derived "active" are the same fact
@@ -241,16 +254,18 @@ func (m Model) renderTable() string {
 	}
 
 	nameW, kindW, stateW, restartsW := lipgloss.Width(tableCols[0]), lipgloss.Width(tableCols[1]), lipgloss.Width(tableCols[2]), lipgloss.Width(tableCols[3])
+	versionW := lipgloss.Width(tableCols[4])
 	for _, s := range m.servers {
 		nameW = maxInt(nameW, lipgloss.Width(s.Name))
 		kindW = maxInt(kindW, lipgloss.Width(s.Kind))
 		stateW = maxInt(stateW, lipgloss.Width(displayState(s)))
 		restartsW = maxInt(restartsW, lipgloss.Width(strconv.Itoa(s.Restarts)))
+		versionW = maxInt(versionW, lipgloss.Width(versionLabel(s.Version)))
 	}
 
 	var b strings.Builder
-	header := formatRow(nameW, kindW, stateW, restartsW,
-		tableCols[0], tableCols[1], tableCols[2], tableCols[3], tableCols[4])
+	header := formatRow(nameW, kindW, stateW, restartsW, versionW,
+		tableCols[0], tableCols[1], tableCols[2], tableCols[3], tableCols[4], tableCols[5])
 	b.WriteString(styleHeader.Render(truncateWidth(header, m.width)))
 	// Each row gets a 2-column "> "/"  " prefix, so the row itself has
 	// m.width-2 columns to fit in.
@@ -262,9 +277,10 @@ func (m Model) renderTable() string {
 	for i, s := range m.servers {
 		state := displayState(s)
 		restarts := strconv.Itoa(s.Restarts)
+		version := versionLabel(s.Version)
 		url := s.URL
 		urlLine := ""
-		if url != "" && lipgloss.Width(formatRow(nameW, kindW, stateW, restartsW, s.Name, s.Kind, state, restarts, url)) > rowWidth {
+		if url != "" && lipgloss.Width(formatRow(nameW, kindW, stateW, restartsW, versionW, s.Name, s.Kind, state, restarts, version, url)) > rowWidth {
 			urlLine = truncateWidth(strings.Repeat(" ", urlIndent)+url, rowWidth)
 			url = ""
 		}
@@ -282,7 +298,7 @@ func (m Model) renderTable() string {
 		}
 		row := rowStyle.Render(prefix+padRight(s.Name, nameW)+"  "+padRight(s.Kind, kindW)+"  ") +
 			stateStyle.Render(padRight(state, stateW)) +
-			rowStyle.Render(strings.TrimRight("  "+padRight(restarts, restartsW)+"  "+url, " "))
+			rowStyle.Render(strings.TrimRight("  "+padRight(restarts, restartsW)+"  "+padRight(version, versionW)+"  "+url, " "))
 		b.WriteString("\n")
 		b.WriteString(truncateWidth(row, m.width))
 		if urlLine != "" {
@@ -293,9 +309,10 @@ func (m Model) renderTable() string {
 	return b.String()
 }
 
-func formatRow(nameW, kindW, stateW, restartsW int, name, kind, state, restarts, url string) string {
+func formatRow(nameW, kindW, stateW, restartsW, versionW int, name, kind, state, restarts, version, url string) string {
 	return padRight(name, nameW) + "  " + padRight(kind, kindW) + "  " +
-		padRight(state, stateW) + "  " + padRight(restarts, restartsW) + "  " + url
+		padRight(state, stateW) + "  " + padRight(restarts, restartsW) + "  " +
+		padRight(version, versionW) + "  " + url
 }
 
 // padRight and truncateWidth use lipgloss.Width/ansi.Truncate rather than

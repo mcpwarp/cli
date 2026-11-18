@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/mcpwarp/cli/internal/eventbus"
 )
 
 const (
@@ -139,9 +141,9 @@ type eraState struct {
 	// entry per name, and one shared by every client without a string name.
 	refused map[refusedClient]bool
 	// queued is what the applied events and refusals leave to do outside
-	// Bridge.mu (log lines, closing the push stream), in the order they
-	// happened; flushEra runs it once Bridge.mu is released, under flushMu so
-	// that two flushes cannot reorder it.
+	// Bridge.mu (log lines, closing the push stream, version reports), in the
+	// order they happened; flushEra runs it once Bridge.mu is released, under
+	// flushMu so that two flushes cannot reorder it.
 	queued  []func()
 	flushMu sync.Mutex
 }
@@ -177,8 +179,8 @@ func (b *Bridge) startProbe(st *eraState) {
 
 // applyEraLocked feeds ev to st's machine and carries out its effects; it is
 // the only thing that changes era state. b.mu must be held. What cannot be
-// done under b.mu (the log, closing the push stream) is queued on st: the
-// caller runs flushEra(st) once b.mu is released.
+// done under b.mu (the log, closing the push stream, publishing the version)
+// is queued on st: the caller runs flushEra(st) once b.mu is released.
 func (b *Bridge) applyEraLocked(st *eraState, ev eraEvent) {
 	counted := st.m.countsInits()
 	var eff eraEffects
@@ -203,6 +205,45 @@ func (b *Bridge) applyEraLocked(st *eraState, ev eraEvent) {
 	if eff.toV2 {
 		st.queued = append(st.queued, func() { b.closePushStream(st) })
 	}
+	b.noteVersionLocked(st)
+}
+
+// noteVersionLocked queues a ServerVersionChanged on st when the version the
+// bridge serves has changed: st is the current process, and its version (none
+// once it has ended) is not the one last reported. Queued on st, the reports
+// of one process go out in order, and ReplaceChild flushes the old process's
+// last one before the new process can queue its first. A queued report reads
+// b.closing when it runs, releases b.mu, then publishes: one that runs after
+// CloseContext has set closing publishes nothing, whenever it was queued, but
+// one that read closing just before still publishes, possibly after
+// CloseContext has returned. b.mu must be held.
+func (b *Bridge) noteVersionLocked(st *eraState) {
+	if b.bus == nil || st != b.era {
+		return
+	}
+	v := st.m.version()
+	if st.m.ended {
+		v = versionUnknown
+	}
+	if v == b.reported {
+		return
+	}
+	b.reported = v
+	evt := eventbus.ServerVersionChanged{Name: b.name}
+	switch v {
+	case versionV1:
+		evt.Version = eventbus.VersionV1
+	case versionV2:
+		evt.Version = eventbus.VersionV2
+	}
+	st.queued = append(st.queued, func() {
+		b.mu.Lock()
+		closing := b.closing
+		b.mu.Unlock()
+		if !closing {
+			b.bus.Publish(evt)
+		}
+	})
 }
 
 // flushEra runs what st has queued, in the order it was queued. b.mu must not

@@ -403,6 +403,13 @@ func (m *Model) applyControl(evt any) {
 		m.connReason = e.Reason
 	case eventbus.ServerStateChanged:
 		m.upsertServerState(e.Name, e.State, e.Restarts)
+	case eventbus.ServerVersionChanged:
+		for i := range m.servers {
+			if m.servers[i].Name == e.Name {
+				m.servers[i].Version = e.Version
+				break
+			}
+		}
 	case eventbus.ServiceChanged:
 		m.applyServiceChanged(e)
 	case eventbus.StreamOpened:

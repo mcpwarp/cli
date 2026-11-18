@@ -5,8 +5,8 @@ package cli
 // internal/tunnel/registry/relay/appproto with ws-mixer-go's
 // mcpwarp.ServiceGroup: what the edge sees on the wire, the eventbus events
 // a renderer consumes (DESIGN.md §3), the rows the TUI shows (tuiRunFunc's
-// seeded servers with the bus's ServiceChanged/ServerStateChanged events
-// applied as tui.Model applies them, §9), the plain renderer's lines for
+// seeded servers with the bus's ServiceChanged/ServerStateChanged/
+// ServerVersionChanged events applied as tui.Model applies them, §9), the plain renderer's lines for
 // that same event stream, relayed responses, and the process exit code.
 // Nothing here reads the tunnel's registry or other internals. The seams
 // used are runUp's own: upDeps.FatalExit (which up.go hands to the tunnel,
@@ -297,16 +297,21 @@ func (h *charHarness) runTUI(_ context.Context, bus *eventbus.Bus, servers []tui
 
 // applyRow applies one Control event to the rows the way tui.Model does
 // (upsertServerState, applyServiceChanged): a ServerStateChanged sets a
-// row's State and restarts; a ServiceChanged sets Registration, State too
-// unless the row is stdio, and the URL — a new one replaces it,
-// rejected/taken_over clear it, anything else keeps it. Called with h.mu
-// held.
+// row's State and restarts; a ServerVersionChanged sets an existing row's
+// Version; a ServiceChanged sets Registration, State too unless the row is
+// stdio, and the URL — a new one replaces it, rejected/taken_over clear it,
+// anything else keeps it. Called with h.mu held.
 func (h *charHarness) applyRow(evt any) {
 	switch e := evt.(type) {
 	case eventbus.ServerStateChanged:
 		r := h.rows[e.Name]
 		r.Name, r.State, r.Restarts = e.Name, e.State, e.Restarts
 		h.rows[e.Name] = r
+	case eventbus.ServerVersionChanged:
+		if r, ok := h.rows[e.Name]; ok {
+			r.Version = e.Version
+			h.rows[e.Name] = r
+		}
 	case eventbus.ServiceChanged:
 		r, ok := h.rows[e.Name]
 		if !ok {
@@ -534,6 +539,20 @@ func (h *charHarness) serverStates(name string) []string {
 	for _, e := range h.control {
 		if sc, ok := e.(eventbus.ServerStateChanged); ok && sc.Name == name {
 			out = append(out, sc.State)
+		}
+	}
+	return out
+}
+
+// serverVersions is every ServerVersionChanged's Version published for
+// name, in order.
+func (h *charHarness) serverVersions(name string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for _, e := range h.control {
+		if v, ok := e.(eventbus.ServerVersionChanged); ok && v.Name == name {
+			out = append(out, v.Version)
 		}
 	}
 	return out

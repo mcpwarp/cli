@@ -260,3 +260,24 @@ func TestServiceLineOptionalPartsAndColor(t *testing.T) {
 		}
 	}
 }
+
+// TestVersionLine: a known version prints its dated label behind the dim
+// "·", and a cleared one prints nothing, not the unknown-event line.
+func TestVersionLine(t *testing.T) {
+	for _, tc := range []struct {
+		evt   eventbus.ServerVersionChanged
+		color bool
+		want  string
+	}{
+		{eventbus.ServerVersionChanged{Name: "fs", Version: eventbus.VersionV1}, false, "· fs: MCP v1 (2025-11-25 and earlier)\n"},
+		{eventbus.ServerVersionChanged{Name: "fs", Version: eventbus.VersionV2}, false, "· fs: MCP v2 (2026-07-28)\n"},
+		{eventbus.ServerVersionChanged{Name: "fs", Version: eventbus.VersionV2}, true, colorDim + "·" + colorReset + " fs: MCP v2 (2026-07-28)\n"},
+		{eventbus.ServerVersionChanged{Name: "fs", Version: ""}, false, ""},
+	} {
+		var b bytes.Buffer
+		writeControlLine(&b, tc.color, tc.evt)
+		if got := b.String(); got != tc.want {
+			t.Errorf("writeControlLine(%+v, color=%v) = %q, want %q", tc.evt, tc.color, got, tc.want)
+		}
+	}
+}

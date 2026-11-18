@@ -35,7 +35,7 @@ func TestViewSmoke80x24(t *testing.T) {
 	m = next.(Model)
 
 	out := renderAt(t, m, 80, 24)
-	for _, want := range []string{"NAME", "KIND", "STATE", "RESTARTS", "URL", "fs", "git", "127.0.0.1:9001", "active", "restarting", "CONNECTED", "q quit"} {
+	for _, want := range []string{"NAME", "KIND", "STATE", "RESTARTS", "VERSION", "URL", "fs", "git", "127.0.0.1:9001", "active", "restarting", "CONNECTED", "q quit"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("view missing %q; got:\n%s", want, out)
 		}
@@ -417,6 +417,45 @@ func tableLines(t *testing.T, m Model, w int) []string {
 	return strings.Split(ansi.Strip(m.renderTable()), "\n")
 }
 
+// TestTableVersionColumn: VERSION sits between RESTARTS and URL, shows the
+// short label for a known version, and is blank while the version is not
+// known and on an http row, with every row's URL still in one column.
+func TestTableVersionColumn(t *testing.T) {
+	m := newTestModel([]Server{
+		{Name: "fs", Kind: "stdio", State: "healthy", Version: eventbus.VersionV1, URL: shortURL},
+		{Name: "git", Kind: "stdio", State: "healthy", Version: eventbus.VersionV2, URL: shortURL},
+		{Name: "db", Kind: "stdio", State: "healthy", URL: shortURL},
+		{Name: "notes", Kind: "http", State: "active", URL: shortURL},
+	}, nil)
+	lines := tableLines(t, m, 120)
+	if len(lines) != 5 {
+		t.Fatalf("expected header + 4 rows, got %d lines:\n%s", len(lines), strings.Join(lines, "\n"))
+	}
+	if got := strings.Fields(lines[0]); strings.Join(got, " ") != "NAME KIND STATE RESTARTS VERSION URL" {
+		t.Fatalf("header = %q", lines[0])
+	}
+	want := map[string]string{"fs": "MCP v1", "git": "MCP v2", "db": "", "notes": ""}
+	urlAt := -1
+	for _, line := range lines[1:] {
+		fields := strings.Fields(strings.TrimPrefix(line, ">"))
+		cell, ok := want[fields[0]]
+		if !ok {
+			t.Fatalf("unexpected row %q", line)
+		}
+		switch {
+		case cell != "" && !strings.Contains(line, " "+padRight(cell, len("VERSION"))+"  "+shortURL):
+			t.Fatalf("%s row = %q, want VERSION %q before its URL", fields[0], line, cell)
+		case cell == "" && strings.Contains(line, "MCP"):
+			t.Fatalf("%s row = %q, want a blank VERSION", fields[0], line)
+		}
+		at := strings.Index(line, shortURL)
+		if urlAt >= 0 && at != urlAt {
+			t.Fatalf("%s row's URL at column %d, others at %d:\n%s", fields[0], at, urlAt, strings.Join(lines, "\n"))
+		}
+		urlAt = at
+	}
+}
+
 // TestTableURLFitsStaysOnOneLine: on a wide terminal every row is one line
 // with its full URL inline — the table looks as it always did.
 func TestTableURLFitsStaysOnOneLine(t *testing.T) {
@@ -462,7 +501,9 @@ func TestTableURLWrapsWhenNarrow(t *testing.T) {
 }
 
 // TestTableURLWrapMixedRows: only the row whose URL doesn't fit gets the
-// extra line; and the selected row's highlight covers its URL line too.
+// extra line; and the selected row's highlight covers its URL line too. At
+// 75 columns fs's row with its short URL is 68 wide and fits, anki's with
+// wrapURL is 105 and doesn't.
 func TestTableURLWrapMixedRows(t *testing.T) {
 	m := newTestModel([]Server{
 		{Name: "fs", Kind: "stdio", State: "healthy", URL: shortURL},
@@ -471,7 +512,7 @@ func TestTableURLWrapMixedRows(t *testing.T) {
 	}, nil)
 	next, _ := m.Update(namedKey(t, "j")) // select anki
 	m = next.(Model)
-	lines := tableLines(t, m, 66)
+	lines := tableLines(t, m, 75)
 	if len(lines) != 5 {
 		t.Fatalf("expected header + fs + anki + anki URL + deepwiki, got %d lines:\n%s", len(lines), strings.Join(lines, "\n"))
 	}
@@ -485,7 +526,7 @@ func TestTableURLWrapMixedRows(t *testing.T) {
 		t.Fatalf("deepwiki row = %q", lines[4])
 	}
 
-	next, _ = m.Update(tea.WindowSizeMsg{Width: 66, Height: 24})
+	next, _ = m.Update(tea.WindowSizeMsg{Width: 75, Height: 24})
 	m = next.(Model)
 	raw := strings.Split(m.renderTable(), "\n")
 	if want := styleSelected.Render("  " + "  " + wrapURL); raw[3] != want {

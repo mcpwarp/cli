@@ -640,9 +640,11 @@ func (s *Supervisor) activate() {
 	// an exiting child against s.current, so setting current first means
 	// an exit racing this handoff (including one that already happened)
 	// is never misattributed to the stale previous child and dropped;
-	// handing off to the bridge first means its own (fast, non-blocking)
-	// exit-triggered rejection always beats the supervisor's (which may
-	// block on eventbus.Publish) restart-state transition.
+	// handing off to the bridge first wires its exit listener first, and the
+	// child runs its exit listeners in order, so the bridge rejects the
+	// child's pending requests before the supervisor's restart-state
+	// transition (which may block on eventbus.Publish) and before anything
+	// in the bridge's own listener that may block on it.
 	s.mu.Lock()
 	s.current = child
 	s.mu.Unlock()

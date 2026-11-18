@@ -714,6 +714,183 @@ func TestSupervisor_EnsureRunning_DisabledStartsChildAndWaitsUntilHealthy(t *tes
 	}
 }
 
+// TestSupervisor_LateExitAfterDisableIsNotACrash: Close() returns once the
+// child has exited, and its exit listeners may still be pending then, so
+// Disable() can return before the supervisor's handleExit for the old child
+// has run. A gate listener registered ahead of the supervisor's holds that
+// handleExit until a respawn from Disabled is in flight; it must then be
+// inert: no crash counted, no backoff, no second spawn, one ReplaceChild.
+func TestSupervisor_LateExitAfterDisableIsNotACrash(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		respawn func(*Supervisor) error
+	}{
+		{"EnsureRunning", func(s *Supervisor) error {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			return s.EnsureRunning(ctx, nil)
+		}},
+		{"Enable", func(s *Supervisor) error {
+			s.Enable()
+			return nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			child := spawnTestChild(t, 0, time.Hour)
+			gate := make(chan struct{})
+			child.OnExit(func(bridge.ExitInfo) { <-gate })
+			fb := &fakeBridge{}
+			g := newGatedSpawn(t)
+			s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: fb}, Deps{
+				Sleep: func(time.Duration) {},
+				Spawn: g.spawn,
+			})
+			handled := make(chan struct{})
+			child.OnExit(func(bridge.ExitInfo) { close(handled) })
+
+			openGate := sync.OnceFunc(func() { close(gate) })
+			release := sync.OnceFunc(func() { close(g.release) })
+			t.Cleanup(func() {
+				g.mu.Lock()
+				children := append([]*bridge.StdioChild{}, g.children...)
+				g.mu.Unlock()
+				for _, c := range children {
+					_ = c.Close()
+				}
+			})
+			t.Cleanup(func() { s.Stop() })
+			t.Cleanup(func() {
+				openGate()
+				release()
+			})
+
+			s.Disable()
+
+			errc := make(chan error, 1)
+			go func() { errc <- tc.respawn(s) }()
+			waitEntered(t, g)
+
+			openGate()
+			select {
+			case <-handled:
+			case <-time.After(3 * time.Second):
+				t.Fatal("the old child's exit was never handled")
+			}
+			s.mu.Lock()
+			failures, backingOff := s.consecutiveFailures, s.backingOff
+			s.mu.Unlock()
+			if failures != 0 || backingOff {
+				t.Fatalf("the disabled child's exit was counted as a crash: consecutiveFailures=%d backingOff=%v", failures, backingOff)
+			}
+
+			release()
+			select {
+			case err := <-errc:
+				if err != nil {
+					t.Fatalf("%s: %v", tc.name, err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatalf("%s never returned", tc.name)
+			}
+			if got := s.GetState(); got != Healthy {
+				t.Fatalf("want healthy, got %v", got)
+			}
+			if fb.replacedCount() != 1 {
+				t.Fatalf("want the new child handed to the bridge once, got %d", fb.replacedCount())
+			}
+			if g.count() != 1 {
+				t.Fatalf("want 1 spawn, got %d", g.count())
+			}
+			spawned := g.lastChild()
+			s.mu.Lock()
+			current := s.current
+			s.mu.Unlock()
+			if spawned == nil || current != spawned {
+				t.Fatalf("want the one spawned child tracked as current, got current=%p spawned=%p", current, spawned)
+			}
+		})
+	}
+}
+
+// TestSupervisor_OverlappingDisablesBothWaitForTheChild guards that a second
+// Disable() overlapping a first still waits for the child to exit. The child
+// ignores SIGTERM, so the first Disable() sits in Close() for the kill grace
+// period; the second must close the same child and return only once it has
+// exited, which holds only while terminate() leaves s.current in place for
+// it. Returning earlier would let an Enable spawn a second process while the
+// first is still alive.
+func TestSupervisor_OverlappingDisablesBothWaitForTheChild(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs /bin/sh's trap")
+	}
+	child, err := bridge.NewStdioChild(bridge.SpawnSpec{
+		Command: "/bin/sh",
+		Args:    []string{"-c", `trap 'echo "{\"term\":true}"' TERM; read x; echo "{\"ready\":true}"; while :; do sleep 1; done`},
+	}, testLogger(), "test")
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = child.Close() })
+	lines := make(chan map[string]any, 8)
+	child.OnMessage(func(m map[string]any) {
+		select {
+		case lines <- m:
+		default:
+		}
+	})
+	waitLine := func(key string) {
+		t.Helper()
+		deadline := time.After(3 * time.Second)
+		for {
+			select {
+			case m := <-lines:
+				if m[key] == true {
+					return
+				}
+			case <-deadline:
+				t.Fatalf("the child never wrote %q", key)
+			}
+		}
+	}
+	s := New(Options{Name: "svc", Log: testLogger(), Child: child, Bridge: &fakeBridge{}}, Deps{Sleep: func(time.Duration) {}})
+	t.Cleanup(func() { s.Stop() })
+
+	// The trap is installed once the child answers a line on stdin.
+	if err := child.Send(map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	waitLine("ready")
+
+	first := make(chan struct{})
+	go func() {
+		s.Disable()
+		close(first)
+	}()
+	waitLine("term") // the first Disable() is inside Close()
+
+	second := make(chan struct{})
+	go func() {
+		s.Disable()
+		close(second)
+	}()
+	select {
+	case <-second:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second Disable never returned")
+	}
+	if !child.HasExited() {
+		t.Fatal("the second Disable returned while the child was still alive")
+	}
+	select {
+	case <-first:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first Disable never returned")
+	}
+	if got := s.GetState(); got != Disabled {
+		t.Fatalf("want disabled, got %v", got)
+	}
+}
+
 // TestSupervisor_EnsureRunning_ConcurrentCallersSpawnOnce piles several
 // EnsureRunning callers and a dashboard-style Enable() onto one disabled
 // supervisor while the first spawn is held open: all of them must share

@@ -249,10 +249,15 @@ func (s *Supervisor) terminate(target State, ctx context.Context) {
 	current := s.current
 	s.mu.Unlock()
 
-	// current is nil when there is no live child to close: Restart() clears
-	// s.current before its spawn, and activate() closes that spawn's child
-	// without tracking it once this terminate() has set the terminal state;
-	// a failed spawn leaves it nil too.
+	// s.current is left in place, so an overlapping terminate() closes the
+	// same child and waits for its exit too. When it is not a live child, it
+	// is either one that has already exited (a crashed child, including in
+	// the Failed state reached by crashes, or one an earlier terminate()
+	// closed), and Close() returns at once, or nil: beginEnableLocked() or
+	// Restart() cleared it, and then the spawn failed or activate() closed
+	// the spawned child untracked on seeing the terminal state. When
+	// activate() only sees the terminal state after tracking the child, it
+	// closes the child itself and this Close() waits on the same exit.
 	closeDone := make(chan struct{})
 	if current != nil {
 		go func() {
@@ -416,7 +421,15 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, allow func() error) erro
 // fresh counters and returns the s.restarting channel runSpawn closes.
 // The caller holds s.mu and has checked the state and that no terminate()
 // is in flight.
+//
+// It also clears s.current, the child terminate() closed or the one that
+// crashed: Close() returns once that child has exited, but its exit
+// listeners may still be pending, and its handleExit can land after the
+// state has left Disabled. With s.current cleared here, in the same hold
+// that leaves the terminal state, it hits the staleness guard rather than
+// counting a crash and scheduling a second spawn.
 func (s *Supervisor) beginEnableLocked() chan struct{} {
+	s.current = nil
 	s.consecutiveFailures = 0
 	s.backingOff = false
 	s.state = Restarting

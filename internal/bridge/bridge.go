@@ -505,7 +505,11 @@ func (b *Bridge) GetCurrentChild() *StdioChild {
 // ReplaceChild swaps in a freshly spawned child after a supervisor
 // restart. The listener/port/session are untouched; only routing wiring
 // moves to the new child, which is probed afresh (the old process's verdict
-// says nothing about it). Clears a previously-latched MarkFailed.
+// says nothing about it). The old process's legacy GET push stream and
+// backlog end here, including a stream opened against it after it had
+// exited, so a GET stream never outlives its process: its exit listener, if
+// still pending, leaves the hub to the new one. Its pending requests are
+// left to that listener. Clears a previously-latched MarkFailed.
 func (b *Bridge) ReplaceChild(child *StdioChild) {
 	st := newEraState(child)
 	b.mu.Lock()
@@ -519,6 +523,7 @@ func (b *Bridge) ReplaceChild(child *StdioChild) {
 	b.mu.Unlock()
 	b.flushEra(old)
 	endListens(gone, listenChildGone)
+	b.pushHub.Close()
 	b.wireChild(child, st)
 	b.startProbe(st)
 }
@@ -847,11 +852,19 @@ func (b *Bridge) wireChild(c *StdioChild, st *eraState) {
 		}
 	})
 
+	// c's exit listeners can still be pending once a respawn has put the next
+	// process in its place, so this touches only c's own requests, listens
+	// and push stream.
 	c.OnExit(func(_ ExitInfo) {
 		b.log.Warn("stdio child exited; failing pending requests", "server", b.name)
 		b.mu.Lock()
-		pending := b.pending
-		b.pending = make(map[int64]*pendingEntry)
+		var pending []*pendingEntry
+		for id, entry := range b.pending {
+			if entry.child == c {
+				delete(b.pending, id)
+				pending = append(pending, entry)
+			}
+		}
 		gone := b.takeListensLocked(func(l *listenEntry) bool { return l.child == c })
 		b.endEraLocked(st)
 		b.mu.Unlock()
@@ -862,7 +875,7 @@ func (b *Bridge) wireChild(c *StdioChild, st *eraState) {
 			entry.rejectWith(errChildRestarted)
 		}
 		endListens(gone, listenChildGone)
-		b.pushHub.Close()
+		b.closePushStream(st)
 		b.flushEra(st)
 	})
 

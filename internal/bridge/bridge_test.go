@@ -665,6 +665,121 @@ func TestBridge_LegacyGETStream_EndsClientSideAfterChildExit(t *testing.T) {
 	}
 }
 
+// TestBridge_LateExitOfAReplacedChildLeavesTheNextOneAlone holds a child's
+// exit listeners (a gate registered ahead of the bridge's) until the next
+// child has replaced it and has a request pending and a GET stream open. The
+// old child's exit must then fail only its own request, and leave the next
+// process's request and stream alone; the old process's GET stream ends at
+// the replacement.
+func TestBridge_LateExitOfAReplacedChildLeavesTheNextOneAlone(t *testing.T) {
+	b := startTestBridge(t)
+	bin := buildFakeMCP(t)
+	spawn := func() *StdioChild {
+		t.Helper()
+		c, err := NewStdioChild(SpawnSpec{Command: bin}, testLogger(), "fake")
+		if err != nil {
+			t.Fatalf("spawn: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		return c
+	}
+	wait := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+	pendingCount := func(n int) func() bool {
+		return func() bool {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			return len(b.pending) == n
+		}
+	}
+	post := func(body string) <-chan *http.Response {
+		out := make(chan *http.Response, 1)
+		req := mustRequest(t, b.URL(), body)
+		go func() {
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Log(err)
+			}
+			out <- resp
+		}()
+		return out
+	}
+	answer := func(ch <-chan *http.Response) (int, map[string]any) {
+		t.Helper()
+		select {
+		case resp := <-ch:
+			if resp == nil {
+				t.Fatal("request errored instead of getting a response")
+			}
+			return resp.StatusCode, decodeBody(t, resp)
+		case <-time.After(5 * time.Second):
+			t.Fatal("request never answered")
+		}
+		return 0, nil
+	}
+
+	initial := b.GetCurrentChild()
+	initialHandled := make(chan struct{})
+	initial.OnExit(func(ExitInfo) { close(initialHandled) })
+	_ = initial.Close()
+	wait(initialHandled, "the initial child's exit to be handled")
+
+	old := spawn()
+	gate := make(chan struct{})
+	openGate := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(openGate)
+	held := make(chan struct{})
+	old.OnExit(func(ExitInfo) {
+		close(held)
+		<-gate
+	})
+	b.ReplaceChild(old)
+	oldHandled := make(chan struct{})
+	old.OnExit(func(ExitInfo) { close(oldHandled) })
+
+	oldGet := openGet(t, b)
+	onOld := post(`{"jsonrpc":"2.0","id":1,"method":"slow","params":{"delayMs":60000}}`)
+	waitFor(t, "the request to the old child to be pending", pendingCount(1))
+
+	_ = old.Close()
+	wait(held, "the old child's exit listeners to start")
+
+	b.ReplaceChild(spawn())
+	if rest := oldGet.drain(t); len(rest) != 0 {
+		t.Fatalf("the old process's GET stream carried %q", rest)
+	}
+	newGet := openGet(t, b)
+	onNew := post(`{"jsonrpc":"2.0","id":2,"method":"slow","params":{"delayMs":1000}}`)
+	waitFor(t, "the request to the new child to be pending", pendingCount(2))
+
+	openGate()
+	wait(oldHandled, "the old child's exit to be handled")
+	if !b.pushHub.HasOpenStream() {
+		t.Fatal("the old child's exit closed the GET stream opened for the new process")
+	}
+
+	status, body := answer(onOld)
+	errObj, _ := body["error"].(map[string]any)
+	if status != 502 || errObj == nil || errObj["code"] != float64(-32000) {
+		t.Fatalf("request to the old child: want 502 -32000, got %d %+v", status, body)
+	}
+	status, body = answer(onNew)
+	result, _ := body["result"].(map[string]any)
+	if status != 200 || body["id"] != float64(2) || result == nil || result["ok"] != true {
+		t.Fatalf("request to the new child: want its answer, got %d %+v", status, body)
+	}
+
+	emit := postJSON(t, b.URL(), map[string]any{"jsonrpc": "2.0", "id": 3, "method": "notifications/emit"}, nil)
+	emit.Body.Close()
+	newGet.waitFor(t, `"method":"notify"`)
+}
+
 // TestBridge_ServerInitiatedRequestRoutedByShapeEvenOnIDCollision proves
 // server-initiated requests are routed to the legacy push stream by
 // shape (has both id and method) rather than by id, even when the

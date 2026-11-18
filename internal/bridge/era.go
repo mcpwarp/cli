@@ -260,9 +260,9 @@ func (b *Bridge) flushEra(st *eraState) {
 	}
 }
 
-// closePushStream ends the push stream of st, a process that turned v2. A
-// respawn that has already put another process in st's place owns the hub
-// now, so it is left alone.
+// closePushStream ends the push stream of st, a process that turned v2 or
+// exited. A respawn that has already put another process in st's place owns
+// the hub now, so it is left alone.
 func (b *Bridge) closePushStream(st *eraState) {
 	b.mu.Lock()
 	current := b.era == st

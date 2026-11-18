@@ -163,7 +163,7 @@ func validateServer(raw json.RawMessage, path string) (Server, issueList) {
 
 	var allowed []string
 	if kind == KindStdio {
-		allowed = []string{"name", "kind", "command", "args", "env", "cwd"}
+		allowed = []string{"name", "kind", "command", "args", "env", "cwd", "mcp_version"}
 
 		command, commandIssues := requireString(obj, "command", path+".command")
 		issues = append(issues, commandIssues...)
@@ -195,6 +195,22 @@ func validateServer(raw json.RawMessage, path string) (Server, issueList) {
 			issues = append(issues, cwdIssues...)
 			server.Cwd = cwd
 			server.HasCwd = cwdIssues == nil
+		}
+
+		server.MCPVersion = MCPVersionAuto
+		if rawVersion, ok := obj["mcp_version"]; ok {
+			version, versionIssues := decodeString(rawVersion, path+".mcp_version")
+			issues = append(issues, versionIssues...)
+			switch {
+			case versionIssues != nil:
+			case version == MCPVersionAuto || version == MCPVersionV1 || version == MCPVersionV2:
+				server.MCPVersion = version
+			default:
+				issues = append(issues, issue{
+					path:    path + ".mcp_version",
+					message: fmt.Sprintf("unknown value %q (expected %q, %q or %q)", version, MCPVersionAuto, MCPVersionV1, MCPVersionV2),
+				})
+			}
 		}
 	} else {
 		allowed = []string{"name", "kind", "url"}

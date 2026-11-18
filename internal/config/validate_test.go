@@ -352,6 +352,55 @@ func TestValidateConfigNullValues(t *testing.T) {
 	}
 }
 
+// TestValidateConfigMCPVersion covers a stdio server's mcp_version: omitted
+// and "auto" are the same, any other value but "v1" and "v2" fails the load,
+// and the key is unknown on an http server.
+func TestValidateConfigMCPVersion(t *testing.T) {
+	stdio := func(version string) string {
+		return `{"servers":[{"name":"a","kind":"stdio","command":"uvx","mcp_version":` + version + `}]}`
+	}
+	for _, c := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"omitted", `{"servers":[{"name":"a","kind":"stdio","command":"uvx"}]}`, MCPVersionAuto},
+		{"auto", stdio(`"auto"`), MCPVersionAuto},
+		{"v1", stdio(`"v1"`), MCPVersionV1},
+		{"v2", stdio(`"v2"`), MCPVersionV2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := mustValidate(t, c.raw).Servers[0].MCPVersion; got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+
+	for _, c := range []struct {
+		name    string
+		raw     string
+		path    string
+		message string
+	}{
+		{"an unknown value", `{"servers":[{"name":"a","kind":"stdio","command":"uvx"},{"name":"b","kind":"stdio","command":"uvx"},{"name":"c","kind":"stdio","command":"uvx","mcp_version":"v3"}]}`,
+			"servers[2].mcp_version", `unknown value "v3" (expected "auto", "v1" or "v2")`},
+		{"a number", stdio(`2`), "servers[0].mcp_version", "Invalid input: expected string, received number"},
+		{"null", stdio(`null`), "servers[0].mcp_version", "Invalid input: expected string, received null"},
+		{"on an http server", `{"servers":[{"name":"a","kind":"http","url":"http://127.0.0.1:8765/mcp","mcp_version":"v1"}]}`,
+			"servers[0]", `Unrecognized key: "mcp_version"`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			issues := mustFail(t, c.raw)
+			if len(issues) != 1 {
+				t.Fatalf("expected exactly one issue, got %v", issues)
+			}
+			if want := (issue{path: c.path, message: c.message}); issues[0] != want {
+				t.Errorf("got %+v, want %+v", issues[0], want)
+			}
+		})
+	}
+}
+
 // TestValidateConfigMultipleIssuesPerField asserts that a field failing more
 // than one check reports every failing check, not just the first — zod runs
 // every chained refine on a field regardless of earlier failures.

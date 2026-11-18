@@ -1546,7 +1546,7 @@ func TestEra_PanicWhileHeadIsHeld(t *testing.T) {
 			}, "--era=modern")
 			// A child with no stdin, decided by hand: Send panics after the
 			// head is held.
-			st := newEraState(newBareChild())
+			st := newEraState(newBareChild(), ServeAuto)
 			st.m = mach(c.phase, vers(eraTestVersion))
 			close(st.decided)
 			b.mu.Lock()

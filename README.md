@@ -88,7 +88,15 @@ Create `~/.mcpwarp/config.json` (or pass `--config <path>` to use a different lo
 }
 ```
 
-A `stdio` server is defined by `name`, `kind`, `command`, and optionally `args`, `env`, `cwd`. An `http` server is defined by `name`, `kind`, and `url`.
+A `stdio` server is defined by `name`, `kind`, `command`, and optionally `args`, `env`, `cwd`, `mcp_version`. An `http` server is defined by `name`, `kind`, and `url`.
+
+`mcp_version` sets which MCP version mcpwarp serves a `stdio` server as:
+
+- `"auto"` (the default, same as leaving it out): mcpwarp asks the server when it starts. Most servers need nothing else.
+- `"v1"`: For apps that use MCP v1 (2025-11-25 and earlier). Apps that use only MCP v2 can't connect.
+- `"v2"`: For apps that use MCP v2 (2026-07-28). Apps that use only MCP v1 can't connect.
+
+A change takes effect on the next `mcpwarp up`. A config that contains `mcp_version` needs a mcpwarp release after v0.3.0; v0.3.0 and earlier, and the Node CLI, validate the config strictly and reject it.
 
 ```sh
 mcpwarp up          # registers each server, prints its URL; TUI unless --no-tui

@@ -641,9 +641,9 @@ func TestEra_RefusedClientIsLoggedOncePerName(t *testing.T) {
 	nameless := eraInitialize(99).body
 	delete(nameless["params"].(map[string]any), "clientInfo")
 	refused := "uses MCP v1 and was refused"
-	namelessLine := "A client uses MCP v1 and was refused: this server speaks MCP v2 (protocol 2026-07-28)."
-	emptyLine := `The client "" uses MCP v1 and was refused: this server speaks MCP v2 (protocol 2026-07-28).`
-	claude := `The client "Claude" uses MCP v1 and was refused: this server speaks MCP v2 (protocol 2026-07-28).`
+	namelessLine := `A client uses MCP v1 and was refused: this server speaks MCP v2 (protocol 2026-07-28). If the server also supports v1, set its MCP version to v1 in its config entry ("mcp_version": "v1").`
+	emptyLine := `The client "" uses MCP v1 and was refused: this server speaks MCP v2 (protocol 2026-07-28). If the server also supports v1, set its MCP version to v1 in its config entry ("mcp_version": "v1").`
+	claude := `The client "Claude" uses MCP v1 and was refused: this server speaks MCP v2 (protocol 2026-07-28). If the server also supports v1, set its MCP version to v1 in its config entry ("mcp_version": "v1").`
 	eraPost(t, b, acceptJSON, nameless, nil)
 	eraPost(t, b, acceptJSON, named(98, 7), nil)
 	logs.waitLogged(t, namelessLine, 1)

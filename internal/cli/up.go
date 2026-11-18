@@ -410,6 +410,18 @@ func ensureChildFor(name string, reg *atomic.Pointer[registry.Registry], sv *ato
 	}
 }
 
+// serveAs maps a stdio server's config "mcp_version" to how its bridge
+// decides the MCP version of each process it runs.
+func serveAs(mcpVersion string) bridge.ServeAs {
+	switch mcpVersion {
+	case config.MCPVersionV1:
+		return bridge.ServeV1
+	case config.MCPVersionV2:
+		return bridge.ServeV2
+	}
+	return bridge.ServeAuto
+}
+
 // --- wiring seams (DI for tests, mirroring Node's UpDeps) --------------
 
 // defaultUpIsTTY requires both stdin and stdout to be a TTY — unlike
@@ -483,7 +495,8 @@ func (d upDeps) resolve() upDeps {
 		// Nothing drains Control before the renderer starts or after a TUI
 		// quit, and Publish blocks on a full one. Before the renderer starts
 		// each server can add its tunnel ServiceChanged, and a stdio one also
-		// its verdict and its one change to v2; after a quit each server can
+		// its verdict and either its one change to v2 or, forced to v1, its
+		// MCP_VERSION error; after a quit each server can
 		// add a ServiceChanged from a reply still in flight, and a stdio one
 		// also its clear and its supervisor's stopped. 4 per server covers the
 		// worst of these at config.MaxServers so no publisher blocks there; 64
@@ -691,6 +704,7 @@ func runUp(ctx *Context, noTUI bool, deps upDeps) error {
 		br, err := deps.StartBridge(bridge.StartBridgeOptions{
 			Name:        s.Name,
 			SpawnSpec:   spawnSpec,
+			ServeAs:     serveAs(s.MCPVersion),
 			Log:         ctx.Log,
 			Bus:         bus,
 			EnsureChild: ensureChildFor(name, &tunnelReg, &svRef),

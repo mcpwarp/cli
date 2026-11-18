@@ -151,6 +151,49 @@ func TestRunUp_StartupOrder_BridgesBeforeTunnel(t *testing.T) {
 	}
 }
 
+// TestRunUp_MCPVersionReachesTheBridge: each stdio server's mcp_version is
+// handed to its bridge, omitted and "auto" alike as automatic.
+func TestRunUp_MCPVersionReachesTheBridge(t *testing.T) {
+	dir := t.TempDir()
+	path := writeUpConfig(t, dir, `{"servers": [
+		{"name":"omitted","kind":"stdio","command":"true"},
+		{"name":"auto","kind":"stdio","command":"true","mcp_version":"auto"},
+		{"name":"one","kind":"stdio","command":"true","mcp_version":"v1"},
+		{"name":"two","kind":"stdio","command":"true","mcp_version":"v2"}
+	]}`)
+	withCapturedStdout(t)
+	withCapturedStderr(t)
+	t.Setenv("MCPWARP_TOKEN", "mcpwarp_pat_abc123")
+	t.Cleanup(bridge.KillAllLiveChildren)
+
+	got := map[string]bridge.ServeAs{}
+	ctx := &Context{ConfigPath: path, HomeDir: dir, Log: NewLogger(false)}
+	err := runUp(ctx, true, upDeps{
+		BlockForever: noopBlockForever,
+		StartBridge: func(opts bridge.StartBridgeOptions) (*bridge.Bridge, error) {
+			got[opts.Name] = opts.ServeAs
+			return bridge.StartBridge(bridge.StartBridgeOptions{
+				Name: opts.Name, SpawnSpec: bridge.SpawnSpec{Command: "true"}, Log: ctx.Log,
+			})
+		},
+		StartTunnel: func(context.Context, tunnel.Config) (tunnelHandle, error) {
+			return nil, errors.New("stop after the bridges")
+		},
+	})
+	if err == nil {
+		t.Fatal("expected an error (from the StartTunnel stub)")
+	}
+	want := map[string]bridge.ServeAs{"omitted": bridge.ServeAuto, "auto": bridge.ServeAuto, "one": bridge.ServeV1, "two": bridge.ServeV2}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for name, as := range want {
+		if got[name] != as {
+			t.Errorf("%s: got ServeAs %d, want %d", name, got[name], as)
+		}
+	}
+}
+
 // TestRunUp_SpawnFailureClosesAlreadyStartedBridges ports Node up.test.ts's
 // "spawn failure closes already-started bridges" case: when a later
 // server's bridge fails to start, every bridge already started for an

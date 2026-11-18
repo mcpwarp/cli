@@ -135,10 +135,23 @@ type SupervisedBridge interface {
 	MarkFailed(reason string)
 }
 
+// ServeAs is how the bridge decides the MCP version of each process it runs
+// (DESIGN.md §7): by the child's answer to server/discover (ServeAuto), or
+// fixed by the config, with no server/discover sent (ServeV1, ServeV2).
+type ServeAs int
+
+const (
+	ServeAuto ServeAs = iota
+	ServeV1
+	ServeV2
+)
+
 // StartBridgeOptions configures StartBridge.
 type StartBridgeOptions struct {
-	Name           string
-	SpawnSpec      SpawnSpec
+	Name      string
+	SpawnSpec SpawnSpec
+	// ServeAs applies to every process of this bridge, ReplaceChild's too.
+	ServeAs        ServeAs
 	Log            *slog.Logger
 	RequestTimeout time.Duration // 0 -> defaultRequestTimeout
 	MaxPending     int           // 0 -> defaultMaxPending
@@ -166,9 +179,10 @@ type StartBridgeOptions struct {
 	// respawned children get via supervisor.Deps.Spawn. The bridge also
 	// publishes eventbus.ServerVersionChanged on it whenever the MCP version
 	// it serves the current process as changes, "" once a process whose
-	// version it published has ended. Once Close has begun it publishes
-	// nothing more, except a report already past its closing check, which
-	// can still land after Close returns.
+	// version it published has ended, and an eventbus.AppError (code
+	// MCP_VERSION) once per process forced to v1 whose child speaks only v2.
+	// Once Close has begun it publishes nothing more, except a report already
+	// past its closing check, which can still land after Close returns.
 	Bus *eventbus.Bus
 	// EnsureChild, if non-nil, is the lazy-respawn safety net (DESIGN.md
 	// §7): when a POST carrying a method (a request, a notification or
@@ -218,8 +232,11 @@ type pendingEntry struct {
 	// revoke releases a provisional session handed out with a held
 	// initialize head; set only for initialize.
 	revoke func()
-	// era, set only for an initialize its process counted (eraMachine.inits),
-	// is the process the child's answer reports on.
+	// era, set only for a request whose answer its process's machine hears,
+	// is the process the child's answer reports on: an initialize it counted
+	// (eraMachine.inits), or, while a forced process checks its child
+	// (eraMachine.checksForced), an initialize (forced v1) or a client's
+	// server/discover (forced v2).
 	era *eraState
 }
 
@@ -357,6 +374,7 @@ type Bridge struct {
 	// under.
 	writeGrace   time.Duration
 	ensureChild  func(ctx context.Context) error
+	serveAs      ServeAs
 	probeTimeout time.Duration
 	headHold     time.Duration
 	initHold     time.Duration
@@ -453,6 +471,7 @@ func StartBridge(opts StartBridgeOptions) (*Bridge, error) {
 		keepalive:    keepalive,
 		writeGrace:   defaultListenWriteGrace,
 		ensureChild:  opts.EnsureChild,
+		serveAs:      opts.ServeAs,
 		probeTimeout: probeTimeout,
 		headHold:     headHold,
 		initHold:     initHold,
@@ -464,9 +483,9 @@ func StartBridge(opts StartBridgeOptions) (*Bridge, error) {
 		abandoned:    make(map[int64]struct{}),
 		nextID:       firstBridgeID,
 	}
-	b.era = newEraState(child)
+	b.era = newEraState(child, b.serveAs)
 	b.wireChild(child, b.era)
-	b.startProbe(b.era)
+	b.startEra(b.era)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -505,13 +524,14 @@ func (b *Bridge) GetCurrentChild() *StdioChild {
 // ReplaceChild swaps in a freshly spawned child after a supervisor
 // restart. The listener/port/session are untouched; only routing wiring
 // moves to the new child, which is probed afresh (the old process's verdict
-// says nothing about it). The old process's legacy GET push stream and
-// backlog end here, including a stream opened against it after it had
-// exited, so a GET stream never outlives its process: its exit listener, if
-// still pending, leaves the hub to the new one. Its pending requests are
-// left to that listener. Clears a previously-latched MarkFailed.
+// says nothing about it) unless ServeAs forces its version. The old
+// process's legacy GET push stream and backlog end here, including a stream
+// opened against it after it had exited, so a GET stream never outlives its
+// process: its exit listener, if still pending, leaves the hub to the new
+// one. Its pending requests are left to that listener. Clears a
+// previously-latched MarkFailed.
 func (b *Bridge) ReplaceChild(child *StdioChild) {
-	st := newEraState(child)
+	st := newEraState(child, b.serveAs)
 	b.mu.Lock()
 	b.child = child
 	old := b.era
@@ -525,7 +545,7 @@ func (b *Bridge) ReplaceChild(child *StdioChild) {
 	endListens(gone, listenChildGone)
 	b.pushHub.Close()
 	b.wireChild(child, st)
-	b.startProbe(st)
+	b.startEra(st)
 }
 
 // MarkFailed latches a permanent-failure response for every new request
@@ -626,10 +646,10 @@ func (b *Bridge) handleChildResponse(id int64, msg map[string]any) {
 	abandoned := b.isAbandonedLocked(id)
 	b.mu.Unlock()
 
-	// An initialize answer reaches the era state here, before its handler
-	// sees it.
+	// An answer the era state hears reaches it here, before its handler sees
+	// it.
 	if entry != nil && entry.era != nil {
-		b.noteInitializeAnswer(entry.era, msg)
+		b.noteAnswer(entry, msg)
 	}
 
 	if hasListen {
@@ -1709,12 +1729,20 @@ func (b *Bridge) handleRegularRequest(w http.ResponseWriter, r *http.Request, pa
 
 	// An initialize still pending joins st's count of initializes in flight
 	// right before its write, while the child's answer to it can still change
-	// st's version (it is then the entry's era).
-	if kind == kindInitialize {
+	// st's version. A forced process still checking its child hears the
+	// answer to an initialize (only forced v1 forwards one) or to a client's
+	// server/discover (only forced v2 forwards one). Either way st is then
+	// the entry's era.
+	if kind == kindInitialize || kind == kindModern && parsed["method"] == "server/discover" {
 		b.mu.Lock()
-		if b.pending[internalID] == entry && st.m.countsInits() {
-			entry.era = st
-			b.applyEraLocked(st, eraEvent{kind: evInitSent})
+		if b.pending[internalID] == entry {
+			switch {
+			case kind == kindInitialize && st.m.countsInits():
+				entry.era = st
+				b.applyEraLocked(st, eraEvent{kind: evInitSent})
+			case st.m.checksForced():
+				entry.era = st
+			}
 		}
 		b.mu.Unlock()
 		b.flushEra(st)

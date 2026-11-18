@@ -135,8 +135,8 @@ func rejectionVersions(msg map[string]any) []string {
 type eraState struct {
 	child   *StdioChild
 	m       eraMachine
-	decided chan struct{} // closed once, when m leaves phasePending
-	timer   *time.Timer   // the probe's timeout
+	decided chan struct{} // closed once, when m leaves phasePending (at creation for a forced m)
+	timer   *time.Timer   // the probe's timeout; nil for a forced m
 	// refused holds the clients whose refused initialize was logged: one
 	// entry per name, and one shared by every client without a string name.
 	refused map[refusedClient]bool
@@ -153,16 +153,28 @@ type refusedClient struct {
 	nameless bool
 }
 
-func newEraState(child *StdioChild) *eraState {
-	return &eraState{child: child, decided: make(chan struct{}), refused: map[refusedClient]bool{}}
+func newEraState(child *StdioChild, as ServeAs) *eraState {
+	st := &eraState{child: child, m: newEraMachine(as), decided: make(chan struct{}), refused: map[refusedClient]bool{}}
+	if st.m.phase != phasePending {
+		close(st.decided)
+	}
+	return st
 }
 
-// startProbe arms st's probe timer and writes the probe. The write runs on its
-// own goroutine: a child that does not read its stdin is the timer's to
-// decide. A failed write ends st through the child's error listener
-// (wireChild), or its exit.
-func (b *Bridge) startProbe(st *eraState) {
+// startEra starts st once its child is wired. A forced process has its
+// version from spawn: it is reported now, and nothing is written to the
+// child. Any other gets its probe: startEra arms the probe timer and writes
+// the probe, on its own goroutine, since a child that does not read its stdin
+// is the timer's to decide. A failed write ends st through the child's error
+// listener (wireChild), or its exit.
+func (b *Bridge) startEra(st *eraState) {
 	b.mu.Lock()
+	if st.m.forced {
+		b.noteVersionLocked(st)
+		b.mu.Unlock()
+		b.flushEra(st)
+		return
+	}
 	if st.m.ended {
 		b.mu.Unlock()
 		return
@@ -205,6 +217,9 @@ func (b *Bridge) applyEraLocked(st *eraState, ev eraEvent) {
 	if eff.toV2 {
 		st.queued = append(st.queued, func() { b.closePushStream(st) })
 	}
+	if eff.noV1 && b.bus != nil {
+		b.queuePublishLocked(st, eventbus.AppError{Code: forcedV1ErrorCode, Message: forcedV1ErrorMessage, Service: b.name, Hint: suggestAuto})
+	}
 	b.noteVersionLocked(st)
 }
 
@@ -212,11 +227,7 @@ func (b *Bridge) applyEraLocked(st *eraState, ev eraEvent) {
 // bridge serves has changed: st is the current process, and its version (none
 // once it has ended) is not the one last reported. Queued on st, the reports
 // of one process go out in order, and ReplaceChild flushes the old process's
-// last one before the new process can queue its first. A queued report reads
-// b.closing when it runs, releases b.mu, then publishes: one that runs after
-// CloseContext has set closing publishes nothing, whenever it was queued, but
-// one that read closing just before still publishes, possibly after
-// CloseContext has returned. b.mu must be held.
+// last one before the new process can queue its first. b.mu must be held.
 func (b *Bridge) noteVersionLocked(st *eraState) {
 	if b.bus == nil || st != b.era {
 		return
@@ -236,6 +247,15 @@ func (b *Bridge) noteVersionLocked(st *eraState) {
 	case versionV2:
 		evt.Version = eventbus.VersionV2
 	}
+	b.queuePublishLocked(st, evt)
+}
+
+// queuePublishLocked queues evt on st for the bus. A queued event reads
+// b.closing when it runs, releases b.mu, then publishes: one that runs after
+// CloseContext has set closing publishes nothing, whenever it was queued, but
+// one that read closing just before still publishes, possibly after
+// CloseContext has returned. b.mu must be held, and b.bus non-nil.
+func (b *Bridge) queuePublishLocked(st *eraState, evt any) {
 	st.queued = append(st.queued, func() {
 		b.mu.Lock()
 		closing := b.closing
@@ -435,7 +455,9 @@ func refuseV1Message(w http.ResponseWriter, parsed map[string]any, versions []st
 
 // refuseInitialize is the 400 body answering a 2025 initialize on a v2
 // process. It logs the refused client once per name for the process, after the
-// lines st's events queued before it.
+// lines st's events queued before it; on automatic the line also points at
+// forcing v1. A process forced to v2 whose child turned out not to speak it
+// has said so once, and logs no more refused clients.
 func (b *Bridge) refuseInitialize(parsed map[string]any, st *eraState, versions []string) map[string]any {
 	params, _ := isRequestParams(parsed)
 	requested, _ := params["protocolVersion"].(string)
@@ -443,11 +465,14 @@ func (b *Bridge) refuseInitialize(parsed map[string]any, st *eraState, versions 
 	name, isName := info["name"].(string)
 	key := refusedClient{name: name, nameless: !isName}
 	b.mu.Lock()
-	if !st.refused[key] && len(st.refused) < maxRefusedNames {
+	if !st.m.mismatch && !st.refused[key] && len(st.refused) < maxRefusedNames {
 		st.refused[key] = true
 		line := logRefusedNamelessClient(versions)
 		if isName {
 			line = logRefusedClient(name, versions)
+		}
+		if !st.m.forced {
+			line += " " + suggestV1
 		}
 		st.queued = append(st.queued, func() { b.log.Warn(line, "server", b.name) })
 	}
@@ -485,18 +510,24 @@ func (b *Bridge) refuseStatelessMethod(w http.ResponseWriter, r *http.Request) b
 	return true
 }
 
-// noteInitializeAnswer feeds the child's answer to a forwarded initialize to
-// st's machine. It runs on the child's pump, before the handler sees the
-// answer.
-func (b *Bridge) noteInitializeAnswer(st *eraState, msg map[string]any) {
-	ev := eraEvent{kind: evInitOK}
-	if !isResultMsg(msg) {
+// noteAnswer feeds the child's answer to entry, a request whose answer its
+// process's machine hears (pendingEntry.era), to that machine: an initialize
+// (raw marks one) or a client's server/discover. It runs on the child's pump,
+// before the handler sees the answer.
+func (b *Bridge) noteAnswer(entry *pendingEntry, msg map[string]any) {
+	var ev eraEvent
+	switch {
+	case entry.raw == nil:
+		ev = eraEvent{kind: evClientDiscover, versions: discoverVersions(msg)}
+	case isResultMsg(msg):
+		ev = eraEvent{kind: evInitOK}
+	default:
 		ev = eraEvent{kind: evInitFailed, versions: rejectionVersions(msg)}
 	}
 	b.mu.Lock()
-	b.applyEraLocked(st, ev)
+	b.applyEraLocked(entry.era, ev)
 	b.mu.Unlock()
-	b.flushEra(st)
+	b.flushEra(entry.era)
 }
 
 // completeInitialize answers a 2025-style initialize from the handler
